@@ -654,6 +654,9 @@ async fn write_group_account(
                 created_at: existing
                     .map(|a| a.created_at.clone())
                     .unwrap_or_else(|| now.clone()),
+                // A group's mailbox is made at approval: a body is not a
+                // consumer and no cancellation-period hold applies to it.
+                hold_until: None,
                 // The group holds the payment state, so the mailbox's record has
                 // no block for one at all rather than a paid-until that could be
                 // mistaken for an unpaid person's.
@@ -1908,6 +1911,7 @@ mod tests {
             front_end: "web".into(),
             stage: "received".into(),
             decided_at: None,
+            status_link_until: None,
             password_link: None,
             domain: Some("parish.example".into()),
             outside_address: None,

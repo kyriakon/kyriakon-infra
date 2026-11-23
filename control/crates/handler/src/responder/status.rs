@@ -93,11 +93,19 @@ pub fn status_page(
     payment: Option<page::PaymentView>,
     now: OffsetDateTime,
 ) -> StatusPage {
-    let live = record.filter(|r| match r.decided_at.as_deref() {
-        // The drain sets `decided_at` when it decides. Until it does, the
-        // application has not been decided and the link answers.
-        Some(decided_at) => util::link_answers(decided_at, now),
-        None => true,
+    let live = record.filter(|r| match r.status_link_until.as_deref() {
+        // A held approval writes the hold's end plus seven days here, so the
+        // page still answers when the account is made and the password link
+        // appears. At provisioning it is reset to seven days from that pass.
+        Some(until) => OffsetDateTime::parse(until, &time::format_description::well_known::Rfc3339)
+            .map(|until| now < until)
+            .unwrap_or(false),
+        None => match r.decided_at.as_deref() {
+            // The drain sets `decided_at` when it decides. Until it does, the
+            // application has not been decided and the link answers.
+            Some(decided_at) => util::link_answers(decided_at, now),
+            None => true,
+        },
     });
     match live {
         Some(record) => StatusPage {

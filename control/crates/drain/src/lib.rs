@@ -103,6 +103,11 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
     // A mail-key replacement whose 72-hour window has closed applies here, on
     // the same pass its record is read.
     transitions::lifecycle::mail_key_rotations(cfg, store, &journal).await?;
+    // A held approval whose fourteen days have passed is supplied here, and
+    // only then does the record become active. Before the window sweep, so a
+    // paid account is active on the day its payment window opens and the lapse
+    // clock cannot run on an account nothing was made for.
+    transitions::review::provision_held(cfg, store, &journal, &key).await?;
     // A payment window whose day has passed either finds its credit and stays
     // active, or lapses the account and starts the grace. One sweep, so a
     // member who paid on the last day is not lapsed by a later pass.

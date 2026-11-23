@@ -1577,6 +1577,13 @@ pub struct Record {
     /// not been decided yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decided_at: Option<String>,
+    /// The last moment the status link answers, RFC 3339. Written by the drain
+    /// at a decision, seven days out; a held approval writes the hold's end
+    /// plus seven, because the status page is the only place a member with no
+    /// outside address can collect the password link after the hold ends. When
+    /// absent the status page falls back to `decided_at` plus seven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_link_until: Option<String>,
     /// The one-time link that sets a mail password, written by the drain for an
     /// applicant who gave no address outside the platform and so cannot be sent
     /// one. The drain signs it; the handler neither signs nor verifies one and
@@ -2019,6 +2026,13 @@ pub struct Account {
     pub rail: String,
     pub no_charge: bool,
     pub created_at: String,
+    /// The last day of the fourteen-day hold on an approval that did not ask
+    /// for immediate supply, `YYYY-MM-DD`. While it is present the account is
+    /// `held`, nothing has been made on the box, and the drain supplies it on
+    /// the first pass after this date. Absent on every supplied account and on
+    /// records written before the hold existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_until: Option<String>,
     /// The payment state, present only on a paid approval. A free account has
     /// no window, no token and no payment block at all, which is why this is an
     /// absent field rather than a block of nulls.
@@ -2526,7 +2540,7 @@ impl Account {
         // operator's step (docs/terms.md, docs/aup.md), so this records what the
         // account page and the capsule must say rather than leaving the form on
         // while the site still answers (#891).
-        if self.state == Standing::Suspended {
+        if matches!(self.state, Standing::Suspended | Standing::Held) {
             return (false, false);
         }
         let written = !self.upload_keys.is_empty();
@@ -2634,6 +2648,24 @@ impl Window {
             state: WindowState::Open,
             extensions: 0,
         }
+    }
+
+    /// Whether the cancellation-period hold has not ended on `now`. The one
+    /// test the account page, the group page and the notices use, so a held
+    /// window cannot read as open on one and closed on another.
+    pub fn held(&self, now: OffsetDateTime) -> bool {
+        self.state == WindowState::Open
+            && crate::util::days_left(&self.opened_at, now).is_some_and(|days| days > 0)
+    }
+
+    /// The day the window opens, `YYYY-MM-DD`.
+    pub fn open_date(&self) -> &str {
+        self.opened_at.get(..10).unwrap_or(&self.opened_at)
+    }
+
+    /// The day the window closes, `YYYY-MM-DD`.
+    pub fn close_date(&self) -> &str {
+        self.closes_at.get(..10).unwrap_or(&self.closes_at)
     }
 }
 

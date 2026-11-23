@@ -255,6 +255,7 @@ pub(super) fn build_record(
         // Both are the drain's to write when it decides: the handler files an
         // undecided application and has no decision to record.
         decided_at: None,
+        status_link_until: None,
         password_link: None,
         domain: body
             .then(|| {

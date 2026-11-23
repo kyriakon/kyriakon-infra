@@ -174,12 +174,16 @@ fn a_body_approval_without_an_outside_address_carries_the_confirmation() {
         sent.contains("To: parish-secretary@parish.example"),
         "{sent}"
     );
-    assert!(sent.contains("digital content"), "{sent}");
-    assert!(sent.contains("fourteen days"), "{sent}");
+    assert!(sent.contains("GBP 40.00"), "{sent}");
     assert!(
-        sent.contains("I give notice that I cancel my contract"),
+        sent.contains("consumer\nright to cancel within fourteen days does not apply"),
         "{sent}"
     );
+    assert!(
+        !sent.contains("I give notice that I cancel my contract"),
+        "{sent}"
+    );
+    assert!(!sent.contains("fourteen days to cancel"), "{sent}");
 }
 
 /// An address the applicant wrote cannot become a second recipient or a header
@@ -4400,4 +4404,45 @@ fn an_address_change_for_a_missing_group_settles_as_refused() {
     assert!(journal.contains("no group for parish.example"), "{journal}");
     assert!(!journal.contains("\"outcome\":\"failed\""), "{journal}");
     assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+}
+
+/// A body buying in the course of business is not a consumer, so its approval
+/// is not held even when the immediate-supply box was left unticked, and its
+/// mail claims neither the hold nor the fourteen-day cancellation right.
+#[test]
+fn a_group_approval_is_not_held_and_claims_no_cancellation_right() {
+    let fix = Fix::new("group-no-hold");
+    let mut record = fix.filed_body("warden");
+    record["acceptances"] = json!([{"document": "terms", "version": "2026-10-01 abc1234"}]);
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let opened = group["payment"]["window"]["opened_at"]
+        .as_str()
+        .expect("a paid group has a window");
+    let opened =
+        OffsetDateTime::parse(opened, &time::format_description::well_known::Rfc3339).unwrap();
+    assert_eq!(
+        (opened.date() - OffsetDateTime::now_utc().date()).whole_days(),
+        0,
+        "the group's window opens at approval: {group}"
+    );
+    assert!(
+        fix.scripts_log().contains("provision-group"),
+        "the group was made at approval: {}",
+        fix.scripts_log()
+    );
+    let sent = fix.sent();
+    assert!(sent.contains("GBP 40.00"), "{sent}");
+    assert!(!sent.contains("hold the account"), "{sent}");
+    assert!(!sent.contains("You have fourteen days to cancel"), "{sent}");
+    assert!(
+        sent.contains("consumer\nright to cancel within fourteen days does not apply"),
+        "{sent}"
+    );
 }

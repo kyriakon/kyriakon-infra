@@ -134,6 +134,10 @@ pub struct GroupView {
     pub token: Option<String>,
     /// The day the group's one window closes, while it runs.
     pub window_closes: Option<String>,
+    /// The day a held window opens, while the cancellation period runs. A body
+    /// is not held, so this is absent on every approval this build writes and
+    /// present only on a record from the release before the exemption.
+    pub window_opens: Option<String>,
     pub accounts: Vec<String>,
     /// The space its mailboxes use together, and the allowance they add up to.
     /// The quota lives on the group record, summed by the drain from the same
@@ -153,6 +157,12 @@ impl GroupView {
     pub fn from_record(group: &kyriakon_control_core::store::GroupRecord) -> GroupView {
         let payment = &group.payment;
         let window = payment.window.as_ref();
+        let now = OffsetDateTime::now_utc();
+        // A future open date is the cancellation-period hold. It is not this
+        // build's group path, but a record left by the release before the body
+        // exemption must not read as payment due with a close date it has not
+        // reached.
+        let held = window.is_some_and(|w| w.held(now));
         // A closed window is the lapse, whether or not the mailbox states have
         // been swept: the page reads the group's own record, and that record is
         // what says the group lapsed.
@@ -160,6 +170,8 @@ impl GroupView {
             "free"
         } else if payment.paid_until.is_some() {
             "active"
+        } else if held {
+            "held"
         } else if window
             .is_some_and(|w| w.state == kyriakon_control_core::account::state::WindowState::Closed)
         {
@@ -180,9 +192,14 @@ impl GroupView {
             token: payment.token_ref.clone().filter(|_| unpaid),
             window_closes: window
                 .filter(|w| {
-                    unpaid && w.state == kyriakon_control_core::account::state::WindowState::Open
+                    !held
+                        && unpaid
+                        && w.state == kyriakon_control_core::account::state::WindowState::Open
                 })
-                .map(|w| w.closes_at[..10.min(w.closes_at.len())].to_string()),
+                .map(|w| w.close_date().to_string()),
+            window_opens: window
+                .filter(|_| unpaid && held)
+                .map(|w| w.open_date().to_string()),
             accounts: group.accounts.clone(),
             space_used: group.space_used.map(space),
             allowance: format!(
@@ -471,15 +488,11 @@ pub fn payment(
 ) -> PaymentView {
     let unpaid = payment.paid_until.is_none();
     let window = payment.window.as_ref().filter(|_| unpaid);
-    let closes_on = window.map(|w| w.closes_at.get(..10).unwrap_or(&w.closes_at).to_string());
+    let closes_on = window.map(|w| w.close_date().to_string());
     // A window whose open date is still ahead is the fourteen-day hold the
     // terms describe: the cancellation period has not run, so the window has
     // not started and is neither running nor lapsed.
-    let held = window.is_some_and(|w| {
-        w.state == kyriakon_control_core::account::state::WindowState::Open
-            && kyriakon_control_core::util::days_left(&w.opened_at, now)
-                .is_some_and(|days| days > 0)
-    });
+    let held = window.is_some_and(|w| w.held(now));
     // A window whose state is still `open` after its close date has not been
     // swept yet, and the member reads the same `Lapsed` the sweep will write:
     // the date, not the sweep's own progress, is what the page is about.
@@ -499,8 +512,10 @@ pub fn payment(
         })
     } else if held {
         window.map(|w| {
-            let opens = w.opened_at.get(..10).unwrap_or(&w.opened_at);
-            format!("opens on {opens}: the fourteen days you have to cancel run first")
+            format!(
+                "opens on {}: the fourteen days you have to cancel run first",
+                w.open_date()
+            )
         })
     } else {
         None

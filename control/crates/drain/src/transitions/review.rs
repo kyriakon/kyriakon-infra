@@ -213,7 +213,9 @@ fn review_body(cfg: &DrainConfig, key: &[u8], record: &Record) -> Result<String,
     ));
     out.push_str(&format!(
         "Immediate supply requested: {}\n",
-        if record.immediate_supply() {
+        if record.domain.is_some() {
+            "not applicable (a body buying in the course of business is not held)"
+        } else if record.immediate_supply() {
             "yes"
         } else {
             "no (the account is held for fourteen days)"
@@ -318,6 +320,51 @@ pub async fn decision(
         // is total.
         other => Err(Error::Failed(format!("kind {other:?} is not a decision"))),
     }
+}
+
+/// Make the member on the box: the keyring, the OS account, the member's
+/// address and lanes, and the published public key. Shared by the immediate
+/// approval and the sweep that supplies a held account, so the two cannot
+/// install different things. Every step tolerates being run again, because a
+/// pass that died halfway is retried rather than reset.
+async fn provision_member(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+    record: &Record,
+    on_box: bool,
+) -> Result<(), Error> {
+    // The keyring first, before the builder makes the address live: the
+    // encrypting LMTP fails closed without the member's key, so mail offered
+    // between the two would bounce at the door.
+    publish_mail_keys(cfg, username, &record.mail_keys).await?;
+    if !on_box {
+        run_script_tolerating(cfg, "add-user.sh", &[username], "already exists").await?;
+    }
+    // The member is always built, because mail is unconditional: the builder
+    // writes the member's address and the allowance, and the key decides
+    // only what else. When the application carried one, it is written where
+    // that script reads it first, since the public tree and the upload
+    // session are built from it.
+    if let Some(upload) = record.upload_key.as_ref() {
+        write_public_key(store, username, &upload.material).await?;
+    }
+    run_script(cfg, "provision-member.sh", &[username]).await?;
+    // The lanes wrote the member's httpd and gmid files, and regenerating the
+    // indexes and reloading those daemons is cron-apply.sh --web's job, as
+    // its own header says. Only a hosting member has new files, so a
+    // mail-only approval does not run it and prints nothing.
+    if record.upload_key.is_some() {
+        run_script(cfg, "cron-apply.sh", &["--web"]).await?;
+    }
+    // Last, with the member already built and mail already delivering: the
+    // published set is what the drift check compares the keyring against, and
+    // the forge is never on a path the key or the member waits on. A failure
+    // here is loud and leaves the work for the next pass, and the retry above
+    // leaves the keyring file alone, so the seven days the check allows an
+    // unpublished key are not restarted by it.
+    publish_mail_keys_publicly(cfg, username, &record.mail_keys).await?;
+    Ok(())
 }
 
 /// The approval path, charged and without charge. `no_charge` is the free
@@ -496,41 +543,19 @@ async fn approve(
     )
     .await?;
 
-    // Provisioning, and only when there is no account record yet, so a retry
-    // does not repeat it. When the box already holds the name this application
-    // started, add-user.sh is skipped: it is not idempotent, and the account it
-    // would refuse is the one this application made.
-    if existing.is_none() {
-        // The keyring first, before the builder makes the address live: the
-        // encrypting LMTP fails closed without the member's key, so mail offered
-        // between the two would bounce at the door.
-        publish_mail_keys(cfg, username, &record.mail_keys).await?;
-        if !on_box {
-            run_script_tolerating(cfg, "add-user.sh", &[username], "already exists").await?;
-        }
-        // The member is always built, because mail is unconditional: the builder
-        // writes the member's address and the allowance, and the key decides
-        // only what else. When the application carried one, it is written where
-        // that script reads it first, since the public tree and the upload
-        // session are built from it.
-        if let Some(upload) = record.upload_key.as_ref() {
-            write_public_key(store, username, &upload.material).await?;
-        }
-        run_script(cfg, "provision-member.sh", &[username]).await?;
-        // The lanes wrote the member's httpd and gmid files, and regenerating the
-        // indexes and reloading those daemons is cron-apply.sh --web's job, as
-        // its own header says. Only a hosting member has new files, so a
-        // mail-only approval does not run it and prints nothing.
-        if record.upload_key.is_some() {
-            run_script(cfg, "cron-apply.sh", &["--web"]).await?;
-        }
-        // Last, with the member already built and mail already delivering: the
-        // published set is what the drift check compares the keyring against, and
-        // the forge is never on a path the key or the member waits on. A failure
-        // here is loud and leaves the intent in place, and the retry above leaves
-        // the keyring file alone, so the seven days the check allows an
-        // unpublished key are not restarted by it.
-        publish_mail_keys_publicly(cfg, username, &record.mail_keys).await?;
+    // Whether the terms require the account to be held for the fourteen days
+    // the applicant has to cancel. Groups are not held: a body buying in the
+    // course of business is not a consumer. This is the person path, so the
+    // answer is the checkbox's own absence.
+    let held = !record.immediate_supply();
+
+    // Provisioning, and only when there is no account record yet and no hold,
+    // so a retry does not repeat it. When the box already holds the name this
+    // application started, add-user.sh is skipped: it is not idempotent, and
+    // the account it would refuse is the one this application made. A held
+    // approval writes its record and waits for `provision_held`.
+    if existing.is_none() && !held {
+        provision_member(cfg, store, username, &record, on_box).await?;
     }
 
     let now_at = OffsetDateTime::now_utc();
@@ -617,26 +642,51 @@ async fn approve(
     // to read a lane nobody has turned off as off.
     let hosted = record.upload_key.is_some().then_some(true);
 
-    // The link this approval mails and stores on the status page. The mailbox's
-    // own record carries the same token, so `set_password` authorizes from the
-    // account and a retry keeps the token and date the first pass put in the mail.
-    let account_password_link = existing
-        .as_ref()
-        .and_then(|a| a.password_link.clone())
-        .unwrap_or_else(|| PasswordLink {
-            token: record.status_token.clone(),
-            until: util::date_after_days(7),
-        });
-    // Signed and recorded with the account's own token, never the status token:
-    // a reset between the first pass and a retry replaces the account's link, so
-    // a link built from the status token would be one the drain refuses.
-    let password_until = account_password_link.until.clone();
-    let password_token = account_password_link.token.clone();
+    // The hold's last day. A paid hold takes its date from the window that
+    // opens when the hold ends, so the account and the payment cannot disagree;
+    // a free account has no window, so the same fortnight is counted here.
+    let hold_until = if held {
+        existing
+            .as_ref()
+            .and_then(|a| a.hold_until.clone())
+            .or_else(|| {
+                Some(match window.as_ref() {
+                    Some(window) => window.open_date().to_string(),
+                    None => util::date_after_days(14),
+                })
+            })
+    } else {
+        None
+    };
+
+    // The link this approval mails and stores on the status page. A held
+    // account has none yet: the link's seven days would run out before the
+    // hold ends, so `provision_held` mints it when the mailbox is made. The
+    // mailbox's own record carries the same token, so `set_password`
+    // authorizes from the account and a retry keeps the token and date the
+    // first pass put in the mail.
+    let account_password_link = if held {
+        existing.as_ref().and_then(|a| a.password_link.clone())
+    } else {
+        Some(
+            existing
+                .as_ref()
+                .and_then(|a| a.password_link.clone())
+                .unwrap_or_else(|| PasswordLink {
+                    token: record.status_token.clone(),
+                    until: util::date_after_days(7),
+                }),
+        )
+    };
 
     let account = Account {
         version: 1,
         username: username.clone(),
-        state: Standing::Active,
+        state: if held {
+            Standing::Held
+        } else {
+            Standing::Active
+        },
         decision: "approve".to_string(),
         decided_at: now.clone(),
         rail: if no_charge {
@@ -646,12 +696,15 @@ async fn approve(
         },
         no_charge,
         created_at: now.clone(),
+        hold_until: hold_until.clone(),
         payment,
         legacy_payment: FlatPayment::default(),
         outside_address: record.outside_address.clone(),
         certificates: Vec::new(),
-        site_served: hosted,
-        capsule_served: hosted,
+        // A held account is not on the box, so neither lane is served. The
+        // sweep that supplies it records the lanes provision-member.sh wrote.
+        site_served: if held { Some(false) } else { hosted },
+        capsule_served: if held { Some(false) } else { hosted },
         space_used: None,
         upload_keys,
         mail_key: record
@@ -663,7 +716,7 @@ async fn approve(
         // the first pass; the window outlives the intent either way.
         rotation: existing.as_ref().and_then(|a| a.rotation.clone()),
         suspension_reason: None,
-        password_link: Some(account_password_link),
+        password_link: account_password_link,
         group: None,
         closing_until: None,
         closing_prior_state: None,
@@ -717,7 +770,14 @@ async fn approve(
             Error::Failed("the application record vanished mid-approval".to_string())
         })?)
         .map_err(|e| Error::context("the application record does not parse", e))?;
-    app_copy["status_link_until"] = json!(util::after_days(7));
+    // Seven days for a supplied account. A held one keeps the page until its
+    // hold ends plus seven, because the page is where a member with no outside
+    // address collects the password link after provisioning.
+    app_copy["status_link_until"] = json!(if held {
+        util::after_days(14 + 7)
+    } else {
+        util::after_days(7)
+    });
     // The handler renders the status page as `_onboard` and cannot read the
     // root-owned account, so the payment block it shows is this copy, written
     // back into the record it does read. A free approval carries none, which is
@@ -739,13 +799,68 @@ async fn approve(
     // enqueued. The address outside the platform when one was given, and the
     // mailbox the approval just created otherwise.
     let subject = decision_subject("approved", username);
+
+    // A held approval has no mailbox, so there is no approval mail with a
+    // password link yet; that mail is sent by `provision_held`. The outside
+    // address, when there is one, hears the decision and the hold date now.
+    if held {
+        let hold = hold_until.as_deref().unwrap_or_default();
+        if let Some(to) = outside_address(&record)? {
+            let mut body = decision_body(
+                cfg,
+                &record.username,
+                &record.rail,
+                no_charge,
+                account.payment.as_ref(),
+                Some(&record.status_token),
+            )?;
+            body.push_str(&format!(
+                "\nWe will create the account on {hold}, after the fourteen days you have\n\
+                 to cancel have passed. Nothing is supplied before then.\n"
+            ));
+            let notice_type = if no_charge {
+                "approval.held.free"
+            } else {
+                "approval.held.paid"
+            };
+            notice::send_account_notice_retryable(
+                cfg,
+                store,
+                username,
+                notice_type,
+                &subject,
+                &to,
+                &body,
+            )
+            .await?;
+        }
+        mark_decided(
+            store,
+            token,
+            &format!("approved: the account is held until {hold}"),
+            &now,
+            None,
+        )
+        .await?;
+        return Ok(Settlement::line(
+            "applied",
+            intent.application.clone(),
+            None,
+        ));
+    }
+
     // Built before the body, so the mail that says the account exists also says
     // how to set the password. The spec asks for the link in the email and on
     // the status page both.
+    let live_link = account
+        .password_link
+        .as_ref()
+        .ok_or_else(|| Error::Failed("a supplied account has no password link".to_string()))?;
+    let password_until = live_link.until.clone();
     let password_link = sign::password_link(
         &cfg.base_url,
         key,
-        &password_token,
+        &live_link.token,
         &record.username,
         &password_until,
     )?;
@@ -899,10 +1014,10 @@ async fn approve_group(
             .to_string(),
             no_charge,
             token_ref: None,
-            // The same hold the person path applies: without the immediate-supply
-            // request the window opens after the fourteen days to cancel.
-            window: (!no_charge)
-                .then(|| Window::on_approval(OffsetDateTime::now_utc(), record.immediate_supply())),
+            // A body buying in the course of business is not a consumer, so
+            // the cancellation-period hold does not apply and the window opens
+            // at approval however the checkbox was answered.
+            window: (!no_charge).then(|| Window::on_approval(OffsetDateTime::now_utc(), true)),
             paid_until: None,
             stripe: Default::default(),
             monero: None,
@@ -978,36 +1093,22 @@ async fn approve_group(
         None
     };
     let payment_note = match (&written.payment.token_ref, &written.payment.window) {
-        (Some(token), Some(window)) if !written.payment.no_charge => {
-            let held = util::days_left(&window.opened_at, OffsetDateTime::now_utc())
-                .is_some_and(|days| days > 0);
-            let hold = if held {
-                format!(
-                    "\nYou did not ask us to start now, so the payment window opens on {}: \
-                     the fourteen days you have to cancel run first, and nothing is due \
-                     before then.",
-                    &window.opened_at[..10.min(window.opened_at.len())]
-                )
-            } else {
-                String::new()
-            };
-            format!(
-                "\n\nThe amount is GBP {price} for the year, for the whole group. Your payment \
-                 reference is {token}.\n{}\
-                 \nThe money must arrive before {} or the whole group lapses: mail keeps \
-                 arriving and everything published stays up, and sending, uploading and \
-                 pushing stop. Nothing is deleted at that point.{hold}\n",
-                rail_instructions(
-                    &written.payment.rail,
-                    &cfg.postal_address,
-                    link.as_deref(),
-                    None,
-                    price,
-                )
-                .join("\n"),
-                &window.closes_at[..10.min(window.closes_at.len())]
+        (Some(token), Some(window)) if !written.payment.no_charge => format!(
+            "\n\nThe amount is GBP {price} for the year, for the whole group. Your payment \
+             reference is {token}.\n{}\
+             \nThe money must arrive before {} or the whole group lapses: mail keeps \
+             arriving and everything published stays up, and sending, uploading and \
+             pushing stop. Nothing is deleted at that point.\n",
+            rail_instructions(
+                &written.payment.rail,
+                &cfg.postal_address,
+                link.as_deref(),
+                None,
+                price,
             )
-        }
+            .join("\n"),
+            window.close_date()
+        ),
         _ => "\n\nThe group was approved without charge: there is nothing to pay, no \
               payment window, and the group does not lapse.\n"
             .to_string(),
@@ -1065,6 +1166,238 @@ async fn approve_group(
         intent.application.clone(),
         None,
     ))
+}
+
+/// Supply every account whose fourteen-day hold has ended: make the member on
+/// the box, mint the password link, send the approval mail, and only then move
+/// the record from `held` to `active`. The path is a sweep rather than an
+/// intent because the clock is the trigger, and it runs before `window_sweep`
+/// so a paid account is active on the day its payment window opens.
+///
+/// The order is what makes a crash safe. The link and the served lanes are
+/// written while the account is still `held`, so a failed send leaves the
+/// record for the next pass; the notice line is written before the enqueue, so
+/// the retry does not send a second approval mail; and the state moves last.
+pub async fn provision_held(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    key: &[u8],
+) -> Result<(), Error> {
+    let today = OffsetDateTime::now_utc().date();
+    for username in store.list("accounts").await? {
+        let account = match store.account(&username).await {
+            Ok(Some(account)) => account,
+            Ok(None) => continue,
+            Err(e) => {
+                super::lifecycle::report_record(
+                    cfg,
+                    store,
+                    journal,
+                    "account",
+                    &username,
+                    &Error::from(e),
+                )
+                .await;
+                continue;
+            }
+        };
+        if account.state != Standing::Held {
+            continue;
+        }
+        let Some(hold) = account.hold_until.as_deref() else {
+            super::lifecycle::report_record(
+                cfg,
+                store,
+                journal,
+                "account",
+                &username,
+                &Error::Failed("a held account has no hold date".to_string()),
+            )
+            .await;
+            continue;
+        };
+        let Some(until) = util::parse_date(hold) else {
+            super::lifecycle::report_record(
+                cfg,
+                store,
+                journal,
+                "account",
+                &username,
+                &Error::Failed(format!("the hold date {hold:?} cannot be read")),
+            )
+            .await;
+            continue;
+        };
+        if until > today {
+            continue;
+        }
+
+        // One account's failure is reported and skipped, so a missing copy or a
+        // failed script cannot stop the payment, grace and bounce sweeps that
+        // follow this one. The journal keeps "applying", so the next pass
+        // retries the same account.
+        let outcome: Result<(), Error> = async {
+            let id = format!("provision-held-{username}");
+            let application = ApplicationRef::account(username.clone());
+            if !journal.has(&id, "applying") {
+                write_journal(
+                    store,
+                    journal,
+                    &cfg.release,
+                    &id,
+                    "provision-held",
+                    &application,
+                    "applying",
+                    Some("the fourteen-day hold has ended"),
+                )
+                .await?;
+            }
+
+            // The keys are in the record the approval kept for the account; a
+            // record that is gone cannot make a mailbox whose mail would deliver,
+            // so it is a failure of this pass rather than a reason to go on.
+            let text = store
+                .account_application_text(&username)
+                .await?
+                .ok_or_else(|| {
+                    Error::Failed(format!(
+                        "the held account {username} has no application copy to supply it from"
+                    ))
+                })?;
+            let record: Record = serde_json::from_str(&text)
+                .map_err(|e| Error::context("the held account's application copy", e))?;
+            if record.username != username {
+                return Err(Error::Failed(format!(
+                    "the approval copy under {username} names {}",
+                    record.username
+                )));
+            }
+
+            provision_member(
+                cfg,
+                store,
+                &username,
+                &record,
+                account_on_box(cfg, &username)?,
+            )
+            .await?;
+
+            // A link that is still in date is kept, so a retry after a failed send
+            // mails the one the status page already shows; an expired one is
+            // replaced, because a link whose date has passed is refused.
+            let link = match account.password_link.clone() {
+                Some(link) if util::parse_date(&link.until).is_some_and(|d| d >= today) => link,
+                _ => PasswordLink {
+                    token: record.status_token.clone(),
+                    until: util::date_after_days(7),
+                },
+            };
+            let signed =
+                sign::password_link(&cfg.base_url, key, &link.token, &username, &link.until)?;
+            let hosted = !account.upload_keys.is_empty();
+            let link_for_write = link.clone();
+            store
+                .update_account(&username, move |current| {
+                    if let Some(account) = current.as_mut() {
+                        account.password_link = Some(link_for_write.clone());
+                        account.site_served = Some(hosted);
+                        account.capsule_served = Some(hosted);
+                    }
+                    Ok::<(), Error>(())
+                })
+                .await?;
+
+            if let Some(mut filed) = store.application(&record.status_token).await? {
+                filed.password_link = Some(signed.clone());
+                filed.status_link_until = Some(util::after_days(7));
+                filed.stage = "approved: an account was made".to_string();
+                let bytes = serde_json::to_vec_pretty(&filed).map_err(|source| Error::Json {
+                    context: "encode the supplied application",
+                    source,
+                })?;
+                store
+                    .write_filed_application(&record.status_token, &bytes)
+                    .await?;
+            }
+
+            let subject = decision_subject("approved", &username);
+            // The member may have paid during the hold, from the instructions
+            // the held notice carried. Do not ask again for money the account
+            // already holds.
+            let decision = match account
+                .payment
+                .as_ref()
+                .and_then(|payment| payment.paid_until.as_deref())
+            {
+                Some(paid_until) if !account.no_charge => format!(
+                    "Your application for {username} has been approved.\n\n\
+                     The year is paid until {paid_until}.\n"
+                ),
+                _ => decision_body(
+                    cfg,
+                    &record.username,
+                    &record.rail,
+                    account.no_charge,
+                    account.payment.as_ref(),
+                    Some(&record.status_token),
+                )?,
+            };
+            let body = approval_body(
+                cfg,
+                &record,
+                account.no_charge,
+                decision,
+                &link.until,
+                &signed,
+            );
+            let notice_type = if account.no_charge {
+                "approval.free"
+            } else {
+                "approval.paid"
+            };
+            let to = recipient(&record, &username)?;
+            notice::send_account_notice_retryable(
+                cfg,
+                store,
+                &username,
+                notice_type,
+                &subject,
+                &to,
+                &body,
+            )
+            .await?;
+
+            store
+                .update_account(&username, move |current| {
+                    if let Some(account) = current.as_mut() {
+                        account.hold_until = None;
+                        if account.state == Standing::Held {
+                            account.state = Standing::Active;
+                        }
+                    }
+                    Ok::<(), Error>(())
+                })
+                .await?;
+            write_journal(
+                store,
+                journal,
+                &cfg.release,
+                &id,
+                "provision-held",
+                &application,
+                "applied",
+                Some("the account is on the box and the approval mail has gone"),
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = outcome {
+            super::lifecycle::report_record(cfg, store, journal, "account", &username, &e).await;
+        }
+    }
+    Ok(())
 }
 
 /// The decline: no reason, a message that offers the way back, the application
@@ -1253,7 +1586,12 @@ fn confirmation_subject(username: &str) -> String {
 /// Schedule 3 Part B form. The text here is the durable-medium copy of the
 /// contract summary, so it is complete without the applicant opening the site.
 fn confirmation_body(cfg: &DrainConfig, record: &Record, no_charge: bool) -> String {
-    let mut out = if record.immediate_supply() {
+    let group = record.domain.is_some();
+    let mut out = if group {
+        // A body is not a consumer, so the cancellation right and the hold do
+        // not apply to it. The approval itself is the notice.
+        String::from("This confirms the approval of your application.\n\nYou accepted:\n\n")
+    } else if record.immediate_supply() {
         String::from(
             "We are starting your account now, before the cancellation period ends:\n\
              digital content is supplied immediately, and this does not take your right\n\
@@ -1262,19 +1600,13 @@ fn confirmation_body(cfg: &DrainConfig, record: &Record, no_charge: bool) -> Str
         )
     } else {
         // The terms say an application that gives neither consent is held until
-        // the fourteen days have passed. On a paid approval that is the payment
-        // window opening later; a free account has no window and nothing to
-        // bill, so the right is restated without claiming a hold that would not
-        // happen.
-        let hold = if no_charge {
-            "You did not ask us to start now, so the fourteen days you have to\n\
-             cancel run in full. There is no charge, so nothing is billed.\n\n"
-        } else {
+        // the fourteen days have passed. That is true of a free approval too:
+        // the cancellation right is about supply, not payment.
+        String::from(
             "You did not ask us to start now, so we will hold the account for the\n\
-             fourteen days you have to cancel. The payment window opens after they\n\
-             have passed, and no money is due before then.\n\n"
-        };
-        format!("{hold}You accepted:\n\n")
+             fourteen days you have to cancel. Nothing is supplied before then.\n\n\
+             You accepted:\n\n",
+        )
     };
     for acceptance in &record.acceptances {
         out.push_str(&format!(
@@ -1311,6 +1643,19 @@ fn confirmation_body(cfg: &DrainConfig, record: &Record, no_charge: bool) -> Str
             "The price is GBP {price} for one year, for {what}. The year starts on the day\n\
              we record your payment.\n"
         ));
+    }
+    if group {
+        out.push_str(
+            "\nThis contract is with a body in the course of business, so the consumer\n\
+             right to cancel within fourteen days does not apply.\n",
+        );
+        return out;
+    }
+    if !record.immediate_supply() && !no_charge {
+        out.push_str(
+            "\nThe payment window opens after the fourteen days you have to cancel, and\n\
+             no money is due before then.\n",
+        );
     }
     out.push_str(
         "\nYou have fourteen days to cancel, starting the day the contract is made. The\n\
@@ -1450,18 +1795,18 @@ fn decision_body(
     // A held window opens after the cancellation period, so the payment
     // instructions above are not live yet. Say when they become live rather
     // than let the applicant think a payment made now is expected.
-    if util::days_left(&window.opened_at, OffsetDateTime::now_utc()).is_some_and(|days| days > 0) {
+    if window.held(OffsetDateTime::now_utc()) {
         out.push_str(&format!(
             "\nYou did not ask us to start now, so the payment window opens on {}:\n\
              the fourteen days you have to cancel run first. Nothing is due before then.\n",
-            &window.opened_at[..10]
+            window.open_date()
         ));
     }
     out.push_str(&format!(
         "\nThe money must arrive before {} or the account lapses: mail keeps arriving and\n\
          everything published stays up, and sending, uploading and pushing stop.\n\
          Nothing is deleted at that point.\n",
-        &window.closes_at[..10]
+        window.close_date()
     ));
     Ok(out)
 }
@@ -1711,12 +2056,37 @@ mod tests {
             "recipe text",
             &[],
         );
-        assert!(body.contains("fourteen days to cancel"), "{body}");
         assert!(body.contains(&cfg.postal_address), "{body}");
         assert!(body.contains("GBP 40.00"), "{body}");
         assert!(
-            body.contains("I give notice that I cancel my contract"),
+            body.contains("the consumer\nright to cancel within fourteen days does not apply"),
             "{body}"
         );
+        assert!(!body.contains("You have fourteen days to cancel"), "{body}");
+        assert!(
+            !body.contains("I give notice that I cancel my contract"),
+            "{body}"
+        );
+    }
+
+    /// A body buying in the course of business is not a consumer, so its
+    /// approval mail claims no hold and no cancellation right.
+    #[test]
+    fn a_group_approval_mail_claims_no_cancellation_right_or_hold() {
+        let cfg = test_config();
+        let mut record = record(&[]);
+        record.domain = Some("body.example".to_string());
+        let body = group_approval_body(
+            &cfg,
+            &record,
+            false,
+            "body.example",
+            "\n\nThe amount is GBP 40.00 for the year, for the whole group.\n",
+            "recipe text",
+            &[],
+        );
+        assert!(!body.contains("hold the account"), "{body}");
+        assert!(!body.contains("fourteen days you have to cancel"), "{body}");
+        assert!(!body.contains("You have fourteen days to cancel"), "{body}");
     }
 }
