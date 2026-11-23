@@ -255,7 +255,10 @@ file_approval() {
 		upload_key: {mailbox: "", fingerprint: "SHA256:fixture", material: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample alice@example", verdict: "unchecked"},
 		rail: "",
 		no_charge: true,
-		acceptances: [],
+		# The applicant asked us to start now, so the approval supplies the
+		# account at once. Without this the fourteen-day hold leaves the
+		# keyring empty until its sweep, which is not what this pass checks.
+		acceptances: [{"document": "immediate supply and the digital-content acknowledgement", "version": "fixture"}],
 		question_list: "fixture"
 	}' > "$tree/store/applications/$status_token.json"
 }
