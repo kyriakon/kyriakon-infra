@@ -1,8 +1,8 @@
 //! Tests for the account module.
 
 use crate::responder::test_support::*;
-use crate::responder::*;
 use kyriakon_control_core::{account::session, mail::keycheck};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
