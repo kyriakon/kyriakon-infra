@@ -58,8 +58,8 @@
 # the daily mail already covers the permissions half.
 #
 #   ksh scripts/check-hygiene.sh --self-test   the checks that run on fixtures:
-#                                              sections 1, 4, 6, 7, 8, 9 and 10,
-#                                              and section 3's remedy lines
+#                                              sections 1, 4, 6, 7, 8, 9, 10 and
+#                                              12, and section 3's remedy lines
 
 set -euo pipefail
 
@@ -1322,21 +1322,37 @@ fi
 # decide the root key, the password policy and disk encryption for every image
 # built from the template, so a copy that differs from the tracked one is a
 # second, unreviewed answer to those questions. deploy-mail.sh installs it from
-# the row in install-set.tsv; this compares what is served with what is tracked.
-tracked_install_conf="$repo_dir/openbsd/restore-template/install.conf"
-served_install_conf=/home/www/kyriakon.net/www/install.conf
-if [ ! -f "$tracked_install_conf" ]; then
-	printf 'restore response file: %s is missing from the checkout, so the served copy was not compared\n' \
-		"$tracked_install_conf"
+# the row in install-set.tsv; this reads the same row, so a renamed source or
+# served name moves both, and compares what is served with what is tracked.
+hygiene_install_set="$repo_dir/scripts/install-set.tsv"
+install_conf_rows=''
+install_conf_rows=$(manifest_targets_route "$hygiene_install_set" /home/www/kyriakon.net/www mail) \
+	|| install_conf_rows=''
+install_conf_count=$(printf '%s' "$install_conf_rows" | grep -c . || true)
+if [ "$install_conf_count" -ne 1 ]; then
+	printf 'restore response file: %s names %s row(s) for /home/www/kyriakon.net/www, so the served copy was not checked\n' \
+		"$hygiene_install_set" "$install_conf_count"
+	printf '  the manifest should name exactly the file the installer fetches\n'
 	status=1
 else
-	install_conf_problem=$(served_copy_problem "$tracked_install_conf" "$served_install_conf")
-	if [ -n "$install_conf_problem" ]; then
-		printf 'restore response file: %s\n' "$install_conf_problem"
-		printf '  scripts/deploy-mail.sh installs it from the manifest row; rerun it from this checkout\n'
+	IFS="$(printf '\t')" read -r install_conf_source install_conf_name <<EOF
+$install_conf_rows
+EOF
+	tracked_install_conf="$repo_dir/$install_conf_source"
+	served_install_conf="/home/www/kyriakon.net/www/$install_conf_name"
+	if [ ! -f "$tracked_install_conf" ]; then
+		printf 'restore response file: %s is missing from the checkout, so the served copy was not compared\n' \
+			"$tracked_install_conf"
 		status=1
 	else
-		printf 'restore response file: the served copy matches the tracked one\n'
+		install_conf_problem=$(served_copy_problem "$tracked_install_conf" "$served_install_conf")
+		if [ -n "$install_conf_problem" ]; then
+			printf 'restore response file: %s\n' "$install_conf_problem"
+			printf '  scripts/deploy-mail.sh installs it from the manifest row; rerun it from this checkout\n'
+			status=1
+		else
+			printf 'restore response file: the served copy matches the tracked one\n'
+		fi
 	fi
 fi
 

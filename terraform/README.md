@@ -175,8 +175,9 @@ parsing is left to chance. This section is where the reasoning lives.
 
 That file is installed at `https://kyriakon.net/install.conf` by
 `scripts/deploy-mail.sh`, which copies the tracked file into the landing site's
-document root. The `scripts/install-set.tsv` row is what routes a change to that
-deploy, so the served copy follows the repository rather than a hand edit on the
+document root. `scripts/deploy.sh` routes a change to that file to the mail
+deploy, and the `scripts/install-set.tsv` row names the source and the served
+name, so the served copy follows the repository rather than a hand edit on the
 box. `scripts/check-hygiene.sh` compares the served bytes with the tracked ones;
 run it before building or refreshing a template. The URL is short because it is
 typed into a VNC console. The name has to stay `install.conf`: the installer
