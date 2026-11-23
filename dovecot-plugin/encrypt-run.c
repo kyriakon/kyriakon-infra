@@ -52,26 +52,30 @@ remaining_ms(long long deadline)
 	return (int)left;
 }
 
-/* Wait until fd is ready for `events`. 1 is ready, 0 is the deadline, -1 is
- * an error with errno set. */
+/* Wait up to a short slice for fd. The caller retries its read or write after
+ * the slice, which is what notices a closed pipe on a host whose poll does not
+ * wake a writer when the read end disappears. 1 means try again, 0 means the
+ * overall deadline passed, -1 is an error with errno set. */
 static int
 wait_ready(int fd, short events, long long deadline)
 {
-	for (;;) {
-		struct pollfd pollfd;
-		int left = remaining_ms(deadline);
-		int ret;
+	struct pollfd pollfd;
+	int left = remaining_ms(deadline);
+	int ret;
 
-		if (left == 0)
-			return 0;
-		pollfd.fd = fd;
-		pollfd.events = events;
-		pollfd.revents = 0;
-		ret = poll(&pollfd, 1, left);
-		if (ret < 0 && errno == EINTR)
-			continue;
-		return ret;
-	}
+	if (left == 0)
+		return 0;
+	if (left > 100)
+		left = 100;
+	pollfd.fd = fd;
+	pollfd.events = events;
+	pollfd.revents = 0;
+	ret = poll(&pollfd, 1, left);
+	if (ret < 0)
+		return errno == EINTR ? 1 : -1;
+	if (ret == 0)
+		return remaining_ms(deadline) == 0 ? 0 : 1;
+	return 1;
 }
 
 static void

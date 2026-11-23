@@ -827,10 +827,13 @@ main(int argc, char **argv)
 		free(result.ciphertext);
 
 	mode(NULL);
-	ok = kyriakon_encrypt_message("/nonexistent/kyriakon-encrypt", "alice",
-				      "/keyring", "/gpg", input, input_len,
-				      &result);
+	ok = kyriakon_encrypt_message_timeout("/nonexistent/kyriakon-encrypt",
+					      "alice", "/keyring", "/gpg",
+					      input, input_len, 5000, &result);
 	expect(!ok, "a missing encryptor is rejected");
+	if (strstr(result.error, "cannot run") == NULL)
+		fprintf(stderr, "missing encryptor: ok=%d exit=%d error=%s\n",
+			ok, result.exit_code, result.error);
 	expect(strstr(result.error, "cannot run") != NULL,
 	       "a missing encryptor says which one");
 
