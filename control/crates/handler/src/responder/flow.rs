@@ -13,7 +13,7 @@ use crate::{capsule, page};
 use kyriakon_control_core::flow::applicant::{body_cross_checks, mail_key_errors};
 use kyriakon_control_core::flow::questions::{Branch, Rule};
 use kyriakon_control_core::store::{Acceptance, Record};
-use kyriakon_control_core::{flow::questions, flow::validate, mail::keycheck, util};
+use kyriakon_control_core::{flow::questions, flow::validate, mail::keycheck, mail::pgp, util};
 
 /// Draw the intent id and write the application then the intent. The application
 /// goes first, so the drain never sees an intent whose application is not on
@@ -180,7 +180,7 @@ pub(super) fn build_record(
         .to_string();
 
     let mail_key_id = if body { "body_mail_key" } else { "mail_key" };
-    let blocks = keycheck::blocks(form.get(mail_key_id).map(String::as_str).unwrap_or(""));
+    let blocks = pgp::blocks(form.get(mail_key_id).map(String::as_str).unwrap_or(""));
     let mailboxes: Vec<String> = if body {
         questions::account_names(form)?
     } else {

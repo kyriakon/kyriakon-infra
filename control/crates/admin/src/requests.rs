@@ -3,6 +3,7 @@
 use crate::Error;
 use crate::*;
 use kyriakon_control_core::account::requests as account_requests;
+use kyriakon_control_core::mail::pgp;
 
 pub(crate) async fn request(
     cfg: &DrainConfig,
@@ -88,7 +89,6 @@ pub(crate) async fn request_verify(
         None => None,
     };
 
-    let parsed = split_message(&String::from_utf8_lossy(&message))?;
     let key_file = keycheck::keyring_file(&cfg.keyring_dir, username);
     if !key_file.is_file() {
         return Err(Error::Failed(format!(
@@ -96,44 +96,48 @@ pub(crate) async fn request_verify(
             key_file.display()
         )));
     }
-    if signature.is_none() && !parsed.clearsigned {
-        return Err(Error::Failed(
-            "the message is not clearsigned; pass --signature with its detached signature \
-             or export the message clearsigned from the client"
-                .to_string(),
-        ));
-    }
+    // The keyring entry the box delivers with is the expected signer, read from
+    // the exact material installed rather than from the record beside it. A
+    // block carrying a second primary key is refused here, so the hidden key
+    // cannot sign a request as though it were the visible one (#918).
+    let material = std::fs::read_to_string(&key_file)
+        .map_err(|e| Error::context(format!("cannot read {}", key_file.display()), e))?;
+    let expected = pgp::inspect_single_cert(&material)
+        .map_err(|e| Error::context(format!("the keyring entry for {username}"), e))?
+        .fingerprint;
     // A clearsigned file is verified over its armour alone, and the text shown
     // is GnuPG's own plaintext for that verification. Slicing the text out of
     // the file let a forged marker and signature line hide the real message and
     // show unsigned request text (#820, #924).
     let (fingerprint, from, text) = match &signature {
         Some(detached) => {
-            let fingerprint =
-                keycheck::verify_signature(&cfg.gpg, &key_file, &message, Some(detached))
-                    .await?
-                    .ok_or_else(|| {
-                        Error::Failed(format!(
-                            "the signature does not verify against {username}'s keyring entry"
-                        ))
-                    })?;
-            let from = parsed
-                .from
+            if !pgp::verify_detached(&cfg.gpg, &key_file, &expected, &message, detached).await? {
+                return Err(Error::Failed(format!(
+                    "the signature does not verify against {username}'s keyring entry"
+                )));
+            }
+            let from = pgp::header_from(pgp::message_headers(&message)?)?
                 .ok_or_else(|| Error::Failed("the message has no From: header".to_string()))?;
-            (fingerprint, from, parsed.signed)
+            (
+                expected,
+                from,
+                String::from_utf8_lossy(&message).into_owned(),
+            )
         }
         None => {
-            let verified =
-                keycheck::verify_clearsigned(&cfg.gpg, &key_file, parsed.signed.as_bytes())
-                    .await?
-                    .ok_or_else(|| {
-                        Error::Failed(format!(
-                            "the clearsigned message's signature does not verify against \
-                             {username}'s keyring entry, so there is no verified text to show"
-                        ))
-                    })?;
-            let armour_from = header_from(&verified.plaintext)?;
-            let from = signed_from(parsed.from, armour_from)?;
+            let verified = pgp::verify_clearsigned(&cfg.gpg, &key_file, &expected, &message)
+                .await?
+                .ok_or_else(|| {
+                    Error::Failed(
+                        "the message is not clearsigned; pass --signature with its \
+                             detached signature or export the message clearsigned from the \
+                             client"
+                            .to_string(),
+                    )
+                })?;
+            let armour_from = pgp::header_from(verified.plaintext.as_bytes())?;
+            let outer = pgp::header_from(pgp::outer_headers(&message)?)?;
+            let from = signed_from(outer, armour_from)?;
             (verified.fingerprint, from, verified.plaintext)
         }
     };
@@ -162,63 +166,6 @@ pub(crate) async fn request_verify(
     Ok(())
 }
 
-/// One request file, split where its signature must be checked.
-#[derive(Debug)]
-pub(crate) struct Message {
-    /// The `From:` outside the armour, if the file carries one. A clearsigned
-    /// export has none: its `From:` is inside the verified plaintext.
-    pub from: Option<String>,
-    /// What gpg is given: the clearsigned block for a clearsigned file, and the
-    /// whole file for the detached form, which still carries its own headers.
-    pub signed: String,
-    /// Whether the file carries a clearsigned block, so a file with neither form
-    /// is refused as unsigned.
-    pub clearsigned: bool,
-}
-
-/// Split a request file into the outer headers and the armour to verify.
-///
-/// A delivered message carries its own headers outside the armour, and a
-/// client's clearsigned export carries them inside it. The outer block is read
-/// here and the verified plaintext's is read after gpg runs, and a `From:` in
-/// both that disagrees is refused: the signature is the proof, so the outer
-/// header adds no forgeable path.
-///
-/// The armour marker must be a complete line after the header block's blank
-/// line. `gpg --verify` finds the armour wherever it sits and ignores the plain
-/// text above it, so an unanchored search let a marker inside a header line pull
-/// a forged signature line into the text the operator read (#820, #924). The
-/// detached form is unchanged: its signature covers the whole file, headers
-/// included.
-pub(crate) fn split_message(message: &str) -> Result<Message, Error> {
-    let normalised = message.replace("\r\n", "\n");
-    let Some(at) = line_index(&normalised, CLEARSIGNED) else {
-        // The detached form's headers are its own; read them the same way a
-        // clearsigned file's outer headers are read.
-        let from = header_from(&normalised)?
-            .ok_or_else(|| Error::Failed("the message has no From: header".to_string()))?;
-        return Ok(Message {
-            from: Some(from),
-            signed: message.to_string(),
-            clearsigned: false,
-        });
-    };
-    let (outer, block) = normalised.split_at(at);
-    headers_only(outer)?;
-    // A delivered message ends its headers with a blank line; a client's
-    // clearsigned export has no outer headers at all.
-    if !outer.is_empty() && !outer.ends_with("\n\n") {
-        return Err(Error::Failed(
-            "the clearsigned block does not follow the message's blank line".to_string(),
-        ));
-    }
-    Ok(Message {
-        from: header_from(outer)?,
-        signed: block.to_string(),
-        clearsigned: true,
-    })
-}
-
 /// The sender of a message: the outer header if the file carries one, the
 /// verified plaintext's otherwise, and a refusal when the two disagree. Only
 /// the verified plaintext's value is proof; the outer header is a hint that must
@@ -232,106 +179,6 @@ pub(crate) fn signed_from(outer: Option<String>, armour: Option<String>) -> Resu
         (None, Some(armour)) => Ok(armour),
         (None, None) => Err(Error::Failed("the message has no From: header".to_string())),
     }
-}
-
-/// The byte index of the first line that is exactly `line`. An armour marker
-/// inside a longer line is not the marker gpg would treat as the block's start.
-fn line_index(text: &str, line: &str) -> Option<usize> {
-    let mut from = 0;
-    while let Some(found) = text[from..].find(line) {
-        let at = from + found;
-        let after = at + line.len();
-        let starts_line = at == 0 || text.as_bytes()[at - 1] == b'\n';
-        let ends_line = after == text.len() || text.as_bytes()[after] == b'\n';
-        if starts_line && ends_line {
-            return Some(at);
-        }
-        from = at + 1;
-    }
-    None
-}
-
-/// The region before a clearsigned block: header lines, the blank line that ends
-/// them, and nothing else. Every non-blank line before the blank line must look
-/// like a header (`Name: value`, or a continuation), and nothing may follow the
-/// blank line. gpg verifies the armour wherever it sits, so a colon-less line of
-/// request text above it would otherwise be read as part of the request.
-fn headers_only(region: &str) -> Result<(), Error> {
-    let mut ended = false;
-    let mut saw_header = false;
-    for (index, line) in region.lines().enumerate() {
-        if line.trim().is_empty() {
-            ended = true;
-            continue;
-        }
-        if ended {
-            return Err(unsigned_text(index, line));
-        }
-        if line.starts_with(' ') || line.starts_with('\t') {
-            if saw_header {
-                continue;
-            }
-            return Err(unsigned_text(index, line));
-        }
-        let Some((name, _)) = line.split_once(':') else {
-            return Err(unsigned_text(index, line));
-        };
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
-            return Err(unsigned_text(index, line));
-        }
-        saw_header = true;
-    }
-    Ok(())
-}
-
-fn unsigned_text(index: usize, line: &str) -> Error {
-    Error::Failed(format!(
-        "the message has unsigned text before the clearsigned block, at line {}: {:?}",
-        index + 1,
-        line.chars().take(80).collect::<String>()
-    ))
-}
-
-/// The address in one header block's `From:`, with RFC 5322 continuation lines
-/// unfolded first. `None` when the block carries no `From:`.
-pub(crate) fn header_from(block: &str) -> Result<Option<String>, Error> {
-    let mut headers: Vec<String> = Vec::new();
-    for line in block.lines() {
-        if line.is_empty() {
-            break;
-        }
-        if line.starts_with(' ') || line.starts_with('\t') {
-            if let Some(last) = headers.last_mut() {
-                last.push(' ');
-                last.push_str(line.trim());
-            }
-        } else {
-            headers.push(line.trim_end().to_string());
-        }
-    }
-    let mut values = headers.iter().filter_map(|header| {
-        let (name, value) = header.split_once(':')?;
-        name.eq_ignore_ascii_case("from")
-            .then(|| value.trim().to_string())
-    });
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(Error::Failed(
-            "the message has more than one From: header".to_string(),
-        ));
-    }
-    let address = match (value.rfind('<'), value.rfind('>')) {
-        (Some(open), Some(close)) if open < close => &value[open + 1..close],
-        _ => value.as_str(),
-    };
-    if address.trim().is_empty() {
-        return Err(Error::Failed(
-            "the message's From: header holds no address".to_string(),
-        ));
-    }
-    Ok(Some(address.trim().to_string()))
 }
 
 pub(crate) async fn request_extend(store: &Store, args: &[String]) -> Result<(), Error> {
@@ -426,5 +273,3 @@ pub(crate) async fn request_list(store: &Store) -> Result<(), Error> {
     }
     Ok(())
 }
-
-pub(crate) const CLEARSIGNED: &str = "-----BEGIN PGP SIGNED MESSAGE-----";

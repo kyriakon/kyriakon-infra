@@ -48,7 +48,10 @@ use kyriakon_control_core::flow::catalogue::{self, Action, Protocol, Row, Servic
 use kyriakon_control_core::flow::questions::{Kind, Question, Rule};
 use kyriakon_control_core::ipc::Answer as StatusAnswer;
 use kyriakon_control_core::store;
-use kyriakon_control_core::{mail::keycheck, store::draft};
+use kyriakon_control_core::{
+    mail::{keycheck, pgp},
+    store::draft,
+};
 
 /// Where a session reads an application's stage. The portal cannot read the
 /// store, so the answer comes from the handler over its own socket; a test drives
@@ -1028,7 +1031,7 @@ fn application(
                 // is a warning and the flow carries on, because the platform has
                 // no way to prove that key bad.
                 let warnings = if page.mailbox.is_some() {
-                    keycheck::pgp_findings(&value).unwrap_or_default()
+                    pgp::findings(&value).unwrap_or_default()
                 } else {
                     Vec::new()
                 };
@@ -1326,7 +1329,7 @@ fn confirmation(questions: &[Question], draft: &draft::Draft) -> String {
                 }
                 let shown = if q.kind == Kind::Key {
                     keycheck::openssh_fingerprint(&value)
-                        .or_else(|| keycheck::pgp_fingerprint(&value))
+                        .or_else(|| pgp::fingerprint(&value))
                         .unwrap_or_else(|| "a key".to_string())
                 } else {
                     value

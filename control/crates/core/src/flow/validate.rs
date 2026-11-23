@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use crate::flow::questions::{self, Kind, Question, Rule};
-use crate::mail::keycheck;
+use crate::mail::{keycheck, pgp};
 
 /// The reserved set, one name per line, `#` comments and blank lines skipped so
 /// the file can explain itself.
@@ -64,7 +64,7 @@ pub fn reason(
         // all stop delivery, and the applicant is the one who can still change
         // the key. The one advisory that proceeds is the parser-gap warning,
         // where `inspected` is false and a person checks the key instead.
-        Rule::MailKey => match keycheck::pgp_public_key(v) {
+        Rule::MailKey => match pgp::public_key(v) {
             Err(e) => Some(e.to_string()),
             Ok(checked) => checked.refusal().map(str::to_string),
         },

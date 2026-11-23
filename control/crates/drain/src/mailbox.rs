@@ -30,12 +30,11 @@ use kyriakon_control_core::config::HOST;
 use kyriakon_control_core::mail::bounce;
 use kyriakon_control_core::mail::keycheck;
 use kyriakon_control_core::mail::notice;
+use kyriakon_control_core::mail::pgp;
 use kyriakon_control_core::store::draft::Draft;
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{NoticeStop, Store};
 
-const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
-const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
 /// One reply per address per day. Only a live draft's recorded address is ever
 /// answered, and a day is long enough that a second mail from the same
 /// applicant is not answered twice and short enough that a genuine retry the
@@ -110,7 +109,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
 /// one whose token names no live draft, has no address to answer: it is dropped.
 async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
     let message = Message::parse(raw);
-    let blocks = labelled_blocks(&message.body);
+    let blocks = pgp::labelled_blocks(&message.body);
     if blocks.is_empty() {
         return Ok(());
     }
@@ -375,38 +374,6 @@ pub fn token_in_subject(subject: &str) -> Option<String> {
     None
 }
 
-/// Armoured blocks with the line above each, which is where the applicant names
-/// the mailbox. A block's label is the nearest non-empty line before its BEGIN.
-pub fn labelled_blocks(text: &str) -> Vec<(Option<String>, String)> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        if !lines[i].trim().starts_with(BEGIN) {
-            i += 1;
-            continue;
-        }
-        let label = lines[..i]
-            .iter()
-            .rev()
-            .map(|l| l.trim())
-            .find(|l| !l.is_empty())
-            .map(str::to_string);
-        let mut block = String::new();
-        while i < lines.len() {
-            block.push_str(lines[i].trim_end());
-            block.push('\n');
-            let done = lines[i].trim().starts_with(END);
-            i += 1;
-            if done {
-                break;
-            }
-        }
-        out.push((label, block.trim().to_string()));
-    }
-    out
-}
-
 /// The mailboxes a multi-mailbox message failed to label, which is what the
 /// reply names.
 #[derive(Debug, PartialEq, Eq)]
@@ -608,7 +575,7 @@ fn decode_body_at(headers: &str, body: &str, depth: usize) -> String {
         .to_ascii_lowercase()
         .as_str()
     {
-        "base64" => keycheck::base64_decode(body)
+        "base64" => pgp::base64_decode(body)
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default(),
         "quoted-printable" => quoted_printable(body),
@@ -869,6 +836,7 @@ async fn stop_clock(
 mod tests {
     use super::*;
 
+    const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
     const KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
 mAYEAAAAABK4BgQAAAAAEg==\n-----END PGP PUBLIC KEY BLOCK-----\n";
 
@@ -886,7 +854,7 @@ mAYEAAAAABK4BgQAAAAAEg==\n-----END PGP PUBLIC KEY BLOCK-----\n";
             token_in_subject(&message.subject).as_deref(),
             Some("0123456789abcdefghjkmnpqrs")
         );
-        let blocks = labelled_blocks(&message.body);
+        let blocks = pgp::labelled_blocks(&message.body);
         assert_eq!(blocks.len(), 1);
         assert!(blocks[0].1.contains(BEGIN));
     }
@@ -932,7 +900,7 @@ aGVsbG8=\n--line--\n";
     #[test]
     fn a_label_names_the_mailbox_above_its_block() {
         let text = format!("secretary@parish.example\n{KEY}\nhall@parish.example\n{KEY}");
-        let blocks = labelled_blocks(&text);
+        let blocks = pgp::labelled_blocks(&text);
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].0.as_deref(), Some("secretary@parish.example"));
         assert_eq!(blocks[1].0.as_deref(), Some("hall@parish.example"));
@@ -948,12 +916,12 @@ aGVsbG8=\n--line--\n";
         draft
             .answers
             .insert("body_account_names".into(), "secretary\nhall".into());
-        let blocks = labelled_blocks(KEY);
+        let blocks = pgp::labelled_blocks(KEY);
         assert_eq!(
             assign(&blocks, &draft).unwrap_err(),
             Unlabelled(vec!["secretary".to_string(), "hall".to_string()])
         );
-        let blocks = labelled_blocks(&format!("secretary@parish.example\n{KEY}"));
+        let blocks = pgp::labelled_blocks(&format!("secretary@parish.example\n{KEY}"));
         let assigned = assign(&blocks, &draft).unwrap();
         assert_eq!(assigned[0].0, "secretary");
     }
@@ -962,7 +930,7 @@ aGVsbG8=\n--line--\n";
     fn a_person_key_needs_no_label() {
         let mut draft = Draft::new("0123456789abcdefghjkmnpqrs".to_string());
         draft.answers.insert("username".into(), "secretary".into());
-        let blocks = labelled_blocks(KEY);
+        let blocks = pgp::labelled_blocks(KEY);
         let assigned = assign(&blocks, &draft).unwrap();
         assert_eq!(assigned[0].0, "secretary");
     }
@@ -971,7 +939,7 @@ aGVsbG8=\n--line--\n";
     fn a_single_mailbox_takes_the_first_block_when_two_arrive() {
         let mut draft = Draft::new("0123456789abcdefghjkmnpqrs".to_string());
         draft.answers.insert("username".into(), "secretary".into());
-        let blocks = labelled_blocks(&format!("{KEY}\n{KEY}"));
+        let blocks = pgp::labelled_blocks(&format!("{KEY}\n{KEY}"));
         let assigned = assign(&blocks, &draft).unwrap();
         assert_eq!(assigned.len(), 1, "one mailbox, one key");
         assert_eq!(assigned[0].0, "secretary");

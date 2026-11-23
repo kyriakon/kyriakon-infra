@@ -6,9 +6,9 @@
 //! they arrived, never after a normalising step that could disagree with the
 //! parser next to it.
 //!
-//! The crate has no dependencies: the encryptor links it without gaining one.
-//! The control consumers land with #945, #947, #908 and #919, and the crate
-//! joins the control build when the first of them lands.
+//! The crate has no dependencies: the encryptor and the control plane link it
+//! without gaining one. The control core reads armour framing, clearsigned
+//! message headers and their line endings through it.
 
 mod message;
 

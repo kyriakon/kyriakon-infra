@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::flow::questions::{self, Branch, Kind, Question, Rule};
 use crate::flow::validate;
-use crate::mail::keycheck;
+use crate::mail::pgp;
 use crate::store::draft;
 use crate::Error;
 
@@ -88,7 +88,7 @@ pub fn flow_problem(
         if value.trim().is_empty() {
             return Some("a public key is needed".to_string());
         }
-        let blocks = keycheck::blocks(value);
+        let blocks = pgp::blocks(value);
         if blocks.len() != 1 {
             return Some("one key for one mailbox".to_string());
         }
@@ -209,7 +209,7 @@ pub fn body_cross_checks(form: &BTreeMap<String, String>, errors: &mut Vec<Strin
 /// The refusals for a mail-key answer. A person's key is one block; a body's is
 /// one block per mailbox, paired with the account names in the order given.
 pub fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String>) -> Vec<String> {
-    let blocks = keycheck::blocks(value);
+    let blocks = pgp::blocks(value);
     if blocks.is_empty() {
         return vec!["a public key is needed".to_string()];
     }
@@ -236,7 +236,7 @@ pub fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String
 /// refusal at the form; the parser-gap advisory proceeds, because a key the
 /// platform cannot inspect is not a key it can prove bad.
 pub fn key_error(block: &str) -> Option<String> {
-    match keycheck::pgp_public_key(block) {
+    match pgp::public_key(block) {
         Err(e) => Some(e.to_string()),
         Ok(checked) => checked.refusal().map(str::to_string),
     }

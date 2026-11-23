@@ -685,7 +685,7 @@ fn a_mail_key_replacement_waits_out_its_window_and_can_be_cancelled() {
         json!({"mail_key": "AAAA", "outside_address": "alice@example.invalid"}),
     );
     let key = replacement_key();
-    let fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&key).unwrap();
+    let fingerprint = kyriakon_control_core::mail::pgp::fingerprint(&key).unwrap();
 
     fix.file_page_action(
         "mail-key",
@@ -765,10 +765,10 @@ fn a_mail_key_replacement_waits_out_its_window_and_can_be_cancelled() {
 fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
     let fix = Fix::new("account-rotation-signed");
     let key = replacement_key();
-    let fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&key).unwrap();
+    let fingerprint = kyriakon_control_core::mail::pgp::fingerprint(&key).unwrap();
 
     let (_, public, signature, _) = signing_key(&fingerprint);
-    let current = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&public).unwrap();
+    let current = kyriakon_control_core::mail::pgp::fingerprint(&public).unwrap();
     fix.page_account("alice", json!({"mail_key": current}));
     fix.mail_key("alice", &public);
 
@@ -813,7 +813,7 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
     // nothing changes.
     let fix = Fix::new("account-rotation-forged");
     let (_, public, _, _) = signing_key("another fingerprint");
-    let current = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&public).unwrap();
+    let current = kyriakon_control_core::mail::pgp::fingerprint(&public).unwrap();
     fix.page_account("alice", json!({"mail_key": current}));
     fix.mail_key("alice", &public);
     let (_, _, wrong, _) = signing_key("a different fingerprint");
@@ -840,7 +840,7 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
 fn a_mail_key_replacement_refuses_an_expiring_or_aead_key() {
     let fix = Fix::new("account-rotation-refused");
     let clean = replacement_key();
-    let current = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&clean).unwrap();
+    let current = kyriakon_control_core::mail::pgp::fingerprint(&clean).unwrap();
     fix.page_account("alice", json!({"mail_key": current}));
     fix.mail_key("alice", &clean);
     let before = std::fs::read_to_string(fix.dir.join("keyring/alice.asc")).unwrap();
@@ -885,7 +885,7 @@ fn a_mail_key_replacement_refuses_an_expiring_or_aead_key() {
     // The parser cannot read this block, so the check is advisory and the
     // replacement proceeds rather than becoming impossible to start.
     let uninspected = GOOD_KEY;
-    let fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(uninspected).unwrap();
+    let fingerprint = kyriakon_control_core::mail::pgp::fingerprint(uninspected).unwrap();
     fix.file_page_action(
         "mail-key",
         "alice",
@@ -982,7 +982,7 @@ fn request_verify_accepts_the_keyring_key_over_the_accounts_own_address() {
     let message = "From: Alice <alice@kyriakon.net>\nTo: admin@kyriakon.net\n\
                    Subject: my data\n\nPlease send me a copy.\n";
     let (_, public, detached, clearsigned) = signing_key(message);
-    let fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&public).unwrap();
+    let fingerprint = kyriakon_control_core::mail::pgp::fingerprint(&public).unwrap();
     fix.page_account("alice", json!({}));
     fix.mail_key("alice", &public);
 

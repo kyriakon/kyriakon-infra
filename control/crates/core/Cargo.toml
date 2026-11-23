@@ -13,6 +13,7 @@ test-fixtures = []
 bcrypt.workspace = true
 hmac.workspace = true
 keygen-spike.workspace = true
+kyriakon-mailparse = { path = "../../../mailparse" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
