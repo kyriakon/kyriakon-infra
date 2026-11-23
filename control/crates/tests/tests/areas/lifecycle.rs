@@ -3983,9 +3983,17 @@ fn removing_a_mailbox_takes_exactly_its_account_and_entries() {
         !fix.dir.join("store/accounts/parish-office").exists(),
         "the account record stayed"
     );
+    // The published key and the box keyring entry go with the account, as
+    // delete_account does, so a name reused after the hold can publish again.
     assert!(
-        fix.dir.join("keyring/parish-office.asc").exists(),
-        "the box keyring entry stays until the published key goes, as delete-user.sh leaves it"
+        !fix.dir.join("keyring/parish-office.asc").exists(),
+        "the box keyring entry stayed"
+    );
+    assert!(
+        fix.scripts_log()
+            .contains("publish-mail-key.sh --remove parish-office"),
+        "the published key was not removed: {}",
+        fix.scripts_log()
     );
     let virtuals = fix.table("virtuals");
     assert!(
@@ -4101,6 +4109,87 @@ fn an_expired_hold_releases_the_name() {
     assert!(fix
         .table("virtuals")
         .contains("desk@parish.example: parish-office"));
+}
+
+/// Closing a group mailbox unpublishes its key and drops its box keyring entry,
+/// so a name reused after the hold with a different key publishes rather than
+/// meeting a published key that refuses to be replaced.
+#[test]
+fn a_reused_group_mailbox_name_publishes_a_different_key() {
+    const OTHER_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
+                             mAYEAAAAABK4BgQAAAAAEQ==\n\
+                             -----END PGP PUBLIC KEY BLOCK-----\n";
+    let fix = Fix::new("group-remove-reuse");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    assert!(fix.dir.join("keyring/parish-office.asc").exists());
+
+    fix.file_address("parish.example", "remove", "", "parish-office", None, None);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    // The old key went from both sets, which is what lets the name publish again.
+    assert!(
+        fix.scripts_log()
+            .contains("publish-mail-key.sh --remove parish-office"),
+        "the published key was not removed: {}",
+        fix.scripts_log()
+    );
+    assert!(
+        !fix.dir.join("keyring/parish-office.asc").exists(),
+        "the box keyring entry stayed"
+    );
+
+    // The hold ends, as it would after ninety days.
+    std::fs::write(
+        fix.dir.join("store/holds/parish-office.json"),
+        br#"{"username":"parish-office","until":"2020-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // A person application reuses the name with a different mail key.
+    let mut record = fix.filed_with(
+        "parish-office",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    record["mail_keys"] = json!([{
+        "mailbox": "",
+        "fingerprint": "5555 6666 7777 8888",
+        "material": OTHER_KEY,
+        "verdict": "works",
+    }]);
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "parish-office");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(!fix.journal().contains("\"failed\""), "{}", fix.journal());
+    assert!(
+        fix.scripts_log()
+            .contains("publish-mail-key.sh parish-office"),
+        "the reused name was not published: {}",
+        fix.scripts_log()
+    );
+    let keyring =
+        std::fs::read_to_string(fix.dir.join("keyring/parish-office.asc")).unwrap_or_default();
+    assert_eq!(
+        keyring.trim(),
+        OTHER_KEY.trim(),
+        "the keyring still serves the old key"
+    );
 }
 
 /// A suspension records the reason where the account page reads it, stops the

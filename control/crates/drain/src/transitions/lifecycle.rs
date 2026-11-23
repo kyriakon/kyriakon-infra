@@ -2095,7 +2095,7 @@ async fn erasure_refund(store: &Store, account: &Account) -> Result<Option<Strin
 /// `scripts/check-keyring-drift.sh` alerts on a published key the box no longer
 /// serves: publishing the removal first keeps that signal to the window the
 /// change takes to merge.
-async fn remove_published_key(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
+pub(super) async fn remove_published_key(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
     run_script(
         cfg,
         "publish-mail-key.sh",
@@ -2107,7 +2107,7 @@ async fn remove_published_key(cfg: &DrainConfig, username: &str) -> Result<(), E
 
 /// Drop one account's published key from the box keyring. A missing directory or
 /// file is already done, which is what makes a retry safe.
-async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
+pub(super) async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
     let path = kyriakon_control_core::mail::keycheck::keyring_file(&cfg.keyring_dir, username);
     match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),

@@ -14,7 +14,7 @@ use super::boxrun::{
     cancel_stripe_if_active, publish_mail_keys, publish_mail_keys_publicly, run_script,
     run_script_tolerating, write_public_key,
 };
-use super::lifecycle::dns_contact;
+use super::lifecycle::{dns_contact, remove_keyring_entry, remove_published_key};
 use super::Error;
 use super::{write_journal, Settlement};
 use kyriakon_control_core::account::state::{Standing, WindowState};
@@ -1182,18 +1182,27 @@ pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Error
         .map_err(Error::from)
 }
 
-/// The three steps that close one mailbox: its name held for ninety days, its
-/// stored upload key dropped, and scripts/delete-user.sh, which removes the box
-/// account, its tree, its quota record and its store record. Shared by a
-/// mailbox leaving a group and a whole group going, so the two cannot disagree
-/// about what a closed account is. The caller removes the virtual entry first,
-/// because it is the one that knows which table line belongs to the account.
+/// The steps that close one mailbox: its name held for ninety days, its stored
+/// upload key dropped, scripts/delete-user.sh removing the box account, its
+/// tree, its quota record and its store record, then the same unpublish and
+/// keyring removal `delete_account` makes. Shared by a mailbox leaving a group
+/// and a whole group going, so the two cannot disagree about what a closed
+/// account is, and a name reused after the hold can publish again. The caller
+/// removes the virtual entry first, because it is the one that knows which
+/// table line belongs to the account.
 async fn close_mailbox(cfg: &DrainConfig, store: &Store, username: &str) -> Result<(), Error> {
     hold_name(store, username).await?;
     store.remove("keys", &format!("{username}.pub")).await?;
     run_script(cfg, "delete-user.sh", &[username])
         .await
-        .map_err(Error::from)
+        .map_err(Error::from)?;
+    // The published set holds the key forever otherwise, and a name reused after
+    // the hold would meet a publish that refuses to replace it. The removal
+    // change goes first so the drift check never sees a key that is published
+    // and no longer served.
+    remove_published_key(cfg, username).await?;
+    remove_keyring_entry(cfg, username).await?;
+    Ok(())
 }
 
 /// The mail key a new mailbox carries, checked before anything is written: the
@@ -1608,10 +1617,6 @@ pub async fn group_address(
                 // the lines have gone here, so this pass makes them live.
                 run_script(cfg, "reload-smtpd.sh", &[]).await?;
             }
-            // The box keyring entry stays, as delete-user.sh leaves it:
-            // check-keyring-drift.sh reports a published key absent from the
-            // box, and the published key's removal is the operator's step
-            // (there is no unpublish path in this tree yet).
             if intent.site_owner.is_some() {
                 // After the record names the replacement and before the old
                 // tree goes: the vhost root must not point at a directory
