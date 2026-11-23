@@ -1723,6 +1723,23 @@ fn a_group_removal_takes_the_domain_down_and_closes_its_accounts() {
     assert!(!fix.dir.join("store/keys/parish-secretary.pub").exists());
     assert!(!fix.dir.join("store/keys/parish-warden.pub").exists());
     assert!(fix.dir.join("store/keys/bob.pub").exists());
+    // The keyring entries go with the accounts, as delete_account does, so the
+    // closed names can publish a different key if reused.
+    assert!(
+        !fix.dir.join("keyring/parish-secretary.asc").exists(),
+        "a removed mailbox's keyring entry stayed"
+    );
+    assert!(
+        !fix.dir.join("keyring/parish-warden.asc").exists(),
+        "a removed mailbox's keyring entry stayed"
+    );
+    let log = fix.scripts_log();
+    for mailbox in ["parish-secretary", "parish-warden"] {
+        assert!(
+            log.contains(&format!("publish-mail-key.sh --remove {mailbox}")),
+            "the published key for {mailbox} was not removed: {log}"
+        );
+    }
     assert_eq!(
         fix.names("holds"),
         vec!["parish-secretary.json", "parish-warden.json"]

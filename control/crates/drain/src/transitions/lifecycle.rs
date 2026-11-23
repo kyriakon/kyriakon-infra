@@ -2037,17 +2037,7 @@ pub async fn delete_account(
         }
     }
 
-    hold_name(store, username).await?;
-    store.remove("keys", &format!("{username}.pub")).await?;
-    run_script(cfg, "delete-user.sh", &[username]).await?;
-    // The published set holds the key forever otherwise, and a name reused after
-    // the hold would meet a publish that refuses to replace it. The removal
-    // change goes first so the drift check never sees a key that is published
-    // and no longer served.
-    remove_published_key(cfg, username).await?;
-    // The box keyring entry goes now, not before the account: the encryptor
-    // failing closed for a mailbox that still exists would bounce its mail.
-    remove_keyring_entry(cfg, username).await?;
+    close_box_account(cfg, store, username).await?;
     close_group_tokens(store, &[username.to_string()]).await?;
 
     write_journal(
@@ -2061,6 +2051,32 @@ pub async fn delete_account(
         Some("the account, its home and its store record were removed; the ledger line stays"),
     )
     .await
+}
+
+/// The five steps every closed account takes: hold its name for ninety days,
+/// drop the stored upload key, run scripts/delete-user.sh, publish the mail
+/// key's removal, and drop the box keyring entry. Shared by `delete_account`
+/// and a group mailbox's closure, so the two cannot disagree about a closed
+/// account and a name reused after the hold can publish again.
+///
+/// The publish removal goes before the keyring entry because
+/// scripts/check-keyring-drift.sh alerts on a published key the box no longer
+/// serves: publishing first leaves only the seven days the check allows a key
+/// on the box and not yet in the published set. The keyring entry goes after
+/// the account, because the encryptor failing closed for a mailbox that still
+/// exists would bounce its mail. A missing key, publication or keyring entry is
+/// already done, which is what makes a retry safe.
+pub(super) async fn close_box_account(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+) -> Result<(), Error> {
+    hold_name(store, username).await?;
+    store.remove("keys", &format!("{username}.pub")).await?;
+    run_script(cfg, "delete-user.sh", &[username]).await?;
+    remove_published_key(cfg, username).await?;
+    remove_keyring_entry(cfg, username).await?;
+    Ok(())
 }
 
 /// The refund fact the erasure answer carries: the token's recorded refund, or
@@ -2095,7 +2111,7 @@ async fn erasure_refund(store: &Store, account: &Account) -> Result<Option<Strin
 /// `scripts/check-keyring-drift.sh` alerts on a published key the box no longer
 /// serves: publishing the removal first keeps that signal to the window the
 /// change takes to merge.
-async fn remove_published_key(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
+pub(super) async fn remove_published_key(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
     run_script(
         cfg,
         "publish-mail-key.sh",
@@ -2107,7 +2123,7 @@ async fn remove_published_key(cfg: &DrainConfig, username: &str) -> Result<(), E
 
 /// Drop one account's published key from the box keyring. A missing directory or
 /// file is already done, which is what makes a retry safe.
-async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
+pub(super) async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
     let path = kyriakon_control_core::mail::keycheck::keyring_file(&cfg.keyring_dir, username);
     match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),

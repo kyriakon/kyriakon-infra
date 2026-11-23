@@ -4133,9 +4133,17 @@ fn removing_a_mailbox_takes_exactly_its_account_and_entries() {
         !fix.dir.join("store/accounts/parish-office").exists(),
         "the account record stayed"
     );
+    // The published key and the box keyring entry go with the account, as
+    // delete_account does, so a name reused after the hold can publish again.
     assert!(
-        fix.dir.join("keyring/parish-office.asc").exists(),
-        "the box keyring entry stays until the published key goes, as delete-user.sh leaves it"
+        !fix.dir.join("keyring/parish-office.asc").exists(),
+        "the box keyring entry stayed"
+    );
+    assert!(
+        fix.scripts_log()
+            .contains("publish-mail-key.sh --remove parish-office"),
+        "the published key was not removed: {}",
+        fix.scripts_log()
     );
     let virtuals = fix.table("virtuals");
     assert!(
@@ -4160,6 +4168,68 @@ fn removing_a_mailbox_takes_exactly_its_account_and_entries() {
     );
     assert_eq!(fix.names("holds"), vec!["parish-office.json"]);
     assert!(fix.scripts_log().contains("delete-user.sh parish-office"));
+}
+
+/// A failed unpublish is not lost: the pass removed the group member, its
+/// record and its box account before the script failed, so the retry finds the
+/// hold and repeats the close steps instead of settling over a published key.
+#[test]
+fn a_failed_unpublish_is_retried_after_the_account_has_gone() {
+    let fix = Fix::new("group-remove-unpublish-retry");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    let keyring = fix.dir.join("keyring/parish-office.asc");
+    assert!(keyring.exists());
+
+    fix.publish_fails();
+    fix.file_address("parish.example", "remove", "", "parish-office", None, None);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.intents().len(), 1, "the intent waits for the retry");
+    assert!(
+        !fix.passwd_file().contains("parish-office:"),
+        "{}",
+        fix.passwd_file()
+    );
+    assert!(!fix.dir.join("store/accounts/parish-office").exists());
+    assert!(
+        keyring.exists(),
+        "the keyring entry stays while the unpublish has failed"
+    );
+    assert_eq!(fix.names("holds"), vec!["parish-office.json"]);
+
+    // The forge works again. The retry must repeat the cleanup that the first
+    // pass began after the record and the account had already gone.
+    let log = fix.path("scripts.log");
+    fix.script(
+        "publish-mail-key.sh",
+        &format!("#!/bin/sh\necho \"publish-mail-key.sh $*\" >> '{log}'\n"),
+    );
+    fix.age_failures();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(
+        !keyring.exists(),
+        "the retry settled without removing the keyring entry"
+    );
+    assert_eq!(
+        fix.scripts_log()
+            .matches("publish-mail-key.sh --remove parish-office")
+            .count(),
+        2,
+        "the unpublish was not retried: {}",
+        fix.scripts_log()
+    );
 }
 
 /// A valid signature does not cover a swapped mail key: the material is hashed
@@ -4251,6 +4321,87 @@ fn an_expired_hold_releases_the_name() {
     assert!(fix
         .table("virtuals")
         .contains("desk@parish.example: parish-office"));
+}
+
+/// Closing a group mailbox unpublishes its key and drops its box keyring entry,
+/// so a name reused after the hold with a different key publishes rather than
+/// meeting a published key that refuses to be replaced.
+#[test]
+fn a_reused_group_mailbox_name_publishes_a_different_key() {
+    const OTHER_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
+                             mAYEAAAAABK4BgQAAAAAEQ==\n\
+                             -----END PGP PUBLIC KEY BLOCK-----\n";
+    let fix = Fix::new("group-remove-reuse");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    assert!(fix.dir.join("keyring/parish-office.asc").exists());
+
+    fix.file_address("parish.example", "remove", "", "parish-office", None, None);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    // The old key went from both sets, which is what lets the name publish again.
+    assert!(
+        fix.scripts_log()
+            .contains("publish-mail-key.sh --remove parish-office"),
+        "the published key was not removed: {}",
+        fix.scripts_log()
+    );
+    assert!(
+        !fix.dir.join("keyring/parish-office.asc").exists(),
+        "the box keyring entry stayed"
+    );
+
+    // The hold ends, as it would after ninety days.
+    std::fs::write(
+        fix.dir.join("store/holds/parish-office.json"),
+        br#"{"username":"parish-office","until":"2020-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // A person application reuses the name with a different mail key.
+    let mut record = fix.filed_with(
+        "parish-office",
+        "cash",
+        &[("rail", "cash")],
+        Some("applicant@example.invalid"),
+        Some((UPLOAD_KEY, "works")),
+    );
+    record["mail_keys"] = json!([{
+        "mailbox": "",
+        "fingerprint": "5555 6666 7777 8888",
+        "material": OTHER_KEY,
+        "verdict": "works",
+    }]);
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "parish-office");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(!fix.journal().contains("\"failed\""), "{}", fix.journal());
+    assert!(
+        fix.scripts_log()
+            .contains("publish-mail-key.sh parish-office"),
+        "the reused name was not published: {}",
+        fix.scripts_log()
+    );
+    let keyring =
+        std::fs::read_to_string(fix.dir.join("keyring/parish-office.asc")).unwrap_or_default();
+    assert_eq!(
+        keyring.trim(),
+        OTHER_KEY.trim(),
+        "the keyring still serves the old key"
+    );
 }
 
 /// A suspension records the reason where the account page reads it, stops the
