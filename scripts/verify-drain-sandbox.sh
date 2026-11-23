@@ -19,8 +19,20 @@
 #   store/intents/01AAAA...json      {"kind":"close"}, a parse failure
 #   store/intents/01BBBB...json      {"kind":"future-verb"}, a refusal
 #   bin/{sendmail,curl,dig,repquota,gpg}  stubs that record or answer
-#   key, stripe-secret, passwd, reserved, the five mail tables
+#   key, stripe-secret, passwd, reserved
+#   etc/mail/{mail_domains,virtuals,mail_from,dkim_domains,spamd.alloweddomains}
+#   etc/mail/mail_domains.lock/pid   a stale lock whose owner is dead
 #   logins/, keyring/, mail/new/, bounce/new/, home/www/, store/rates/
+#
+# The tree is made outside the process's temp directory: restrict unveils /tmp
+# with rwc, so a fixture under it would resolve every path and a missing unveil
+# entry would pass. The tables have a directory of their own for the same
+# reason, because restrict unveils the tables' parent.
+#
+# Two applications are approved through the console, with the same key the
+# drain verifies: one person's, and one body's. The body's approval takes the
+# group path, so the pass writes mail_domains, and that write is what reaps the
+# dead owner's lock through `groups::stale_table_lock`'s `/bin/kill -0`.
 #
 # What the pass proves when it exits 0 and the assertions hold: the approval key
 # and the config were read, the store lock was taken, an intent was parsed, one
@@ -56,6 +68,8 @@ key_src=$repo/control/crates/tests/tests/areas/export.rs
 # The application's status token: 26 Crockford characters, the shape
 # Store::is_status_token accepts.
 status_token=01arz3ndektsv4rrffq69g5fav
+# The body's application token, the same shape and a different value.
+body_token=01arz3ndektsv4rrffq69g5fax
 
 usage() {
 	cat >&2 <<'USAGE'
@@ -106,7 +120,8 @@ make_fixture() {
 		"$tree/store/sessions" \
 		"$tree/store/rates" "$tree/store/drafts" "$tree/store/applications" \
 		"$tree/logins" "$tree/keyring" "$tree/mail/new" "$tree/mail/cur" \
-		"$tree/bounce/new" "$tree/home/www" "$tree/bin" "$tree/log" || return 1
+		"$tree/bounce/new" "$tree/home/www" "$tree/bin" "$tree/log" \
+		"$tree/etc/mail" || return 1
 
 	# The two keys: root-only 0600, which sign::read_key insists on.
 	printf 'unveil-fixture-approval-key\n' > "$tree/key"
@@ -117,12 +132,26 @@ make_fixture() {
 	printf 'root:*:0:0::0:0:Charlie &:/root:/bin/ksh\n' > "$tree/passwd"
 	printf 'admin\nroot\n' > "$tree/reserved"
 
-	# The five mail tables, in their shipped shape: one domain, one alias.
-	printf 'kyriakon.net\n' > "$tree/mail_domains"
-	printf 'postmaster: root\n' > "$tree/virtuals"
-	printf 'root: root@kyriakon.net\n' > "$tree/mail_from"
-	printf 'kyriakon.net\n' > "$tree/dkim_domains"
-	printf '@kyriakon.net\n' > "$tree/spamd.alloweddomains"
+	# The five mail tables, in their shipped shape: one domain, one alias. They
+	# live in a directory of their own because restrict unveils the tables'
+	# parent, and a fixture that put them at the tree root would lay the whole
+	# fixture under that rule and hide a missing unveil entry.
+	printf 'kyriakon.net\n' > "$tree/etc/mail/mail_domains"
+	printf 'postmaster: root\n' > "$tree/etc/mail/virtuals"
+	printf 'root: root@kyriakon.net\n' > "$tree/etc/mail/mail_from"
+	printf 'kyriakon.net\n' > "$tree/etc/mail/dkim_domains"
+	printf '@kyriakon.net\n' > "$tree/etc/mail/spamd.alloweddomains"
+
+	# A stale lock with a dead owner on the first table the group approval
+	# writes. Reaping it runs `groups::stale_table_lock`'s `/bin/kill -0` under
+	# the veil; without that unveil entry the probe reads a failed spawn as "the
+	# owner is alive", keeps the lock, and the group's write fails.
+	sleep 1 &
+	typeset dead_pid=$!
+	kill "$dead_pid" 2>/dev/null || true
+	wait "$dead_pid" 2>/dev/null || true
+	mkdir "$tree/etc/mail/mail_domains.lock"
+	printf '%s\n' "$dead_pid" > "$tree/etc/mail/mail_domains.lock/pid"
 
 	# A malformed intent: the drain mails the operator once and leaves it.
 	printf '{"kind":"close"}\n' > "$tree/store/intents/01AAAAAAAAAAAAAAAAAAAAAAAA.json"
@@ -142,10 +171,12 @@ make_fixture() {
 	stub "$tree/bin/dig" 'exit 0'
 	stub "$tree/bin/repquota" 'exit 0'
 	stub "$tree/bin/gpg" 'exit 0'
-	# Every privileged script the approval runs. Each records its own name, which
-	# is what proves the drain exec'd it under the pledge.
+	# Every privileged script the approval runs, the group's reload lanes
+	# included. Each records its own name, which is what proves the drain exec'd
+	# it under the pledge.
 	typeset name
-	for name in add-user.sh provision-member.sh publish-mail-key.sh cron-apply.sh; do
+	for name in add-user.sh provision-member.sh publish-mail-key.sh cron-apply.sh \
+		reload-smtpd.sh reload-spamd.sh; do
 		stub "$tree/bin/$name" \
 			"printf '%s %s\\n' \"\$0\" \"\$*\" >> '$tree/log/scripts'"
 	done
@@ -162,11 +193,11 @@ config_for() {
 		-e "s|^scripts = .*|scripts = \"$tree/bin\"|" \
 		-e "s|^sendmail = .*|sendmail = \"$tree/bin/sendmail\"|" \
 		-e "s|^passwd = .*|passwd = \"$tree/passwd\"|" \
-		-e "s|^mail_domains = .*|mail_domains = \"$tree/mail_domains\"|" \
-		-e "s|^virtuals = .*|virtuals = \"$tree/virtuals\"|" \
-		-e "s|^mail_from = .*|mail_from = \"$tree/mail_from\"|" \
-		-e "s|^dkim_domains = .*|dkim_domains = \"$tree/dkim_domains\"|" \
-		-e "s|^spamd_alloweddomains = .*|spamd_alloweddomains = \"$tree/spamd.alloweddomains\"|" \
+		-e "s|^mail_domains = .*|mail_domains = \"$tree/etc/mail/mail_domains\"|" \
+		-e "s|^virtuals = .*|virtuals = \"$tree/etc/mail/virtuals\"|" \
+		-e "s|^mail_from = .*|mail_from = \"$tree/etc/mail/mail_from\"|" \
+		-e "s|^dkim_domains = .*|dkim_domains = \"$tree/etc/mail/dkim_domains\"|" \
+		-e "s|^spamd_alloweddomains = .*|spamd_alloweddomains = \"$tree/etc/mail/spamd.alloweddomains\"|" \
 		-e "s|^approval_key = .*|approval_key = \"$tree/key\"|" \
 		-e "s|^keyring_dir = .*|keyring_dir = \"$tree/keyring\"|" \
 		-e "s|^stripe_webhook_secret = .*|stripe_webhook_secret = \"$tree/stripe-secret\"|" \
@@ -229,6 +260,40 @@ file_approval() {
 	}' > "$tree/store/applications/$status_token.json"
 }
 
+# file_body_approval <tree> <key>: a community body's application, so the
+# console's free approval takes the group path and the drain writes the mail
+# tables on its way. One mailbox, which owns the site; no outside address and an
+# empty upload key, so the pass makes no hosting lanes and depends on no
+# external mail address.
+file_body_approval() {
+	typeset tree=$1 key=$2
+	mkdir -p "$tree/store/applications"
+	jq -n --arg token "$body_token" --arg key "$(cat "$key")" '{
+		username: "warden",
+		status_token: $token,
+		filed_at: "2026-11-01T09:00:00Z",
+		front_end: "web",
+		stage: "received",
+		domain: "parish.example",
+		outside_address: null,
+		answers: {
+			whose: "body",
+			body_name: "Parish of Example",
+			body_kind: "parish",
+			body_domain: "parish.example",
+			body_records: "yes",
+			body_addresses: "secretary: own",
+			body_account_names: "parish-secretary"
+		},
+		mail_keys: [{mailbox: "parish-secretary", fingerprint: "1111 2222 3333 4444", material: $key, verdict: "works"}],
+		upload_key: {mailbox: "", fingerprint: "", material: "", verdict: "unchecked"},
+		rail: "cash",
+		no_charge: true,
+		acceptances: [{"document": "terms", "version": "fixture"}],
+		question_list: "fixture"
+	}' > "$tree/store/applications/$body_token.json"
+}
+
 # file_export <tree>: a proved session and the intent the account page files.
 # The proof is the root-written file the drain checks, with a real 64 hex name
 # and a live expiry, and the intent's id sorts after the console's ULID so the
@@ -253,7 +318,8 @@ assert_fixture() {
 	[ -x "$tree/bin/curl" ] || ok=no
 	[ -f "$tree/key" ] || ok=no
 	[ -d "$tree/store/rates" ] || ok=no
-	[ "$(cat "$tree/mail_domains")" = kyriakon.net ] || ok=no
+	[ "$(cat "$tree/etc/mail/mail_domains")" = kyriakon.net ] || ok=no
+	[ -s "$tree/etc/mail/mail_domains.lock/pid" ] || ok=no
 	[ "$ok" = yes ]
 }
 
@@ -262,7 +328,10 @@ full_run() {
 	[ -x "$drain_bin" ] || missing "no drain binary at $drain_bin; set KYRIAKON_DRAIN_BIN"
 	[ -f "$config_src" ] || missing "no drain.toml at $config_src"
 
-	work=$(mktemp -d "${TMPDIR:-/tmp}/verify-drain.XXXXXX") || exit 1
+	# Outside the process's temp directory on purpose: restrict unveils /tmp
+	# with rwc, so a fixture under it would resolve every path whatever the
+	# unveil list named and a missing entry would still exit 0.
+	work=$(mktemp -d /var/db/kyriakon-verify.XXXXXX) || exit 1
 	trap 'rm -rf "$work"' EXIT
 	tree=$work/fixture
 	mkdir "$tree"
@@ -286,6 +355,15 @@ full_run() {
 		sed -n 1,20p "$work/admin-out" >&2
 		die "the console could not sign the fixture's decision"
 	fi
+	# The body's free approval takes the group path, and the drain's own
+	# provision-group transition writes mail_domains. That is the table write
+	# the stale lock below is reaped by.
+	file_body_approval "$tree" "$work/member-key.asc"
+	if ! "$admin_bin" --config "$work/drain.toml" approve-free warden "$body_token" \
+		> "$work/admin-body-out" 2>&1; then
+		sed -n 1,20p "$work/admin-body-out" >&2
+		die "the console could not sign the fixture's body decision"
+	fi
 
 	# The pass must finish. Its stderr carries the malformed intent's report,
 	# which is expected; the exit status is what says unveil and pledge held.
@@ -303,6 +381,20 @@ full_run() {
 		fail "the approval did not record the free decision"
 	[ -f "$tree/keyring/alice.asc" ] ||
 		fail "the approval did not write the member's key into the keyring"
+	# The body's approval took the group path and wrote the mail tables on the
+	# way. Its first table write is also the only proof the `/bin/kill -0`
+	# reaper ran under the veil: a failed spawn leaves the dead owner looking
+	# alive, the lock in place and the approval failed.
+	[ -f "$tree/store/groups/parish.example/group.json" ] ||
+		fail "the body approval wrote no group record"
+	[ -f "$tree/store/accounts/parish-secretary/account.json" ] ||
+		fail "the body approval wrote no mailbox account"
+	[ -f "$tree/keyring/parish-secretary.asc" ] ||
+		fail "the body approval did not write the mailbox key into the keyring"
+	grep -qx 'parish.example' "$tree/etc/mail/mail_domains" ||
+		fail "the body approval did not add its domain to mail_domains"
+	[ ! -d "$tree/etc/mail/mail_domains.lock" ] ||
+		fail "the stale mail_domains.lock was not reaped"
 	for script in add-user.sh provision-member.sh publish-mail-key.sh; do
 		grep -q "$script" "$tree/log/scripts" ||
 			fail "the approval did not run $script"

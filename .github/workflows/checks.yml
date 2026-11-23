@@ -307,6 +307,11 @@ jobs:
             # same reason the responder is.
             cargo build --release --manifest-path control/Cargo.toml -p kyriakon-control-drain -p kyriakon-admin
             ksh scripts/verify-drain-sandbox.sh
+            # The unit tests gated on OpenBSD and `test` cannot run in the
+            # Ubuntu control job, and this is the only host whose kernel
+            # behaviour they exercise. `--lib` keeps it to the crate's own
+            # tests; the acceptance suite runs its Linux half above.
+            cargo test --manifest-path control/Cargo.toml -p kyriakon-control-drain --lib
 
   terraform:
     name: terraform

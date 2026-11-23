@@ -10,19 +10,23 @@
 //! unveils and pledges; elsewhere it is a no-op, so the acceptance suite and
 //! `cargo test` still run on Linux and macOS.
 //!
-//! Every path below names the call site that opens it. A path a later transition
-//! adds will fail with `EACCES` (the wrong mode) or `ENOENT` (no rule), and the
-//! store and script errors already carry the path, so the failure names what is
-//! missing rather than losing the intent.
+//! Every path below names the call site that opens it. Once the list is locked
+//! it is probed: each configured path the pass opens itself, and each hardcoded
+//! one, must still be reachable, so an entry this list forgot fails the pass at
+//! startup with the path and its errno rather than surfacing later as an empty
+//! spool. A path only a child opens after `execve` is not probed, because this
+//! process's veil does not apply to the child. The rate cache file is lazy (the
+//! first run creates it), so its directory is probed instead.
 
 use crate::transitions::Error;
 use kyriakon_control_core::config::DrainConfig;
 
 /// The promises a full pass needs, one per operation the pass performs:
 ///
-/// * `stdio`: the baseline for read/write on open files, mmap, poll, wait4,
-///   kqueue, timers and signals, which the tokio runtime and every child wait
-///   use. It also lets libc open `/etc/localtime` and `/dev/null` itself.
+/// * `stdio`: read, write and control of the descriptors this process already
+///   holds, plus mmap, poll, wait4, kqueue, timers and signals, which the tokio
+///   runtime and every child wait use. Opening a path is unveil's business:
+///   `/dev/null` is an unveil entry below, and `/etc/localtime` is never opened.
 /// * `rpath`: `read_to_string`/`read_dir` of the store, `/etc/passwd`, the mail
 ///   tables, the approval key and the keyring.
 /// * `wpath`: writing the rate cache, the mail tables, store records, proofs and
@@ -38,7 +42,8 @@ use kyriakon_control_core::config::DrainConfig;
 ///   `payments.jsonl.lock`.
 /// * `proc`: fork for every `Command`, and `wait4` on the child.
 /// * `exec`: `execve` of the configured scripts, `sendmail`, `gpg`, `dig`,
-///   `repquota` and `curl`.
+///   `repquota`, `curl` and `/bin/kill`, the last for the stale-lock liveness
+///   check.
 ///
 /// Not present, because nothing in a pass asks for it: `inet` and `dns` (the
 /// network calls are the `curl` and `dig` children, which start unpledged),
@@ -79,6 +84,12 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     unveil(&cfg.repquota, "x")?;
     // The HTTPS client the rate cache is fetched with.
     unveil(&cfg.rates_fetch, "x")?;
+    // The liveness check `groups::stale_table_lock` runs on a `<table>.lock`
+    // owner's pid. The path is a literal in that function rather than a config
+    // value because `/bin/kill` is base-system, and without this entry the check
+    // reads a failed spawn as "the owner is alive", so a stale lock is never
+    // reaped and every table write fails forever.
+    unveil("/bin/kill", "x")?;
     // The box keyring: `boxrun::write_public_key` writes an approved member's
     // `.asc`, and the export reads it back.
     unveil(&cfg.keyring_dir, "rwc")?;
@@ -131,6 +142,12 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     if unsafe { libc::unveil(std::ptr::null(), std::ptr::null()) } == -1 {
         return Err(failure("unveil (lock)", std::io::Error::last_os_error()));
     }
+
+    // With the list locked, a path named above is reachable and one that is not
+    // fails with `ENOENT`. Probe every path a pass opens here, before the
+    // pledge, so a missing entry is a startup failure that names the path
+    // instead of a later `ENOENT` that a sweep reads as an empty spool.
+    probe_pass_paths(cfg)?;
 
     // The exec promise set is NULL on purpose: the scripts and helpers are
     // themselves OpenBSD programs with their own pledge or none, and forcing
@@ -187,12 +204,90 @@ fn temp_dir() -> Result<String, Error> {
         .ok_or_else(|| Error::Failed("the temp directory is not UTF-8".to_string()))
 }
 
+/// Every path the pass opens after `restrict` returns, checked once the list is
+/// locked. Kept separate from the unveil calls on purpose: a path listed here
+/// but not unveiled is exactly the omission this catches, and that is how
+/// `groups::stale_table_lock`'s `/bin/kill` went missing.
+#[cfg(target_os = "openbsd")]
+fn probe_pass_paths(cfg: &DrainConfig) -> Result<(), Error> {
+    for path in [
+        cfg.store_root.as_str(),
+        cfg.reserved.as_str(),
+        cfg.passwd.as_str(),
+        cfg.approval_key.as_str(),
+        cfg.stripe_webhook_secret.as_str(),
+        cfg.keyring_dir.as_str(),
+        cfg.proof_dir.as_str(),
+        cfg.mail_dir.as_str(),
+        cfg.bounce_dir.as_str(),
+        cfg.public_root.as_str(),
+    ] {
+        probe(path, false)?;
+    }
+    // The tables and the rate cache are opened through their directory, which
+    // is what the unveil above names. The cache file itself is created on the
+    // first pass and is deliberately not probed.
+    for table in [
+        &cfg.mail_domains,
+        &cfg.virtuals,
+        &cfg.mail_from,
+        &cfg.dkim_domains,
+        &cfg.spamd_alloweddomains,
+    ] {
+        probe(parent_of(table)?, false)?;
+    }
+    probe(parent_of(&cfg.rates)?, false)?;
+    probe(&temp_dir()?, false)?;
+    for path in ["/tmp", "/dev/null", "/dev/urandom"] {
+        probe(path, false)?;
+    }
+    for path in [
+        cfg.scripts.as_str(),
+        cfg.sendmail.as_str(),
+        cfg.gpg.as_str(),
+        cfg.resolver.as_str(),
+        cfg.repquota.as_str(),
+        cfg.rates_fetch.as_str(),
+        "/bin/kill",
+    ] {
+        probe(path, true)?;
+    }
+    Ok(())
+}
+
+/// `access(path, R_OK)` or `access(path, X_OK)` after the list is locked. An
+/// exec target is checked for execute because it is unveiled `x` only; asking
+/// for read would be refused by the rule itself.
+#[cfg(target_os = "openbsd")]
+fn probe(path: &str, execute: bool) -> Result<(), Error> {
+    let c_path = std::ffi::CString::new(path)
+        .map_err(|_| Error::Failed(format!("unveil {path:?} (probe): the path contains a NUL")))?;
+    let mode = if execute { libc::X_OK } else { libc::R_OK };
+    if unsafe { libc::access(c_path.as_ptr(), mode) } == -1 {
+        let source = std::io::Error::last_os_error();
+        // ENOENT here is not a missing file: the first unveil that named this
+        // path would have failed on that. It is the shape of "no rule covers
+        // this path", which is the omission the probe exists to report.
+        if source.raw_os_error() == Some(libc::ENOENT) {
+            return Err(Error::Failed(format!(
+                "unveil {path} (probe): no rule covers this path after the list was locked"
+            )));
+        }
+        return Err(failure(&format!("unveil {path} (probe)"), source));
+    }
+    Ok(())
+}
+
 #[cfg(all(test, target_os = "openbsd"))]
 mod tests {
     use super::*;
 
     /// A failed unveil names the path and the reason, which is what the
     /// operator in cron mail needs to fix the config.
+    ///
+    /// The English text is asserted deliberately: the CI VM installs no
+    /// translations, so the C locale's `strerror` text is what a failure there
+    /// carries, and the message is the operator-facing contract.
     #[test]
     fn a_failed_unveil_names_the_path_and_the_errno() {
         let error = unveil("/nonexistent-kyriakon-unveil-probe/child", "r").unwrap_err();
@@ -202,5 +297,21 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("No such file or directory"), "{message}");
+    }
+
+    /// A probe that cannot reach its path names the path and says the list
+    /// missed it, which is the operator-facing half of the startup check.
+    #[test]
+    fn a_probe_failure_names_the_path_and_the_missing_rule() {
+        let error = probe("/nonexistent-kyriakon-probe/child", false).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("/nonexistent-kyriakon-probe/child"),
+            "{message}"
+        );
+        assert!(message.contains("no rule covers this path"), "{message}");
+        // A path the veil does allow must pass, or the probe would fail every
+        // pass on a correctly configured box.
+        probe("/", false).unwrap();
     }
 }

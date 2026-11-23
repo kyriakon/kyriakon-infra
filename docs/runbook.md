@@ -417,7 +417,7 @@ A failed publish is reported by the drain, which names the member and the finger
 
 ### The drain's first run under unveil and pledge
 
-The drain is the one program that runs as root from cron, and since #849 it cuts its own view before the first pass. `control/crates/drain/src/sandbox.rs` unveils every path a pass opens, locks the list with `unveil(NULL, NULL)`, then pledges `stdio rpath wpath cpath fattr chown flock proc exec`. `chown` is separate from `fattr` because fattr permits the syscall but refuses to change the owner. The file's comments name the call site for each entry.
+The drain is the one program that runs as root from cron, and since #849 it cuts its own view before the first pass. `control/crates/drain/src/sandbox.rs` unveils every path a pass opens, locks the list with `unveil(NULL, NULL)`, probes every path a pass opens, then pledges `stdio rpath wpath cpath fattr chown flock proc exec`. `chown` is separate from `fattr` because fattr permits the syscall but refuses to change the owner. The file's comments name the call site for each entry. The probe runs after the lock, so an entry the list misses fails the pass at startup and names the path.
 
 `scripts/deploy-control.sh` rebuilds the release and installs `/usr/local/sbin/kyriakon-control-drain`, so the ordinary deploy is the install step. The first run after it is the one to watch, because a path or promise the pass needs and the list misses fails there and not in a test:
 
@@ -429,7 +429,7 @@ A clean pass exits 0 and leaves the store as it found it. Its stderr is what cro
 	doas tail -n 3 /var/db/onboard/journal.jsonl
 	doas grep 'kyriakon-control-drain' /var/log/messages | tail -n 5
 
-A line naming `signal ABRT` means pledge stopped a syscall the pass attempted, so a promise is missing. If BSD accounting is enabled (`rcctl get accounting`), `doas lastcomm kyriakon-control-drain` marks the process with `U` when unveil refused an access it tried. A `U` line with exit 0 means a path is missing from the list and a transition did less than it should; add that path to `sandbox.rs` with the mode its call site needs. A non-zero exit names the path and the errno text, for example `unveil /var/db/onboard/rates: No such file or directory` when a configured directory does not exist. Fix the config or create the directory; do not widen the list to make the error go away.
+A line naming `signal ABRT` means pledge stopped a syscall the pass attempted, so a promise is missing. If BSD accounting is enabled (`rcctl get accounting`), `doas lastcomm kyriakon-control-drain` marks the process with `U` when unveil refused an access it tried. A `U` line with exit 0 means the refused access is one the startup probe does not cover, such as a path only a child opens after `execve`; add that path to `sandbox.rs` with the mode its call site needs. A non-zero exit names the path and the errno text. `unveil /var/db/onboard/rates: No such file or directory` means a configured directory does not exist. `unveil /bin/kill (probe): no rule covers this path after the list was locked` means the list omits a path the pass opens. Fix the config or add the entry; do not widen the list to make the error go away.
 
 A promise the pass needs and the list lacks does not produce an error. The kernel sends `SIGABRT` at the first such syscall, so a pass that dies abruptly after the first intent is a promise problem, and the fix is one word in `PROMISES` beside the comment naming the operation that needs it.
 
