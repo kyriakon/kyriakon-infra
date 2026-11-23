@@ -164,8 +164,8 @@ async fn a_submission_that_is_not_from_this_form_is_refused_whatever_it_names() 
 #[test]
 fn key_blocks_splits_one_per_mailbox() {
     let two = "-----BEGIN PGP PUBLIC KEY BLOCK-----\nAAA\n-----END PGP PUBLIC KEY BLOCK-----\n\n-----BEGIN PGP PUBLIC KEY BLOCK-----\nBBB\n-----END PGP PUBLIC KEY BLOCK-----\n";
-    assert_eq!(kyriakon_control_core::mail::keycheck::blocks(two).len(), 2);
-    assert!(kyriakon_control_core::mail::keycheck::blocks("nothing here").is_empty());
+    assert_eq!(kyriakon_control_core::mail::pgp::blocks(two).len(), 2);
+    assert!(kyriakon_control_core::mail::pgp::blocks("nothing here").is_empty());
 }
 
 #[test]

@@ -57,6 +57,14 @@ impl Kind {
         }
     }
 
+    /// Whether an answer of this kind is read as a list of lines, so a line
+    /// break is part of the answer rather than a control character. The one
+    /// place the front-ends and the validator ask that question, so a kind
+    /// added later cannot be refused for the line breaks it was asked for.
+    pub fn is_list(self) -> bool {
+        matches!(self, Kind::Multiline | Kind::Addresses)
+    }
+
     fn parse(s: &str) -> Result<Kind, Error> {
         Ok(match s {
             "text" => Kind::Text,

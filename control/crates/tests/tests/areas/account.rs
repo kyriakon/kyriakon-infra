@@ -685,7 +685,7 @@ fn a_mail_key_replacement_waits_out_its_window_and_can_be_cancelled() {
         json!({"mail_key": "AAAA", "outside_address": "alice@example.invalid"}),
     );
     let key = replacement_key();
-    let fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&key).unwrap();
+    let fingerprint = kyriakon_control_core::mail::pgp::fingerprint(&key).unwrap();
 
     fix.file_page_action(
         "mail-key",
@@ -765,10 +765,10 @@ fn a_mail_key_replacement_waits_out_its_window_and_can_be_cancelled() {
 fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
     let fix = Fix::new("account-rotation-signed");
     let key = replacement_key();
-    let fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&key).unwrap();
+    let fingerprint = kyriakon_control_core::mail::pgp::fingerprint(&key).unwrap();
 
     let (_, public, signature, _) = signing_key(&fingerprint);
-    let current = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&public).unwrap();
+    let current = kyriakon_control_core::mail::pgp::fingerprint(&public).unwrap();
     fix.page_account("alice", json!({"mail_key": current}));
     fix.mail_key("alice", &public);
 
@@ -813,7 +813,7 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
     // nothing changes.
     let fix = Fix::new("account-rotation-forged");
     let (_, public, _, _) = signing_key("another fingerprint");
-    let current = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&public).unwrap();
+    let current = kyriakon_control_core::mail::pgp::fingerprint(&public).unwrap();
     fix.page_account("alice", json!({"mail_key": current}));
     fix.mail_key("alice", &public);
     let (_, _, wrong, _) = signing_key("a different fingerprint");
@@ -832,6 +832,38 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
     assert!(fix.journal().contains("\"outcome\":\"refused\""));
 }
 
+/// An account record written before the `mail_key` field existed has no
+/// fingerprint. The keyring entry is then the expected signer, so a signed
+/// replacement still applies at once instead of waiting out the window.
+#[test]
+fn a_signed_replacement_reads_the_expected_key_from_the_keyring() {
+    let fix = Fix::new("account-rotation-signed-no-record");
+    let key = replacement_key();
+    let fingerprint = kyriakon_control_core::mail::pgp::fingerprint(&key).unwrap();
+    let (_, public, signature, _) = signing_key(&fingerprint);
+    fix.page_account("alice", json!({"mail_key": null}));
+    fix.mail_key("alice", &public);
+
+    fix.file_page_action(
+        "mail-key",
+        "alice",
+        json!({"action": "replace", "material": key, "signature": signature}),
+    );
+    assert!(fix.drain().status.success());
+    let account = fix.account("alice");
+    assert_eq!(
+        account["mail_key"],
+        json!(fingerprint),
+        "intents: {:?}\njournal: {}",
+        fix.intents(),
+        fix.journal()
+    );
+    assert!(
+        account.get("rotation").is_none_or(Value::is_null),
+        "the keyring's fingerprint let the signature skip the window: {account}"
+    );
+}
+
 /// A replacement carrying a verdict other than "works" is refused, so a key
 /// that would stop delivery cannot enter the keyring from `/account`. The key
 /// in use and the keyring file stay as they were. A block the parser could not
@@ -840,7 +872,7 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
 fn a_mail_key_replacement_refuses_an_expiring_or_aead_key() {
     let fix = Fix::new("account-rotation-refused");
     let clean = replacement_key();
-    let current = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&clean).unwrap();
+    let current = kyriakon_control_core::mail::pgp::fingerprint(&clean).unwrap();
     fix.page_account("alice", json!({"mail_key": current}));
     fix.mail_key("alice", &clean);
     let before = std::fs::read_to_string(fix.dir.join("keyring/alice.asc")).unwrap();
@@ -885,7 +917,7 @@ fn a_mail_key_replacement_refuses_an_expiring_or_aead_key() {
     // The parser cannot read this block, so the check is advisory and the
     // replacement proceeds rather than becoming impossible to start.
     let uninspected = GOOD_KEY;
-    let fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(uninspected).unwrap();
+    let fingerprint = kyriakon_control_core::mail::pgp::fingerprint(uninspected).unwrap();
     fix.file_page_action(
         "mail-key",
         "alice",
@@ -982,7 +1014,7 @@ fn request_verify_accepts_the_keyring_key_over_the_accounts_own_address() {
     let message = "From: Alice <alice@kyriakon.net>\nTo: admin@kyriakon.net\n\
                    Subject: my data\n\nPlease send me a copy.\n";
     let (_, public, detached, clearsigned) = signing_key(message);
-    let fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&public).unwrap();
+    let fingerprint = kyriakon_control_core::mail::pgp::fingerprint(&public).unwrap();
     fix.page_account("alice", json!({}));
     fix.mail_key("alice", &public);
 
@@ -1124,6 +1156,9 @@ fn request_verify_refuses_a_wrong_signer_from_or_missing_keyring_entry() {
 fn request_verify_refuses_unsigned_text_before_the_armour() {
     let fix = Fix::new("request-verify-prefix");
     fix.page_account("alice", json!({}));
+    // The keyring entry has to exist for the framing check to be reached; the
+    // signed block below is never verified because the text above it is refused.
+    fix.mail_key("alice", GOOD_KEY);
     let armour = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n\
                   From: alice@kyriakon.net\n\nPlease send me a copy.\n\
                   -----BEGIN PGP SIGNATURE-----\n\nAAAA\n\

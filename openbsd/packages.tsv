@@ -5,8 +5,9 @@
 # need_packages in lib.sh; scripts/install-packages.sh installs the rows for CI,
 # or the whole table on the box.
 #
-# `box` is the checkout itself: git updates it, and no deploy owns that. The CI
-# column is not "the box has it", it is "the CI VM installs it", so dovecot stays
+# Nothing is owned by `box` any more: git is assigned to deploy.sh and
+# deploy-control.sh, so a deploy installs the tool the checkout itself needs.
+# The CI column is not "the box has it", it is "the CI VM installs it", so dovecot stays
 # out because the self-tests do not start the mail daemons, and the DKIM filter
 # stays out until a CI step checks the config that needs it. gmid is in because
 # scripts/verify-hosting.sh starts it against a fixture chroot, alongside httpd
@@ -19,7 +20,7 @@
 
 curl	deploy-mail.sh,deploy-control.sh	yes
 dovecot	deploy-mail.sh	no
-git	box	yes
+git	deploy.sh,deploy-control.sh	yes
 gmid	deploy-mail.sh,deploy-control.sh	yes
 gnupg	deploy-mail.sh	yes
 hcloud	deploy-mail.sh	no

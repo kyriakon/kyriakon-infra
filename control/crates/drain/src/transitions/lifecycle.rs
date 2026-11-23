@@ -2782,24 +2782,26 @@ async fn rotation_notices(
     Ok(())
 }
 
-/// Whether `signature` is a detached signature by the key the box delivers
-/// with, over `fingerprint`. A scratch homedir holds just that one key, so a
-/// good signature is by the current key and by nothing else; `Ok(false)` is a
+/// Whether `signature` is a detached signature over `fingerprint` by the key
+/// the box delivers with. A scratch homedir holds just that one key, and gpg's
+/// `VALIDSIG` must equal the account's recorded fingerprint, so a second primary
+/// key in the same block cannot sign as the key in use (#918). `Ok(false)` is a
 /// signature that does not verify, and `Err` is gpg failing to run at all.
 async fn signed_by_current_key(
     cfg: &DrainConfig,
     key_file: &std::path::Path,
+    expected: &str,
     fingerprint: &str,
     signature: &str,
 ) -> Result<bool, Error> {
-    Ok(kyriakon_control_core::mail::keycheck::verify_signature(
+    Ok(kyriakon_control_core::mail::pgp::verify_detached(
         &cfg.gpg,
         key_file,
+        expected,
         fingerprint.as_bytes(),
-        Some(signature.as_bytes()),
+        signature.as_bytes(),
     )
-    .await?
-    .is_some())
+    .await?)
 }
 
 /// Apply a pending rotation: the new key into the keyring delivery reads, the
@@ -2929,13 +2931,12 @@ pub async fn mail_key(
             ))
         }
         "replace" => {
-            let checked =
-                match kyriakon_control_core::mail::keycheck::pgp_public_key(&intent.material) {
-                    Ok(checked) => checked,
-                    Err(why) => {
-                        return Ok(Settlement::refused(format!("the mail key: {why}")));
-                    }
-                };
+            let checked = match kyriakon_control_core::mail::pgp::public_key(&intent.material) {
+                Ok(checked) => checked,
+                Err(why) => {
+                    return Ok(Settlement::refused(format!("the mail key: {why}")));
+                }
+            };
             // Signup warns and proceeds because a heuristic refusal turns a
             // guarantee into a support queue. A replacement refuses, because
             // the account already receives mail and a key that stops delivery
@@ -2945,8 +2946,7 @@ pub async fn mail_key(
             if let Some(why) = checked.refusal() {
                 return Ok(Settlement::refused(format!("the mail key: {why}")));
             }
-            let Some(fingerprint) =
-                kyriakon_control_core::mail::keycheck::pgp_fingerprint(&intent.material)
+            let Some(fingerprint) = kyriakon_control_core::mail::pgp::fingerprint(&intent.material)
             else {
                 return Ok(Settlement::refused("the mail key carries no key packet"));
             };
@@ -2965,7 +2965,33 @@ pub async fn mail_key(
                         "the box holds no current key to verify a signature against",
                     ));
                 }
-                match signed_by_current_key(cfg, &key_file, &fingerprint, &intent.signature).await {
+                let expected = match account.mail_key.as_deref() {
+                    Some(fingerprint) if !fingerprint.is_empty() => fingerprint.to_string(),
+                    _ => {
+                        let material = std::fs::read_to_string(&key_file).map_err(|e| {
+                            Error::context(format!("cannot read {}", key_file.display()), e)
+                        })?;
+                        match kyriakon_control_core::mail::pgp::inspect_single_cert(&material) {
+                            Ok(cert) => cert.fingerprint,
+                            Err(why) => {
+                                return Ok(Settlement::refused(format!(
+                                    "the box's key for {} cannot be read, so the signature \
+                                         cannot be checked: {why}",
+                                    account.username
+                                )))
+                            }
+                        }
+                    }
+                };
+                match signed_by_current_key(
+                    cfg,
+                    &key_file,
+                    &expected,
+                    &fingerprint,
+                    &intent.signature,
+                )
+                .await
+                {
                     Ok(true) => true,
                     Ok(false) => {
                         return Ok(Settlement::refused(

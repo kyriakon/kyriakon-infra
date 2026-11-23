@@ -1,0 +1,13 @@
+[package]
+name = "kyriakon-control-fromcheck"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kyriakon-fromcheck"
+path = "src/main.rs"
+
+[dependencies]
+kyriakon-mailparse = { path = "../../../mailparse" }
+libc.workspace = true

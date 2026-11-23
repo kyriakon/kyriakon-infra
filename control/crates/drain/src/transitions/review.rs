@@ -458,7 +458,7 @@ async fn approve(
     // record's own verdict field. It runs only when something would be
     // installed: the already-member and name refusals above make no account.
     for key in &record.mail_keys {
-        let checked = kyriakon_control_core::mail::keycheck::pgp_public_key(&key.material)
+        let checked = kyriakon_control_core::mail::pgp::public_key(&key.material)
             .map_err(|e| Error::context("the application's mail key", e))?;
         if let Some(why) = checked.refusal() {
             return Err(Error::Failed(format!(

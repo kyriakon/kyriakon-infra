@@ -1220,7 +1220,7 @@ fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Error> {
     // The console carries whatever file the operator named. A private key, an
     // SSH key or a truncated block would reach the encryptor's keyring and
     // fail closed, so the shared check refuses it before the journal line.
-    let checked = kyriakon_control_core::mail::keycheck::pgp_public_key(&key.material)
+    let checked = kyriakon_control_core::mail::pgp::public_key(&key.material)
         .map_err(|e| Error::context(format!("the mail key for {}", intent.mailbox), e))?;
     // The form and the rotation path refuse a key whose verdict is not "works";
     // the console is the same boundary, so an AEAD advert or an expiring subkey
@@ -1236,8 +1236,8 @@ fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Error> {
     key.verdict = checked.verdict;
     // The signature covers the material, not the fingerprint beside it, so the
     // fingerprint is computed from the parsed key rather than trusted.
-    key.fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&key.material)
-        .ok_or_else(|| {
+    key.fingerprint =
+        kyriakon_control_core::mail::pgp::fingerprint(&key.material).ok_or_else(|| {
             Error::Failed(format!(
                 "the mail key for {} has no fingerprint this build can derive",
                 intent.mailbox

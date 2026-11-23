@@ -1242,7 +1242,7 @@ fn a_mailbox_added_to_a_group_gets_an_account_key_and_entry() {
     assert!(sent.contains(&format!("/password/{link}?")), "{sent}");
     // The intent carried a fingerprint the signature does not cover, so the
     // record must show the one computed from the material.
-    let computed = kyriakon_control_core::mail::keycheck::pgp_fingerprint(GOOD_KEY).unwrap();
+    let computed = kyriakon_control_core::mail::pgp::fingerprint(GOOD_KEY).unwrap();
     assert_eq!(
         fix.account("parish-office")["mail_key"],
         json!(computed),

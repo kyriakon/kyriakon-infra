@@ -77,7 +77,7 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     unveil(&cfg.scripts, "x")?;
     // The enqueuer every notice runs through (`core::mail::notice`).
     unveil(&cfg.sendmail, "x")?;
-    // The OpenPGP binary `keycheck::verify_signature` runs for an upload key.
+    // The OpenPGP binary `mail::pgp` runs for a key check or a signature.
     unveil(&cfg.gpg, "x")?;
     // The resolver `check_group_dns` runs, which needs no entry of its own for
     // `/etc/resolv.conf`: it is a different process after `execve`.
@@ -125,11 +125,11 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     // The rate cache's directory: the cache is written through `<name>.new`
     // and a failed fetch is stamped in `<name>.attempt` beside it.
     unveil(parent_of(&cfg.rates)?, "rwc")?;
-    // The export's scratch directory is made under the process's temp
-    // directory, with gpg's homedir inside it.
+    // The scratch directories a journal pass and a transition make under the
+    // process's temp directory.
     unveil(&temp_dir()?, "rwc")?;
-    // `keycheck::verify_signature` names `/tmp` literally for the scratch
-    // homedir a mail-key signature is checked in, whatever `TMPDIR` says.
+    // `mail::pgp::run_gpg` names `/tmp` literally for the scratch homedir a key
+    // is imported into, whatever `TMPDIR` says.
     unveil("/tmp", "rwc")?;
     // `Stdio::null` opens this in the parent for an enqueued notice's stdout
     // and stderr and for a session check's stderr.

@@ -4,7 +4,7 @@ use super::*;
 
 use super::account::{group_recipe, group_state};
 use super::flow::{build_record, file_application};
-use super::reply::{respond, too_many, Which};
+use super::reply::{respond, too_many, unavailable, Which};
 use super::route::Call;
 use super::status::{card_link, live_application};
 use kyriakon_control_core::flow::applicant::{
@@ -149,8 +149,10 @@ pub(super) async fn account_notices(app: &App, username: &str) -> Vec<Notice> {
 /// about the applicant. The 30 is the only way the token reaches the path: a
 /// gemini prompt cannot carry one.
 pub(super) async fn capsule_new(app: &App, incoming: &Incoming) -> Reply {
-    if !app.counter.allow_draft(incoming.key) {
-        return too_many(FrontEnd::Gemini, Which::Day);
+    match app.counter.allow_draft(incoming.key) {
+        rate::Admission::Allowed => {}
+        rate::Admission::Denied => return too_many(FrontEnd::Gemini, Which::Day),
+        rate::Admission::Unavailable => return unavailable(FrontEnd::Gemini),
     }
     let token = match store::status_token().await {
         Ok(token) => token,

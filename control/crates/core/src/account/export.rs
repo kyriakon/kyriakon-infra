@@ -17,14 +17,13 @@
 use std::io::Write;
 use std::os::unix::fs::{fchown, DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Duration, OffsetDateTime};
 
 use crate::config::DrainConfig;
-use crate::mail::keycheck;
 use crate::mail::notice;
+use crate::mail::{keycheck, pgp};
 use crate::store::{Account, JournalLine, Store};
 use crate::util;
 use crate::Error;
@@ -649,67 +648,6 @@ pub fn has_mail_key(cfg: &DrainConfig, username: &str) -> bool {
     keycheck::keyring_file(&cfg.keyring_dir, username).is_file()
 }
 
-/// Encrypt the written part to the member's public key with the same gpg
-/// invocation `kyriakon-encrypt` uses for their mail: `--recipient-file` reads
-/// the armored cert directly, and a scratch homedir keeps gpg's own files out
-/// of the keyring.
-async fn encrypt(program: &str, key: &Path, plain: &[u8]) -> Result<Vec<u8>, Error> {
-    use tokio::io::AsyncWriteExt;
-    let home = std::env::temp_dir().join(format!("kyriakon-export-gpg-{}", ulid::Ulid::new()));
-    tokio::fs::create_dir_all(&home)
-        .await
-        .map_err(|source| Error::context(format!("cannot create {}", home.display()), source))?;
-    let run = async {
-        let mut child = tokio::process::Command::new(program)
-            .args([
-                "--batch",
-                "--no-tty",
-                "--no-options",
-                "--encrypt",
-                "--armor",
-                "--no-encrypt-to",
-                "--recipient-file",
-            ])
-            .arg(key)
-            .arg("--homedir")
-            .arg(&home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| Error::context(format!("cannot spawn {program}"), source))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::Failed("gpg has no stdin".to_string()))?;
-        stdin
-            .write_all(plain)
-            .await
-            .map_err(|source| Error::context("cannot write to gpg", source))?;
-        stdin
-            .shutdown()
-            .await
-            .map_err(|source| Error::context("cannot close gpg's stdin", source))?;
-        // The pipe has to be closed before the wait, or gpg never sees EOF.
-        drop(stdin);
-        child
-            .wait_with_output()
-            .await
-            .map_err(|source| Error::context("cannot wait for gpg", source))
-    }
-    .await;
-    let _ = tokio::fs::remove_dir_all(&home).await;
-    let out = run?;
-    if !out.status.success() {
-        return Err(Error::Failed(format!(
-            "gpg refused to encrypt to {}: {}",
-            key.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(out.stdout)
-}
-
 /// Mail the written part as an attachment encrypted to the member's public key.
 /// This is the path for a member who cannot log in but still holds their key;
 /// a member who holds neither is told what is reachable, and nothing is sent.
@@ -731,7 +669,7 @@ pub async fn deliver_by_mail(
     }
     let now = OffsetDateTime::now_utc();
     let (account, answer, docs) = written(cfg, store, username, now, true).await?;
-    let armored = encrypt(&cfg.gpg, &key, bundle_text(&docs).as_bytes()).await?;
+    let armored = pgp::encrypt_to_cert(&cfg.gpg, &key, bundle_text(&docs).as_bytes()).await?;
     let filename = format!("export-{}.txt.asc", stamp(now));
     let to = account.notice_address();
     notice::send_account_notice_attachment(

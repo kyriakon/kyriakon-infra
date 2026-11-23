@@ -30,6 +30,7 @@
 #   /home/www/<username>.kyriakon.net/www       <username>:members 0755
 #   /home/www/<username>.kyriakon.net/gemini    <username>:members 0755
 #   /home/<username>/repos                      the member, 0700
+#   /home/<username>/repos/pass.git             the member, 0700, a bare repo
 #   /home/<username>/.ssh                       root:<group>, 0750
 #   /home/<username>/.ssh/authorized_keys       root:<group>, 0640
 #   /etc/ssh/authorized_keys/<username>         root:wheel 0644
@@ -54,6 +55,12 @@
 # would let them replace the root of their own jail. repos is beside Maildir,
 # outside that chroot, so the upload session never sees it and the repositories
 # are reached only through the confined git shell on 2222, which is not chrooted.
+#
+# pass.git is the repository the catalogue's live git service advertises. The
+# wrapper on 2222 serves a repository only at ~/repos/<name>.git and will not
+# create one, and the chrooted upload session cannot reach ~/repos, so a member
+# with no repository has nothing to push to. The bare repo is made here, after
+# ~/repos, with the same owner and mode as the directory around it.
 #
 # The member's key is written twice. /etc/ssh/authorized_keys/<username> is the
 # one that matters: /etc and /etc/ssh are root-owned, so nothing the member can
@@ -129,6 +136,18 @@ assert_shape() {
 	fi
 }
 
+# refuse_symlink <path>...: a planted link would make install or chown act on
+# its target, and the tree below a member's home belongs to the member. Refuse
+# it before any privileged call, and never touch the target.
+refuse_symlink() {
+	typeset path
+	for path in "$@"; do
+		[ -L "$path" ] || continue
+		printf '%s is a symlink; refusing to install through it\n' "$path" >&2
+		exit 1
+	done
+}
+
 # ensure_dir <path> <mode> <owner> <group>: the directory, in that shape.
 # Returns 0 when it created or corrected it and 1 when it was already right, so
 # a run can report what it did rather than claiming work it did not do. install
@@ -137,13 +156,9 @@ assert_shape() {
 ensure_dir() {
 	typeset path mode want
 	path="$1"
-	# install -d follows a final symlink, and the tree it descends is the
-	# member's own: a planted link would make root chown and chmod the target
-	# before the shape check below ran. Refuse it first, and never touch it.
-	[ -L "$path" ] && {
-		printf '%s is a symlink; refusing to install through it\n' "$path" >&2
-		exit 1
-	}
+	# install -d follows a final symlink, so refuse one before the chown and
+	# chmod below would follow it.
+	refuse_symlink "$path"
 	mode="$2"
 	# The names, not the ids: every call site names an owner and a group, and
 	# %Su/%Sg are what print those. %u/%g would print 0:0 beside "root:wheel".
@@ -152,6 +167,55 @@ ensure_dir() {
 		return 1
 	fi
 	install -d -m "$mode" -o "$3" -g "$4" "$path"
+	return 0
+}
+
+# ensure_bare_repo <path> <owner> <group>: the member's default repository.
+# member-git-shell.sh serves only a path of the form ~/repos/<name>.git whose
+# directory resolves to itself, so the path is exactly that. Returns 0 when it
+# created or corrected the repository and 1 when it was already right, the same
+# contract ensure_dir has. An existing directory git does not read as bare is
+# refused rather than adopted: a push into a non-bare repository would land in a
+# working tree nothing serves.
+ensure_bare_repo() {
+	typeset path owner group unowned
+	path=$1
+	owner=$2
+	group=$3
+	# A link at the repository name, or at ~/repos itself, would send the init,
+	# chmod and chown below through it into another tree. The parent is checked
+	# again here because it can be replaced between ensure_dir and this call.
+	refuse_symlink "${path%/*}" "$path"
+	if [ -e "$path" ]; then
+		if [ ! -d "$path" ] ||
+			[ "$(git -c safe.directory="$path" --git-dir="$path" \
+				rev-parse --is-bare-repository 2>/dev/null)" != true ]; then
+			printf '%s exists and is not a bare git repository\n' "$path" >&2
+			printf 'refusing to adopt a directory the git session cannot serve\n' >&2
+			exit 1
+		fi
+		# The top directory's shape is not the whole shape. A repository made by
+		# hand as root leaves objects/ and refs/ in root's ownership, which git
+		# refuses to the member, so the whole tree is checked and corrected with
+		# the same chown the creation branch makes.
+		unowned=$(find "$path" \( ! -user "$owner" -o ! -group "$group" \) -print |
+			wc -l | tr -d ' ')
+		if [ "$(stat -f '%Su:%Sg %Lp' "$path")" = "$owner:$group $(strip_mode 0700)" ] &&
+			[ "$unowned" -eq 0 ]; then
+			return 1
+		fi
+		install -d -m 0700 -o "$owner" -g "$group" "$path"
+		chown -R "$owner:$group" "$path"
+		return 0
+	fi
+	# The umask keeps every path git writes at 0700/0600 before the chown, so
+	# nothing it creates is ever readable by the member's group or others.
+	(umask 077 && git init --bare --quiet "$path") || {
+		printf 'git init --bare %s failed\n' "$path" >&2
+		exit 1
+	}
+	chmod 0700 "$path"
+	chown -R "$owner:$group" "$path"
 	return 0
 }
 
@@ -300,6 +364,10 @@ self_test() {
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin
 	tree=$self_test_work
+	# The wrapper compares a repository path with its canonical parent, and
+	# mktemp can hand back a symlinked component (macOS /var). Resolve the tree
+	# once here so the push fixture and the repository it names agree.
+	tree=$(cd "$tree" && pwd -P)
 	# smtpd -n validates the live tree, maildir and filter, which this fixture
 	# does not have. The deploy self-test proves the parser check with a stub.
 	export SMTPD_CONF_CHECK=no
@@ -419,6 +487,98 @@ self_test() {
 	check "and its target keeps its mode" "$(stat -f '%Lp' "$tree/planted-target")" 755
 	check "the refusal names the link" \
 		"$(grep -c 'is a symlink' "$tree/planted.err")" 1
+
+	# The repository the git service serves. member-git-shell.sh accepts only
+	# ~/repos/<name>.git and never creates one, so provisioning makes pass.git
+	# beside the repos directory, owned by the member in the mode around it.
+	# The test's own uid and gid stand in for the member's, as they do above.
+	mkdir "$tree/repos"
+	repo="$tree/repos/pass.git"
+	rc=0
+	( ensure_bare_repo "$repo" "$(id -un)" "$(id -gn)" ) >/dev/null 2>&1 || rc=$?
+	check "the default repository is created" "$rc" 0
+	check "and git reads it as bare" \
+		"$(git --git-dir="$repo" rev-parse --is-bare-repository 2>/dev/null)" true
+	check "owned by the member" \
+		"$(stat -f '%Su:%Sg' "$repo")" "$(id -un):$(id -gn)"
+	check "at the mode the other per-member directories use" \
+		"$(stat -f '%Lp' "$repo")" 700
+	repo_inode=$(stat -f '%i' "$repo")
+	rc=0
+	( ensure_bare_repo "$repo" "$(id -un)" "$(id -gn)" ) \
+		>/dev/null 2>"$tree/repo-second.err" || rc=$?
+	check "a second run leaves it alone" "$rc" 1
+	check "and says nothing" \
+		"$(wc -c <"$tree/repo-second.err" | tr -d ' ')" 0
+	check "and does not replace it" "$(stat -f '%i' "$repo")" "$repo_inode"
+	# A mode that drifted is corrected by the same body, so a later run does not
+	# leave a repository the git session cannot read.
+	chmod 0755 "$repo"
+	rc=0
+	( ensure_bare_repo "$repo" "$(id -un)" "$(id -gn)" ) >/dev/null 2>&1 || rc=$?
+	check "a drifted repository mode is corrected" "$rc" 0
+	check "and the mode is 700 again" "$(stat -f '%Lp' "$repo")" 700
+	# A plain directory at the name is refused rather than adopted, because a
+	# push into it would land in a working tree nothing serves.
+	mkdir "$tree/repos/plain.git"
+	rc=0
+	( ensure_bare_repo "$tree/repos/plain.git" "$(id -un)" "$(id -gn)" ) \
+		>/dev/null 2>"$tree/plain.err" || rc=$?
+	check "an existing non-bare directory is refused" "$rc" 1
+	check "and the refusal says why" \
+		"$(grep -c 'is not a bare git repository' "$tree/plain.err")" 1
+	# A link planted at the repository name is refused before install or chown
+	# can follow it, and its target keeps the mode it had.
+	mkdir "$tree/repos/planted-target"
+	chmod 0755 "$tree/repos/planted-target"
+	ln -s "$tree/repos/planted-target" "$tree/repos/planted.git"
+	rc=0
+	( ensure_bare_repo "$tree/repos/planted.git" "$(id -un)" "$(id -gn)" ) \
+		>/dev/null 2>"$tree/repo-link.err" || rc=$?
+	check "a symlinked repository is refused" "$rc" 1
+	check "and its target keeps its mode" \
+		"$(stat -f '%Lp' "$tree/repos/planted-target")" 755
+	check "and the refusal names the link" \
+		"$(grep -c 'is a symlink' "$tree/repo-link.err")" 1
+	# ~/repos itself is the member's and can be swapped between ensure_dir and
+	# this call, so the parent is refused as well.
+	ln -s "$tree/repos" "$tree/repos-link"
+	rc=0
+	( ensure_bare_repo "$tree/repos-link/pass.git" "$(id -un)" "$(id -gn)" ) \
+		>/dev/null 2>"$tree/repo-parent.err" || rc=$?
+	check "a repository under a symlinked parent is refused" "$rc" 1
+	check "and the refusal names the parent" \
+		"$(grep -c "$tree/repos-link is a symlink" "$tree/repo-parent.err")" 1
+
+	# The push itself, through the live wrapper. git runs the fixture as its
+	# remote receive-pack program; the fixture sources the wrapper and names the
+	# fixture home, so the request crosses resolve_repo and the receive-pack
+	# dispatch the session uses. The connection sshd would provide is the only
+	# part not exercised.
+	git_path=$(command -v git)
+	mkdir -p "$tree/bin"
+	cat >"$tree/bin/receive-pack-fixture" <<EOF
+#!/bin/ksh
+. '$script_dir/member-git-shell.sh'
+home='$tree'
+git='$git_path'
+run_command "git-receive-pack '\$1'"
+EOF
+	chmod 0755 "$tree/bin/receive-pack-fixture"
+	mkdir "$tree/push-src"
+	git -C "$tree/push-src" init -q
+	printf 'hello\n' >"$tree/push-src/readme"
+	git -C "$tree/push-src" add -A
+	git -C "$tree/push-src" -c user.email=self-test@example.invalid \
+		-c user.name='self test' -c commit.gpgsign=false commit -qm one
+	rc=0
+	git -C "$tree/push-src" push -q \
+		--receive-pack="$tree/bin/receive-pack-fixture" \
+		"$repo" HEAD:refs/heads/main >"$tree/push.out" 2>&1 || rc=$?
+	check "a push through the member git shell lands" "$rc" 0
+	check "and the pushed commit is the repository's tip" \
+		"$(git --git-dir="$repo" rev-parse refs/heads/main 2>/dev/null)" \
+		"$(git -C "$tree/push-src" rev-parse HEAD)"
 
 	self_test_end
 }
@@ -757,14 +917,11 @@ if ensure_dir "$public/gemini" 0755 "$user" members; then changed=yes; fi
 # StrictModes.
 if [ "$have_key" = yes ]; then
 	if ensure_dir "$home/repos" 0700 "$user" "$group"; then changed=yes; fi
+	if ensure_bare_repo "$home/repos/pass.git" "$user" "$group"; then changed=yes; fi
 	if ensure_dir "$home/.ssh" 0750 root "$group"; then changed=yes; fi
 	# The home is member-owned, so ~/.ssh can be replaced between ensure_dir and
 	# the key install. Refuse that here rather than follow it as root (#934).
-	if [ -L "$home/.ssh" ] || [ -L "$authorized_keys" ]; then
-		printf '%s or %s is a symlink; refusing to install a key through it\n' \
-			"$home/.ssh" "$authorized_keys" >&2
-		exit 1
-	fi
+	refuse_symlink "$home/.ssh" "$authorized_keys"
 	if ensure_dir "$managed_keys_dir" 0755 root wheel; then changed=yes; fi
 
 	# The key is installed whole rather than appended: the source file is the
@@ -783,6 +940,7 @@ assert_shape "$public/www" "$user:members" 0755
 assert_shape "$public/gemini" "$user:members" 0755
 if [ "$have_key" = yes ]; then
 	assert_shape "$home/repos" "$user:$group" 0700
+	assert_shape "$home/repos/pass.git" "$user:$group" 0700
 	assert_shape "$home/.ssh" "root:$group" 0750
 	assert_shape "$authorized_keys" "root:$group" 0640
 	assert_shape "$managed_keys_dir" root:wheel 0755
@@ -874,7 +1032,7 @@ fi
 
 printf 'provisioned %s\n' "$user"
 printf '  public:  %s (root:wheel 0755; www and gemini %s:members)\n' "$public" "$user"
-printf '  private: %s/repos 0700, %s/.ssh/authorized_keys root:%s 0640\n' "$home" "$home" "$group"
+printf '  private: %s/repos 0700 (pass.git bare), %s/.ssh/authorized_keys root:%s 0640\n' "$home" "$home" "$group"
 printf '  session: sftp on 22 and confined git on 2222 from the member login class, one key\n'
 printf '  key:     %s (root:wheel 0644; sshd reads it for members once the hand step lands)\n' "$managed_key"
 printf '  files:   /etc/httpd.d/%s.kyriakon.net.conf, /etc/gmid.d/%s.kyriakon.net.conf\n' "$user" "$user"

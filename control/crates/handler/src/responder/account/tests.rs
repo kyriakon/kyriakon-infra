@@ -1,7 +1,10 @@
 //! Tests for the account module.
 
 use crate::responder::test_support::*;
-use kyriakon_control_core::{account::session, mail::keycheck};
+use kyriakon_control_core::{
+    account::session,
+    mail::{keycheck, pgp},
+};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
@@ -1062,7 +1065,7 @@ async fn the_mail_key_form_starts_and_cancels_a_replacement() {
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap();
-    let fingerprint = keycheck::pgp_fingerprint(&key).unwrap();
+    let fingerprint = pgp::fingerprint(&key).unwrap();
     amend_account(&dir, "alice", |value| {
         value["mail_key"] = serde_json::json!(fingerprint);
     });

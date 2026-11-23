@@ -5,7 +5,7 @@ use super::*;
 use super::connection::fields;
 use super::flow::{application_problems, build_record, file_application, render_applicant};
 use super::gemini::capsule_new;
-use super::reply::{capability, page_html, refused, respond, too_many, Which};
+use super::reply::{capability, page_html, refused, respond, too_many, unavailable, Which};
 use super::route::Call;
 use kyriakon_control_core::flow::applicant::{label, reading, Reading};
 
@@ -106,10 +106,12 @@ pub(super) async fn apply_web(app: &App, request: &Request, incoming: &Incoming)
     // Charged here, once the submission is a draft and no longer merely an
     // attempt: a refusal spends the request budget, not the day's drafts, and a
     // third-party page cannot burn a visitor's day with junk posts.
-    if !app.counter.allow_draft(incoming.key) {
+    match app.counter.allow_draft(incoming.key) {
+        rate::Admission::Allowed => {}
         // The web front-end's own refusal: a draft is filed through this route,
         // which is the form's.
-        return too_many(FrontEnd::Httpd, Which::Day);
+        rate::Admission::Denied => return too_many(FrontEnd::Httpd, Which::Day),
+        rate::Admission::Unavailable => return unavailable(FrontEnd::Httpd),
     }
 
     let token = match store::status_token().await {

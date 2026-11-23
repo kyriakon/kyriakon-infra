@@ -24,6 +24,11 @@
 #ifndef KYRIAKON_KEYRING
 #define KYRIAKON_KEYRING "/etc/kyriakon/keys"
 #endif
+/* A stalled encryptor must not wedge the imap or lmtp process. The whole run,
+ * including waiting for it to exit, is bounded by this wall clock. */
+#ifndef KYRIAKON_ENCRYPT_TIMEOUT_MS
+#define KYRIAKON_ENCRYPT_TIMEOUT_MS (60 * 1000)
+#endif
 
 struct kyriakon_encrypt_result {
 	/* malloc'd ciphertext; NULL on failure, and the caller owns it on
@@ -44,5 +49,13 @@ bool kyriakon_encrypt_message(const char *bin, const char *user,
 			      const char *keyring, const char *gpg_home,
 			      const unsigned char *input, size_t input_len,
 			      struct kyriakon_encrypt_result *result);
+
+/* The same run with an explicit wall-clock bound in milliseconds. The test uses
+ * a short one to drive a stalled child; the plugin uses the default above. */
+bool kyriakon_encrypt_message_timeout(const char *bin, const char *user,
+				      const char *keyring, const char *gpg_home,
+				      const unsigned char *input,
+				      size_t input_len, int timeout_ms,
+				      struct kyriakon_encrypt_result *result);
 
 #endif
