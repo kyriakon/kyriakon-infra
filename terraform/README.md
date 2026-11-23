@@ -56,7 +56,7 @@ Hetzner has no native OpenBSD image, so install once by hand and snapshot it:
 7. Shut down cleanly (`shutdown -h now`), then snapshot with a label:
    ```sh
    hcloud server create-image --type snapshot \
-     --description "kyriakon-openbsd-79-$(date +%Y%m%d)" \
+     --description "kyriakon-openbsd-80-$(date +%Y%m%d)" \
      --label kind=gold \
      <server>
    ```
@@ -204,10 +204,30 @@ Fully unattended is not built yet, and the image's shape is why.
 `miniroot80.img` has no disklabel. It is an MBR with x86 boot code at sector 0, an EFI FAT
 partition at sector 64 whose OEM name is `BSD  4.4` and whose root holds a single `EFI`
 directory, and an OpenBSD partition at sector 1024 of 10,368 sectors. That partition does
-carry an FFS: the superblock magic `0x011954` sits at its usual offset, and the only gzip
-stream in the image begins at partition offset 180,224 and runs to the end of it, which is
-the installer kernel. Measured on 2026-11-23; 7.9's and 8.0's images have the same size and
-the same partition geometry.
+carry an FFS: the superblock magic `0x011954` sits at its usual offset in the 16 KiB-block
+filesystem, and the installer kernel is an FFS file whose data begins at partition offset
+180,224. The file is 299 blocks long, and it is not one contiguous run. Its first 12
+blocks, 196,608 bytes, hold the start of the gzip stream. The next block is the indirect
+block, so it holds block pointers rather than file data. After it come the remaining 287
+blocks, from partition offset 393,216. The stream ends 4,897,648 bytes in, 1,168 bytes
+before the end of the last block, and the rest of that block is zero padding.
+
+Measured on 2026-11-23; 7.9's and 8.0's images have the same size and the same partition
+geometry. Reading from 180,224 byte by byte therefore hits the indirect block after
+196,608 bytes and `gunzip` fails there. Extract the three runs separately (the `skip`
+values are whole-image 16 KiB blocks, and the last run is the first 15,216 bytes of block
+342, the rest of the stream):
+
+```sh
+dd if=miniroot80.img of=bsd.rd.gz  bs=16384 skip=43 count=12
+dd if=miniroot80.img of=bsd.rd.mid bs=16384 skip=56 count=286
+dd if=miniroot80.img of=bsd.rd.end bs=1 skip=$((342*16384)) count=15216
+cat bsd.rd.mid bsd.rd.end >> bsd.rd.gz
+gunzip bsd.rd.gz
+```
+
+The result is the 11,005,898-byte installer kernel. This was run on an OpenBSD 8.0 host
+against the downloaded image, whose SHA256 is the value `prepare-disk.sh` pins.
 
 The first attempt at a patch script reported the image as carrying no FFS after mounting
 `/dev/vnd0a` and `/dev/vnd0c` and finding nothing, and from that said the kernel was missing.
@@ -217,9 +237,9 @@ The unattended route is worth having and needs the kernel patched rather than a 
 mounted for its own sake: the response file has to reach `/auto_install.conf` inside the
 kernel's ramdisk, so the work is to lift the kernel out of the image's OpenBSD partition,
 `gunzip` it, `rdsetroot -x` the ramdisk, add the file, put both back, and write the result
-to the same offset. The signature-verified `bsd.rd` from the release directory is the same
-kernel under its release name, so it can be used directly instead of extracting from the
-image, if the modified kernel can be written back where the boot loader looks for it.
+back into the same FFS blocks. The signature-verified `bsd.rd` from the release directory is
+the same kernel under its release name, so it can be used directly instead of extracting from
+the image, if the modified kernel can be written back where the boot loader looks for it.
 
 Until that exists, the URL route is the one to use, and the URL is kept short deliberately:
 `https://kyriakon.net/install.conf`, served from the site's document root, which is a git
