@@ -1,6 +1,8 @@
 # Build the kyriakon-encrypt Dovecot plugin.
 #
-# Requires Dovecot's headers, seeded on OpenBSD by the dovecot package:
+# Requires Dovecot's headers: the OpenBSD dovecot package seeds
+# /usr/local/include/dovecot, and Debian/Ubuntu's dovecot-dev seeds
+# /usr/include/dovecot, which CI passes with INCLUDEDIR:
 #   pkg_add dovecot        # ships include/dovecot/*.h and lib/dovecot/*.so
 #
 #   make                  # produces libkyriakon_encrypt_plugin.so

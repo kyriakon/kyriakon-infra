@@ -26,8 +26,8 @@
 # Two guards keep it narrow: the head branch must be a publish-key or remove-key
 # branch, and the diff must touch nothing outside keys/: additions for a
 # publication, exactly one deletion for a removal, and every added key a regular
-# file rather than a symlink (the file list has no mode, so the blob is resolved
-# at the head commit).
+# file rather than a symlink (the file list has no mode, so the mode is read from
+# the head commit's tree).
 name: auto-merge key publications
 
 on:
@@ -112,6 +112,13 @@ jobs:
             exit 0
             ;;
           esac
+          # changedFiles itself caps at 3000, so the mismatch below cannot see a
+          # list truncated exactly at the boundary: anything at or past the cap
+          # is refused without inspecting it.
+          if [ "$changed" -ge 3000 ]; then
+            printf 'leaving #%s alone: %s files changed, at or past the file-list cap\n' "$pr" "$changed"
+            exit 0
+          fi
           listed=$(printf '%s\n' "$files" | grep -c . || true)
           if [ "$changed" -ne "$listed" ]; then
             printf 'leaving #%s alone: %s files changed, only %s listed\n' "$pr" "$changed" "$listed"
@@ -121,10 +128,10 @@ jobs:
             printf 'leaving #%s alone: it changes no file\n' "$pr"
             exit 0
           fi
-          bad=$(printf '%s\n' "$files" | grep -vE '^added keys/[^/]+\.asc$' || true)
+          bad=$(printf '%s\n' "$files" | grep -vE '^added keys/[a-z0-9][a-z0-9-]*\.asc$' || true)
           if [ -n "$bad" ]; then
             if [ "$bad" != "$files" ] || [ "$(printf '%s\n' "$files" | wc -l)" -ne 1 ] ||
-              ! printf '%s\n' "$files" | grep -qE '^removed keys/[^/]+\.asc$'; then
+              ! printf '%s\n' "$files" | grep -qE '^removed keys/[a-z0-9][a-z0-9-]*\.asc$'; then
               printf 'leaving #%s alone: these are not new key files, and not one deletion:\n%s\n' "$pr" "$files"
               exit 0
             fi
@@ -133,18 +140,31 @@ jobs:
           # keys_regular <path>...: 0 when every path is a regular file at the head
           # commit, 1 with the offending path printed when one is not. The pull
           # request's file list carries status and name but no mode, so an added
-          # blob that is a symlink reads there as a new key. The contents API says
-          # what the blob is: "file" for mode 100644, "symlink" for mode 120000. A
-          # path it cannot answer for is refused as well, because a guard that
+          # blob that is a symlink reads there as a new key. One tree listing of
+          # the head commit says what each blob is: 100644 and 100755 are regular
+          # files, 120000 is a symlink. The whole listing is fetched once and a
+          # name is looked up literally in it, never interpolated into a URL: a
+          # name carrying ? or / then cannot select another ref or path. A path
+          # the listing does not carry is refused as well, because a guard that
           # fails open is not one.
           keys_regular() {
-            typeset path blob_type
+            typeset path mode listing
+            listing=$(gh api "repos/$GITHUB_REPOSITORY/git/trees/$HEAD_SHA?recursive=1" \
+              --jq '.tree[] | "\(.mode) \(.path)"') || listing=''
             for path in "$@"; do
-              blob_type=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$HEAD_SHA" --jq .type) || blob_type=''
-              if [ "$blob_type" != file ]; then
-                printf '%s is not a regular file (%s)\n' "$path" "${blob_type:-no answer}"
+              mode=$(printf '%s\n' "$listing" |
+                awk -v p="$path" '{ m = $1; sub(/^[^ ]+ /, ""); if ($0 == p) { print m; exit } }')
+              case "$mode" in
+              100644 | 100755) ;;
+              120000)
+                printf '%s is not a regular file (symlink)\n' "$path"
                 return 1
-              fi
+                ;;
+              *)
+                printf '%s is not a regular file (%s)\n' "$path" "${mode:-no answer}"
+                return 1
+                ;;
+              esac
             done
           }
           # --- end added key blob guard ---
@@ -172,6 +192,13 @@ jobs:
           # create and approve pull requests" is on, which is off by default. A
           # refusal there is configuration, not a broken key, so it is named and
           # left for a person rather than reported as a failed run.
+          # Everything above was read at $HEAD_SHA, so the approval must apply to
+          # that commit and not a newer one the branch was pushed to meanwhile.
+          head_now=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+          if [ "$head_now" != "$HEAD_SHA" ]; then
+            printf 'leaving #%s alone: its head moved from %s to %s\n' "$pr" "$HEAD_SHA" "$head_now"
+            exit 0
+          fi
           if ! GH_TOKEN="$WORKFLOW_TOKEN" gh pr review "$pr" --repo "$GITHUB_REPOSITORY" \
             --approve --body "The drain's publication or deletion opened this key change and the checks passed on it."; then
             printf 'the workflow could not approve #%s: check that the repository allows\n' "$pr"
@@ -183,9 +210,12 @@ jobs:
           # #443 sat mergeable and approved until the checks were re-run by hand;
           # the same gap left its branch undeleted. The approval above is
           # registered by the time this returns, and the retries cover the second
-          # it can take to settle. A merge that still fails is loud.
+          # it can take to settle. --match-head-commit refuses the merge if the
+          # branch moved after the read and approval above. A merge that still
+          # fails is loud.
           attempt=0
-          until gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --squash --delete-branch; do
+          until gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --squash --delete-branch \
+            --match-head-commit "$HEAD_SHA"; do
             attempt=$((attempt + 1))
             if [ "$attempt" -ge 3 ]; then
               printf 'could not merge #%s; it is left open\n' "$pr"
