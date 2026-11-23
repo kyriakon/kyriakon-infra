@@ -960,9 +960,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kyriakon-control-fromcheck"
+version = "0.1.0"
+dependencies = [
+ "kyriakon-mailparse",
+ "libc",
+]
+
+[[package]]
 name = "kyriakon-control-fuzz"
 version = "0.0.0"
 dependencies = [
+ "kyriakon-control-fromcheck",
  "kyriakon-control-handler",
  "kyriakon-control-static",
  "libfuzzer-sys",
@@ -986,8 +995,17 @@ dependencies = [
 name = "kyriakon-control-static"
 version = "0.1.0"
 dependencies = [
+ "kyriakon-control-core",
  "libc",
+ "serde",
+ "time",
+ "tokio",
+ "toml",
 ]
+
+[[package]]
+name = "kyriakon-mailparse"
+version = "0.1.0"
 
 [[package]]
 name = "lazy_static"

@@ -6,6 +6,7 @@
 #   cargo +nightly fuzz run request
 #   cargo +nightly fuzz run form
 #   cargo +nightly fuzz run resolve
+#   cargo +nightly fuzz run fromcheck
 #
 # Seeds are committed in `corpus/`, except the FastCGI wire seeds: those are
 # bytes and the repository tracks no binaries, so docs/runbook.md prints the
@@ -31,6 +32,9 @@ features = ["fuzz"]
 [dependencies.kyriakon-control-static]
 path = "../crates/static"
 
+[dependencies.kyriakon-control-fromcheck]
+path = "../crates/fromcheck"
+
 [[bin]]
 name = "request"
 path = "fuzz_targets/request.rs"
@@ -48,6 +52,13 @@ bench = false
 [[bin]]
 name = "resolve"
 path = "fuzz_targets/resolve.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fromcheck"
+path = "fuzz_targets/fromcheck.rs"
 test = false
 doc = false
 bench = false

@@ -667,9 +667,12 @@ self_test() {
 	check "and the signed local enqueue uses that chain" \
 		"$(grep -c '^listen on socket filter "sign"$' "$tree/smtpd.conf")" 1
 	check "and the From filter reads the mapping the listeners bind" \
-		"$(grep -c '^filter "fromcheck" proc-exec "/usr/local/libexec/filter-fromcheck.sh' "$tree/smtpd.conf")" 1
-	check "and it is a command this deploy installs" \
-		"$(grep -cx "$(printf 'filter-fromcheck.sh\t/usr/local/libexec\t-\t\tmail\t-\tactive')" "$install_set")" 1
+		"$(grep -c '^filter "fromcheck" proc-exec "/usr/local/libexec/filter-fromcheck ' "$tree/smtpd.conf")" 1
+	check "and the manifest retires the ksh filter" \
+		"$(manifest_retired_names "$install_set" /usr/local/libexec | grep -cx 'filter-fromcheck.sh')" 1
+	check "and names the compiled filter's install" \
+		"$(manifest_installed_name "$install_set" kyriakon-fromcheck /usr/local/libexec)" \
+		filter-fromcheck
 	check "no unauthenticated TCP loopback listener is left" \
 		"$(grep -c '^listen on lo0' "$tree/smtpd.conf" || true)" 0
 
@@ -1628,10 +1631,10 @@ printf 'mail_from: %s entries\n' "$(grep -c . "$mail_from_table" || true)"
 # The table's /usr/local/libexec rows, installed before the configuration that
 # names them: the member session shell on 2222 (the member login class names that
 # path, and applying the class before the file is there would refuse every
-# member's push) and the From-header filter smtpd starts below (proc-exec resolves
-# the command when the filter starts, so a missing one is a filter that never
-# registers). root:wheel 0755, which a member can read and execute and cannot
-# write, and which is not in the PATH a member session is handed.
+# member's push). root:wheel 0755, which a member can read and execute and cannot
+# write, and which is not in the PATH a member session is handed. The From-header
+# filter is a compiled binary row whose route is control, so this deploy does not
+# install it; the check below fails if the control deploy has not.
 libexec_targets=$(manifest_targets_route "$install_set" /usr/local/libexec mail) \
 	|| { printf 'cannot read %s\n' "$install_set" >&2; exit 1; }
 [ -n "$libexec_targets" ] \
@@ -1642,7 +1645,13 @@ while IFS="$(printf '\t')" read -r s installed; do
 done <<EOF
 $libexec_targets
 EOF
-printf 'member session shell and the From-header filter installed into /usr/local/libexec\n'
+printf 'member session shell installed into /usr/local/libexec\n'
+
+# The From-header filter is a compiled program installed by deploy-control.sh.
+# smtpd resolves `proc-exec` when the filter starts, so a missing one is a filter
+# that never registers and a mail listener that cannot accept a message.
+[ -x /usr/local/libexec/filter-fromcheck ] \
+	|| die "missing /usr/local/libexec/filter-fromcheck: run scripts/deploy-control.sh first"
 
 # The shipped template with both placeholders still in it, installed beside the
 # live file. reload-smtpd.sh and provision-member.sh re-render from it whenever a

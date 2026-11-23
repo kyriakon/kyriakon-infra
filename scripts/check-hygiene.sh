@@ -193,6 +193,11 @@ deployed_drift() {
 			printf '%s: not installed, and %s names it\n' "$dir/$name" "$table"
 			continue
 		fi
+		# A compiled binary row names the build's output, not a file under
+		# scripts/. Presence is checkable; its content belongs to the build.
+		if [ ! -f "$checkout/$source" ]; then
+			continue
+		fi
 		cmp -s "$dir/$name" "$checkout/$source" \
 			|| printf '%s differs from %s\n' "$dir/$name" "$checkout/$source"
 	done <<EOF

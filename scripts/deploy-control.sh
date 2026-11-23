@@ -2,9 +2,10 @@
 # deploy-control.sh: put the control plane on the box and start its handler.
 #
 # The release's front door, installed from this repository: the store under
-# /var/db/onboard, the five binaries built from control/ and installed to
+# /var/db/onboard, the six programs built from control/. Five go to
 # /usr/local/sbin (the handler, the member content responder, the root drain,
-# kyriakon-admin and the portal), the handler's config at /etc/onboard/onboard.toml,
+# kyriakon-admin and the portal) and the From-header filter to
+# /usr/local/libexec/filter-fromcheck, the handler's config at /etc/onboard/onboard.toml,
 # the responder's at /etc/onboard/static.toml, and the drain's own root-only config
 # at /etc/kyriakon/onboard/drain.toml, the first and last with the deployed release
 # substituted, and the two rc.d units. Every step is idempotent, so a rebuild, or a
@@ -591,12 +592,13 @@ say "build"
 # jq for the publish path, and gmid for the capsule socket directory.
 need_packages "$repo_dir/openbsd/packages.tsv" deploy-control.sh
 cargo build --release --manifest-path "$repo_dir/control/Cargo.toml"
-# The handler, the member content responder, the root drain, kyriakon-admin and the
-# portal are one workspace and five programs: a build that produced some of them
-# but not the others is half a service. The portal is the one the applicant's ssh
-# session runs, so a build without it would install nothing the login class names
-# and every connection would land on a file that is not there.
-for b in kyriakon-control kyriakon-control-static kyriakon-control-drain kyriakon-admin kyriakon-control-tui; do
+# The handler, the member content responder, the root drain, kyriakon-admin, the
+# portal and the From-header filter are one workspace and six programs: a build
+# that produced some of them but not the others is half a service. The portal is
+# the one the applicant's ssh session runs, so a build without it would install
+# nothing the login class names and every connection would land on a file that is
+# not there. The filter is the command smtpd starts on every mail connection.
+for b in kyriakon-control kyriakon-control-static kyriakon-control-drain kyriakon-admin kyriakon-control-tui kyriakon-fromcheck; do
 	[ -x "$repo_dir/control/target/release/$b" ] \
 		|| die "the build produced no binary at control/target/release/$b"
 done
@@ -679,6 +681,15 @@ authcheck_name=$(manifest_installed_name "$install_set" kyriakon-authcheck.sh /u
 	|| die "cannot read $install_set"
 [ -n "$authcheck_name" ] || die "$install_set names no kyriakon-authcheck.sh for /usr/local/libexec"
 install_staged "$repo_dir/scripts/kyriakon-authcheck.sh" "/usr/local/libexec/$authcheck_name" -m 0755
+# The From-header filter openbsd/etc/smtpd.conf names as `proc-exec`. It is a
+# compiled binary row in the manifest, built from control/crates/fromcheck and
+# installed under the name the row gives. deploy-mail.sh refuses the mail
+# configuration when it is missing, so the control deploy runs first.
+fromcheck_name=$(manifest_installed_name "$install_set" kyriakon-fromcheck /usr/local/libexec) \
+	|| die "cannot read $install_set"
+[ -n "$fromcheck_name" ] || die "$install_set names no kyriakon-fromcheck for /usr/local/libexec"
+install -m 0755 "$repo_dir/control/target/release/kyriakon-fromcheck" \
+	"/usr/local/libexec/$fromcheck_name"
 
 # The login proofs: one file per admitted login, named by a random token, written
 # by the checker as root and read back by the drain. Root-owned 0700 is the whole

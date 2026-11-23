@@ -54,11 +54,12 @@ and `terraform apply`/`destroy` remain human-only.
 
 ## Fuzz the parsers
 
-Six `cargo-fuzz` targets cover the parsers that read input the box does not
+Seven `cargo-fuzz` targets cover the parsers that read input the box does not
 control: the encryptor's message and envelope parsers, the handler's FastCGI
 reader and form decoder, the member path resolver, which asserts that a served
-file is always one inside the member's own root, and the shared header, address
-and MIME parsers in `mailparse/fuzz`. The `fuzz` workflow in
+file is always one inside the member's own root, the From-header filter's
+protocol and policy, and the shared header, address and MIME parsers in
+`mailparse/fuzz`. The `fuzz` workflow in
 `.github/workflows/fuzz.yml` runs each for two minutes every Monday and on
 demand. That is coverage over time, not a merge gate: a crash is filed as a bug
 with a regression test, not treated as a blocked PR.
@@ -991,7 +992,7 @@ Work inbound first, then outbound, and stop when you find it. `doas ksh scripts/
 
 10. Is the envelope sender allowed? `/etc/mail/mail_from` maps each account to the addresses it may submit as, and the egress listeners carry `senders <mail_from>`, so an authenticated session can only use an address on its own line. `scripts/deploy-mail.sh` regenerates the mapping from `/etc/passwd` and the virtual table at every run; `scripts/provision-member.sh` and the drain's group transition add an address to the owning account's line under the same table lock, so an account provisioned after the last deploy submits without waiting for a redeploy. A member removed by `scripts/delete-user.sh` loses its line, and a body removed by `scripts/remove-group.sh` loses every address on its domain from every line. Separately, `match from local for any action "relay"` carries cron's own mail and every operator alert to the relay; without it they are refused at RCPT and never leave the box. There is no `listen on lo0`: local mail leaves through `sendmail(1)` and the socket listener. A submission refused at MAIL FROM usually means the address is not on the authenticating account's line, or the account has no line at all; check both before rerunning the deploy. The drain writes this mapping too, so a rollout that changes either the drain or the table runs `scripts/deploy.sh`, which runs `deploy-control.sh` before `deploy-mail.sh`. Running the mail deploy first leaves the installed drain writing the old table shape, which `senders` does not match.
 
-The From header is the half `senders` cannot reach. It binds the envelope only, and `filter-dkimsign` signs whatever domain the header names, so `filter "fromcheck"` runs ahead of the signer in the "sign" chain and refuses at DATA a From the session may not use: the addresses mapped to the account that authenticated, or the platform's own domains for the local enqueuer, which has no account to map. A refusal is a 5xx at the end of DATA and a `reject` line from the filter in `/var/log/maillog`. `ksh scripts/filter-fromcheck.sh --self-test` exercises the decisions on any host, and the deploy self-test asserts the chain's order, because a chain in the other order would sign the spoofed header before refusing it.
+The From header is the half `senders` cannot reach. It binds the envelope only, and `filter-dkimsign` signs whatever domain the header names, so `filter "fromcheck"` runs ahead of the signer in the "sign" chain and refuses at DATA a From the session may not use: the addresses mapped to the account that authenticated, or the platform's own domains for the local enqueuer, which has no account to map. A refusal is a 5xx at the end of DATA and a `reject` line from the filter in `/var/log/maillog`. `cargo test --manifest-path control/Cargo.toml -p kyriakon-control-fromcheck` exercises the decisions on any host, and the deploy self-test asserts the chain's order, because a chain in the other order would sign the spoofed header before refusing it.
 
 		doas grep -n 'from local for any\|senders <mail_from>\|filter "fromcheck"' /etc/mail/smtpd.conf
 		doas grep -n '^<username>:' /etc/mail/mail_from

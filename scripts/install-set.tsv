@@ -103,7 +103,11 @@ reload-spamd.sh	drain	-		control	-	active
 member-git-shell.sh	drain	-		control	-	active
 
 member-git-shell.sh	/usr/local/libexec	-		mail	-	active
-filter-fromcheck.sh	/usr/local/libexec	-		mail	-	active
+# The From-header filter is a compiled binary row. deploy-control.sh builds and
+# installs it under the name smtpd's proc-exec line uses; the route is control
+# for the install, while deploy.sh also plans the mail restart for a source
+# change because the running filter keeps the old code until smtpd restarts.
+kyriakon-fromcheck	/usr/local/libexec	-		control	filter-fromcheck	active
 # deploy-control.sh installs lib.sh and its modules beside the login checker,
 # which sources them; their route is what keeps deploy-mail.sh from taking them.
 lib.sh	/usr/local/libexec	-		control	lib.sh	active
@@ -115,6 +119,10 @@ lib/paths.sh	/usr/local/libexec	-		control	-	active
 # The checker runs as root under a doas rule, so it is installed under a name
 # without the .sh suffix; the name is the row's, not a private rename table's.
 kyriakon-authcheck.sh	/usr/local/libexec	-		control	kyriakon-authcheck	active
+
+# The ksh From-header filter that #947 replaced. A box that ran it must lose the
+# file rather than keep it beside the compiled binary of the same name.
+filter-fromcheck.sh	/usr/local/libexec	-		mail	-	retired
 
 # The pre-split copies in /root/bin that a box from before the control-plane
 # split still carries. Each is an uninstall step for deploy-mail.sh.
