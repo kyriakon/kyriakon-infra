@@ -1072,6 +1072,29 @@ The record published today carries no `t=` flag, so adding `t=s` is part of the 
 
 `scripts/deploy-mail.sh` compares the on-box public key with the record under the filter's current selector on every run and prints the correct record when the two disagree, which is the check to run after either step.
 
+## Verify an OpenBSD release image
+
+The release directory holds the image, `SHA256`, and `SHA256.sig`. `SHA256` catches a corrupted download. `SHA256.sig` is the release checksum list signed with the release key, and checking it catches a substituted image. That signature is what makes the hash in `openbsd/restore-template/prepare-disk.sh` a trust anchor.
+
+`signify` and its keyring are part of the OpenBSD base system. The Hetzner rescue shell is Debian and has neither, so run this on an OpenBSD 8.0 host you already trust. The first build uses a local OpenBSD 8.0 VM, because the mail box is provisioned from the snapshot built here; a rebuild can use the mail box instead. On 8.0 the release key is `/etc/signify/openbsd-80-base.pub`. The release root also publishes the same key as `openbsd-80-base.pub`. Use that copy only after comparing it with the copy on a trusted OpenBSD system.
+
+Download the three files into one directory and verify the image:
+
+	mkdir -p /tmp/openbsd-80
+	cd /tmp/openbsd-80
+	ftp https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/miniroot80.img
+	ftp https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/SHA256
+	ftp https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/SHA256.sig
+	signify -Cp /etc/signify/openbsd-80-base.pub -x SHA256.sig miniroot80.img
+
+A good run prints `Signature Verified` and then `miniroot80.img: OK`, and exits with status 0. Any other result stops the build. Do not write that image to a disk.
+
+Record the hash to give the rescue host:
+
+	sha256 -q miniroot80.img
+
+For the 8.0 release this prints `fe268f373dacf249b36306096404aa578e0ceb950d08c19c5a1117806997399a`, which is the default in `prepare-disk.sh`. A different value means the download is not the image that was verified, and `prepare-disk.sh` refuses to write it.
+
 ## Keep the base system and the packages current
 
 The base system and the packages move on different clocks. `syspatch` carries base system security fixes, `sysupgrade` moves between releases, and `pkg_add -u` updates the packages, which follow their own upstream releases. Track the two separately, and record the date of each, because a snapshot freezes both at once.

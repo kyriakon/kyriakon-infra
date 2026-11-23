@@ -17,28 +17,37 @@ Hetzner has no native OpenBSD image, so install once by hand and snapshot it:
 
 1. Provision a throwaway Cloud VPS (any Linux type, e.g. `cx22`/`cx32`). Its disk
    **must be <= the production `server_type` disk**, or the snapshot won't fit.
-2. Enable rescue and reboot into it:
+2. On an OpenBSD 8.0 host you already trust, download the release files and
+   verify the image with `signify` before trusting it. The first build uses a
+   local OpenBSD 8.0 VM, because the snapshot built here is what provisions the
+   mail box; a rebuild can use the mail box instead. A substituted image is a
+   compromised platform from first boot. The rescue shell cannot do this check.
+   It is Debian, with no `signify` and no `/etc/signify`, and the invocation
+   fails there. The runbook's "Verify an OpenBSD release image" gives the
+   commands. A good run prints `Signature Verified` and `miniroot80.img: OK`.
+   Record the output of `sha256 -q miniroot80.img` for the next step.
+3. Enable rescue and reboot into it:
    ```sh
    hcloud server enable-rescue --type linux64 <server>
    hcloud server reset <server>
    ```
-3. In the rescue shell (SSH as root), download the install image and **verify it
-   with `signify` before trusting it** - a substituted image is a compromised
-   platform from first boot:
+4. From the operator's checkout, copy the disk script to the rescue host:
    ```sh
-   wget https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/miniroot80.img \
-        https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/SHA256 \
-        https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/SHA256.sig
-   signify -Cp /etc/signify/openbsd-80-base.pub -x SHA256.sig miniroot80.img
+   scp openbsd/restore-template/prepare-disk.sh root@<rescue-ip>:/root/
    ```
+   Then in the rescue shell (SSH as root), write the verified image to the disk
+   and extend its OpenBSD partition:
+   ```sh
+   bash /root/prepare-disk.sh <sha256>
+   ```
+   The argument is the hash recorded in step 2. With no argument, the script uses
+   the hash it pins, which is the same value for 8.0. It fetches the image,
+   refuses to write anything when the download does not match, writes the image,
+   and extends the partition. Reboot when it finishes.
    (`miniroot` pulls file sets over the network; `install80.img` bundles them.
    Take the release the box runs, not whatever is newest: the response file and
    the restore rehearsal are both written for that release. `signify` catches
    tampering, `SHA256` only corruption.)
-4. Write it to disk and reboot:
-   ```sh
-   dd if=miniroot80.img of=/dev/sda bs=4M && sync && reboot
-   ```
 5. Complete the **interactive** installer over the VNC console. Choose **full-disk
    `softraid` encryption** when prompted - now-or-never, and required by the
    threat model (proposal section 2). Answer **no** at that prompt only when
