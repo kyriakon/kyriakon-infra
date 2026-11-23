@@ -52,6 +52,25 @@ enum kyriakon_save_pull {
 int kyriakon_save_pull(int ret, const char *read_error,
 		       char *error, size_t error_size);
 
+/* The stream calls the pull loop needs. Function pointers, not Dovecot's
+ * istream, so the test can model an istream-limit without its headers. `error`
+ * returns NULL while the stream is healthy. */
+struct kyriakon_pull_stream {
+	int (*read)(void *context);
+	const unsigned char *(*data)(void *context, size_t *size_r);
+	void (*skip)(void *context, size_t size);
+	const char *(*error)(void *context);
+};
+
+/* Pull whatever the stream has buffered, without blocking. An istream-limit
+ * returns -1 with eof=TRUE once the literal is complete while its last bytes
+ * are still in the buffer, so buffered data is consumed both before and after
+ * the read: -1 is EOF only when the buffer is empty and the stream is healthy. */
+int kyriakon_save_pull_stream(const struct kyriakon_pull_stream *stream,
+			      void *context,
+			      const unsigned char **data_r, size_t *size_r,
+			      char *error, size_t error_size);
+
 /* One chunk of plaintext, or a pull status. *data_r is valid only with
  * KYRIAKON_SAVE_PULL_DATA; the pump copies it before pulling again. WAIT means
  * nothing is available yet and must return to the caller. */

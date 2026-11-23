@@ -27,6 +27,44 @@ kyriakon_save_pull(int ret, const char *read_error,
 	return ret == -1 ? KYRIAKON_SAVE_PULL_EOF : KYRIAKON_SAVE_PULL_WAIT;
 }
 
+int
+kyriakon_save_pull_stream(const struct kyriakon_pull_stream *stream,
+			  void *context,
+			  const unsigned char **data_r, size_t *size_r,
+			  char *error, size_t error_size)
+{
+	const unsigned char *data;
+	size_t size;
+	int ret;
+
+	/* i_stream_read()'s return says what the read added, not what the
+	   stream holds: an istream-limit reports -1 with eof=TRUE as soon as the
+	   literal is complete, while the bytes remain in the buffer. Consume
+	   whatever is there before and after the read. */
+	data = stream->data(context, &size);
+	if (size > 0) {
+		*data_r = data;
+		*size_r = size;
+		stream->skip(context, size);
+		return kyriakon_save_pull(1, NULL, error, error_size);
+	}
+	ret = stream->read(context);
+	data = stream->data(context, &size);
+	if (size > 0) {
+		*data_r = data;
+		*size_r = size;
+		stream->skip(context, size);
+		return kyriakon_save_pull(1, NULL, error, error_size);
+	}
+	/* A positive read must have left those bytes in the buffer. If it did
+	   not, there is nothing to consume: DATA would hand the pump an unset
+	   pointer and length, so wait instead. */
+	if (ret > 0)
+		ret = 0;
+	/* Only now may -1 mean EOF; a stream error still fails the save. */
+	return kyriakon_save_pull(ret, stream->error(context), error, error_size);
+}
+
 static bool
 plain_append(struct kyriakon_save *save, const unsigned char *data, size_t size)
 {

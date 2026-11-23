@@ -180,21 +180,57 @@ from_problem() {
 				problem("5.7.1 the message has no From header")
 			exit
 		}
-		# An RFC 5322 comment may itself contain an address, so comments are
-		# removed before anything is read out of the header: otherwise the
-		# address in "hello@kyriakon.net (x <alice@kyriakon.net>)" would be the
-		# one in the comment, and the header own address never checked. To a
-		# fixpoint, innermost first, because comments nest.
-		while (match(value, /\([^()]*\)/)) {
-			value = substr(value, 1, RSTART - 1) " " substr(value, RSTART + RLENGTH)
+		# RFC 5322 comments and quoted strings are blanked in one lexical pass,
+		# not by regexes run one after the other. The pass keeps the two apart:
+		# a "(" inside a quoted display name does not open a comment, a ")"
+		# inside a comment does not close anything else, and a backslash escapes
+		# the next character in both. filter-dkimsign reads the header with the
+		# same grammar, so a header this pass cannot read is refused.
+		clean = ""
+		inq = 0
+		depth = 0
+		esc = 0
+		for (i = 1; i <= length(value); i++) {
+			c = substr(value, i, 1)
+			if (esc) {
+				clean = clean " "
+				esc = 0
+				continue
+			}
+			if (c == "\\" && (inq || depth > 0)) {
+				clean = clean " "
+				esc = 1
+				continue
+			}
+			if (depth > 0) {
+				if (c == "(")
+					depth++
+				else if (c == ")")
+					depth--
+				clean = clean " "
+				continue
+			}
+			if (inq) {
+				if (c == "\"")
+					inq = 0
+				clean = clean " "
+				continue
+			}
+			if (c == "(") {
+				depth = 1
+				clean = clean " "
+			} else if (c == "\"") {
+				inq = 1
+				clean = clean " "
+			} else {
+				clean = clean c
+			}
 		}
-		# Blank quoted display-name strings in one regex pass, so the comma in
-		# `"A, Inc." <a@b>` is not read as an address separator. The alternation
-		# keeps an escaped quote inside the string; a quote left over after it
-		# is one that never closed, and an unreadable header must not pass.
-		gsub(/"[^"\\]*(\\.?[^"\\]*)*"/, " ", value)
-		if (index(value, "\"") > 0)
+		if (inq)
 			problem("5.7.1 the From header has an unterminated quoted string")
+		if (depth > 0)
+			problem("5.7.1 the From header has an unterminated comment")
+		value = clean
 		added = 0
 		n = split(value, part, ",")
 		for (i = 1; i <= n; i++) {
@@ -239,7 +275,10 @@ handle_dataline() {
 			printf ' %s' "$line" >> "$state_dir/$sid.from"
 		fi
 		;;
-	[Ff][Rr][Oo][Mm]:*)
+	# Obsolete RFC 5322 allows whitespace before the colon, and filter-dkimsign
+	# accepts it there: an unmatched `From :` would be signed while this filter
+	# read only the following `From:`.
+	[Ff][Rr][Oo][Mm]:* | [Ff][Rr][Oo][Mm]' '*:* | [Ff][Rr][Oo][Mm]'	'*:*)
 		count=0
 		[ -f "$state_dir/$sid.count" ] && read -r count < "$state_dir/$sid.count"
 		count=$((count + 1))
@@ -569,6 +608,31 @@ $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: hello@kyriakon.net
 $(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From: \"Alice\" (the platform) <alice@kyriakon.net>")"
 	check "a comment beside a display name does not change the address" \
 		"$(decision)" proceed
+
+	# Obsolete RFC 5322 lets whitespace sit before the colon, and filter-dkimsign
+	# reads such a header as a From. It must be counted here too, or the signer
+	# signs the domain of a header this filter never saw.
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|From : secretary@otherparish.org" \
+	"filter|0.7|2.0b|smtp-in|data-line|$session|t8|From: alice@kyriakon.net")"
+	check_reject "an obsolete 'From :' header is counted and refused" \
+		"550 5.7.1 the message has more than one"
+
+	# A "(" inside a quoted display name does not open a comment: the first
+	# mailbox is secretary@ and dkimsign would sign as it.
+	bypass_quoted='From: "x(" <secretary@otherparish.org>, "y)" <alice@kyriakon.net>'
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|$bypass_quoted")"
+	check_reject "a paren inside a quoted display name does not hide a mailbox" \
+		"550 5.7.1 secretary@otherparish.org"
+
+	# A backslash escapes the ")" inside a comment, so the mailbox after it is
+	# the real From address, not hidden text.
+	bypass_pair='From: (\)" )"<alice@kyriakon.net>(" <secretary@otherparish.org> (\))'
+	run_case "$(connect_remote)
+$(message "filter|0.7|2.0|smtp-in|data-line|$session|t9|$bypass_pair")"
+	check_reject "an escaped paren inside a comment does not hide the mailbox" \
+		"550 5.7.1 secretary@otherparish.org"
 
 	# A message with no From at all has no address to check, and dkimsign has
 	# nothing to sign either: refused rather than let through unsigned.
