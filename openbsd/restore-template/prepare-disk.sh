@@ -7,7 +7,7 @@
 # of this repo assumes: Linux can write a disk image and a partition table, and
 # cannot mount the filesystem that results.
 #
-# Why the partition must be extended. miniroot79.img is a whole-disk image whose
+# Why the partition must be extended. miniroot80.img is a whole-disk image whose
 # MBR declares an OpenBSD partition of 10,368 sectors, about 5 MB, holding the
 # installer kernel. The interactive installer asks "Use (W)hole disk MBR, whole
 # disk (G)PT" and a person answers it, which is how the live box came out with a
@@ -20,13 +20,14 @@
 # Usage: bash prepare-disk.sh [expected-sha256]
 #
 # The default hash was verified on the mail box with signify against
-# /etc/signify/openbsd-79-base.pub. Linux has no signify, so comparing against
-# that verified value is the most this side can do, and the script refuses to
-# write anything if it does not match.
+# /etc/signify/openbsd-80-base.pub, and matches the line in the release's own
+# SHA256. Linux has no signify, so comparing against that verified value is the
+# most this side can do, and the script refuses to write anything if it does not
+# match.
 set -euo pipefail
 
-IMG_URL=https://cdn.openbsd.org/pub/OpenBSD/7.9/amd64/miniroot79.img
-EXPECTED=${1:-7f0ba80ce491008cce01bbefe34f1ecf820b93eb32565c3c708f5c50ea619b75}
+IMG_URL=https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/miniroot80.img
+EXPECTED=${1:-fe268f373dacf249b36306096404aa578e0ceb950d08c19c5a1117806997399a}
 DISK=${DISK:-/dev/sda}
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
@@ -40,9 +41,9 @@ total=$(blockdev --getsz "$DISK")
 printf 'disk: %s sectors (%.1f GiB)\n' "$total" "$(echo "$total * 512 / 1073741824" | bc -l)"
 
 cd /tmp
-rm -f miniroot79.img
-wget -q -O miniroot79.img "$IMG_URL"
-got=$(sha256sum miniroot79.img | cut -d' ' -f1)
+rm -f miniroot80.img
+wget -q -O miniroot80.img "$IMG_URL"
+got=$(sha256sum miniroot80.img | cut -d' ' -f1)
 echo "sha256: $got"
 if [ "$got" != "$EXPECTED" ]; then
 	echo "does not match the signature-verified value, refusing to write" >&2
@@ -50,7 +51,7 @@ if [ "$got" != "$EXPECTED" ]; then
 fi
 
 echo "writing the installer to $DISK"
-dd if=/tmp/miniroot79.img of="$DISK" bs=4M conv=fsync status=none
+dd if=/tmp/miniroot80.img of="$DISK" bs=4M conv=fsync status=none
 sync
 
 # Find the OpenBSD partition rather than assuming its slot. The image happens to
