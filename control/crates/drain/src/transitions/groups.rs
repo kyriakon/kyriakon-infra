@@ -1297,6 +1297,19 @@ pub async fn group_address(
             )));
         }
     }
+    if intent.action == "remove" && !intent.address.is_empty() {
+        // The console refuses `--address` with a removal. An intent that
+        // carries one anyway (filed by an older console, or signed by the
+        // approval key) would close the mailbox while the address it also names
+        // went untouched, so settle the contradiction rather than let it look
+        // like the address was the thing removed. A refusal, not an error: no
+        // retry can change it.
+        return Ok(Settlement::refused(format!(
+            "the removal of the mailbox {} also names the address {}@{}; a removal takes no \
+             address, so nothing was deleted",
+            intent.mailbox, intent.address, intent.domain
+        )));
+    }
 
     let entry = format!("{}@{}", intent.address, intent.domain);
     let current = match intent.action.as_str() {

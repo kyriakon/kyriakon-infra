@@ -42,6 +42,75 @@ fn flags_read_pairs_and_refuse_a_bad_shape() {
     ));
 }
 
+/// A removal closes the mailbox, never one address. A command that names both
+/// is refused, even confirmed, rather than closing the mailbox while the
+/// `--address` it was given is silently discarded.
+#[test]
+fn a_removal_refuses_an_address_and_requires_confirmation() {
+    let both = args(&[
+        "--domain",
+        "parish.example",
+        "--action",
+        "remove",
+        "--address",
+        "oldalias",
+        "--mailbox",
+        "alice",
+        "--confirm-remove",
+    ]);
+    let err = crate::address::address_args(&both).unwrap_err();
+    assert!(
+        matches!(&err, Error::Failed(message) if message.contains("--address") && message.contains("alice@parish.example")),
+        "{err}"
+    );
+
+    let unconfirmed = args(&[
+        "--domain",
+        "parish.example",
+        "--action",
+        "remove",
+        "--mailbox",
+        "alice",
+    ]);
+    let err = crate::address::address_args(&unconfirmed).unwrap_err();
+    assert!(
+        matches!(&err, Error::Failed(message) if message.contains("--confirm-remove") && message.contains("alice@parish.example")),
+        "{err}"
+    );
+
+    let confirmed = args(&[
+        "--domain",
+        "parish.example",
+        "--action",
+        "remove",
+        "--mailbox",
+        "alice",
+        "--confirm-remove",
+    ]);
+    let parsed = crate::address::address_args(&confirmed).unwrap();
+    assert_eq!(parsed.mailbox, "alice");
+    assert_eq!(parsed.address, "");
+
+    // The confirmation switch names the destructive action, so it is refused
+    // on a change that only adds an alias.
+    let wrong_action = args(&[
+        "--domain",
+        "parish.example",
+        "--action",
+        "add-alias",
+        "--address",
+        "office",
+        "--mailbox",
+        "alice",
+        "--confirm-remove",
+    ]);
+    let err = crate::address::address_args(&wrong_action).unwrap_err();
+    assert!(
+        matches!(&err, Error::Failed(message) if message.contains("--confirm-remove") && message.contains("only for")),
+        "{err}"
+    );
+}
+
 #[test]
 fn one_username_takes_exactly_one_valid_name() {
     let show = args(&["show", "alice"]);

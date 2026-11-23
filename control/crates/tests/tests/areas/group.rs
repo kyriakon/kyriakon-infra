@@ -2163,6 +2163,74 @@ fn a_stale_removal_settles_refused_and_spares_a_later_group() {
     assert!(fix.table("mail_domains").contains("parish.example"));
 }
 
+/// A remove intent that also names an address is a contradiction no retry can
+/// fix. It settles refused, with a line naming both, leaves no intent file, and
+/// spares the mailbox: the drain must never erase the account while the address
+/// it was given looks like the thing removed.
+#[test]
+fn a_removal_intent_carrying_an_address_is_refused_and_spares_the_mailbox() {
+    let fix = Fix::new("group-remove-address-intent");
+    fix.file_group(
+        "parish.example",
+        "parish-office",
+        &[("office", "parish-office")],
+        &["parish-office"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+
+    fix.file_address(
+        "parish.example",
+        "remove",
+        "oldalias",
+        "parish-office",
+        None,
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let journal = fix.journal();
+    let refused = journal
+        .lines()
+        .rev()
+        .find(|line| line.contains("\"outcome\":\"refused\""))
+        .unwrap_or_else(|| panic!("no refusal line: {journal}"));
+    assert!(refused.contains("oldalias"), "{refused}");
+    assert!(refused.contains("parish-office"), "{refused}");
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(
+        fix.passwd_file().contains("parish-office:"),
+        "the refused removal deleted the mailbox:\n{}",
+        fix.passwd_file()
+    );
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert_eq!(group["accounts"], json!(["parish-office"]));
+}
+
+/// The console refuses a removal that names an address before it files
+/// anything, so the destructive command cannot silently drop the `--address`.
+#[test]
+fn the_console_refuses_an_address_on_a_mailbox_removal() {
+    let fix = Fix::new("group-remove-address-console");
+    let out = fix.ctl(&[
+        "address",
+        "--domain",
+        "parish.example",
+        "--action",
+        "remove",
+        "--address",
+        "oldalias",
+        "--mailbox",
+        "alice",
+    ]);
+    assert!(!out.status.success(), "{}", body(&out));
+    let printed = body(&out);
+    assert!(printed.contains("--address"), "{printed}");
+    assert!(printed.contains("alice@parish.example"), "{printed}");
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+}
+
 /// The console takes `group remove`, signs the domain, and refuses a name that
 /// could not be a body's domain before it files anything.
 #[test]
