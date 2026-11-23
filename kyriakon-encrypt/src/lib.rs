@@ -27,7 +27,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kyriakon_mailparse::{boundary_param, headers, split_message, walk_multipart, Part};
+use kyriakon_mailparse::{boundary_param, headers, lines, split_message, walk_multipart, Part};
 
 /// On-box keyring location - sync of the git-tracked published key set.
 pub const DEFAULT_KEYRING: &str = "/etc/kyriakon/keys";
@@ -249,7 +249,7 @@ fn envelope_ciphertext(input: &[u8]) -> Option<&[u8]> {
     if media_type(value)? != "multipart/encrypted" {
         return None;
     }
-    let boundary = boundary_param(value).filter(|boundary| !boundary.is_empty())?;
+    let boundary = boundary_param(value)?;
     let multipart = walk_multipart(message.body, &boundary).ok()?;
     // The builder ends at the closing delimiter. An epilogue is readable text
     // the store would keep in the clear, so it is not this wrapper's shape.
@@ -318,61 +318,39 @@ fn armored_message(body: &[u8]) -> Option<&[u8]> {
     const BEGIN: &str = "-----BEGIN PGP MESSAGE-----";
     const END: &str = "-----END PGP MESSAGE-----";
 
-    let mut pos = 0;
-    let (begin, after_begin) = loop {
-        let (line, next) = next_line(body, pos)?;
-        if line.is_empty() {
-            pos = next;
-        } else if line == BEGIN.as_bytes() {
-            break (pos, next);
-        } else {
-            return None;
+    let mut body_lines = lines(body);
+    let begin = loop {
+        let line = body_lines.next()?;
+        if line.text.is_empty() {
+            continue;
         }
+        if line.text == BEGIN.as_bytes() {
+            break line.start;
+        }
+        return None;
     };
     // The line after BEGIN must be blank: a header comment belongs to the
     // clear text the store must not keep.
-    let (line, next) = next_line(body, after_begin)?;
-    if !line.is_empty() {
+    if !body_lines.next()?.text.is_empty() {
         return None;
     }
-    pos = next;
     let mut data = false;
     loop {
-        let (line, next) = next_line(body, pos)?;
-        if line == END.as_bytes() {
-            if !data || body[next..].iter().any(|b| !b.is_ascii_whitespace()) {
+        let line = body_lines.next()?;
+        if line.text == END.as_bytes() {
+            if !data || body[line.next..].iter().any(|b| !b.is_ascii_whitespace()) {
                 return None;
             }
-            return Some(&body[begin..next]);
+            return Some(&body[begin..line.next]);
         }
         let base64 = line
+            .text
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
-        if line.is_empty() || !base64 {
+        if line.text.is_empty() || !base64 {
             return None;
         }
         data = true;
-        pos = next;
-    }
-}
-
-/// One line of `block` from `pos`, without its line ending, and the offset of
-/// the line after it. `None` past the end.
-fn next_line(block: &[u8], pos: usize) -> Option<(&[u8], usize)> {
-    if pos >= block.len() {
-        return None;
-    }
-    match block[pos..].iter().position(|&b| b == b'\n') {
-        Some(off) => {
-            let nl = pos + off;
-            let end = if nl > pos && block[nl - 1] == b'\r' {
-                nl - 1
-            } else {
-                nl
-            };
-            Some((&block[pos..end], nl + 1))
-        }
-        None => Some((&block[pos..], block.len())),
     }
 }
 
@@ -1182,6 +1160,35 @@ mod tests {
         assert!(
             text.contains(String::from_utf8_lossy(ARMOR).as_ref()),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn an_envelope_with_only_bare_cr_line_endings_is_recognised() {
+        // The armour scan must use the same line rule as the header split, or
+        // an all-CR envelope is encrypted a second time.
+        let lf = format!(
+            "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";\n\
+             \tboundary=\"b\"\n\
+             MIME-Version: 1.0\n\
+             \n\
+             --b\n\
+             Content-Type: application/pgp-encrypted\n\
+             \n\
+             Version: 1\n\
+             \n\
+             --b\n\
+             Content-Type: application/octet-stream\n\
+             \n\
+             {}\n\
+             --b--\n",
+            String::from_utf8_lossy(ARMOR)
+        );
+        let bare_cr = lf.replace('\n', "\r");
+        let armor_cr = String::from_utf8_lossy(ARMOR).replace('\n', "\r");
+        assert_eq!(
+            envelope_ciphertext(bare_cr.as_bytes()),
+            Some(armor_cr.as_bytes())
         );
     }
 

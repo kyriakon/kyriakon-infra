@@ -8,6 +8,11 @@
 use super::header::{lines, lines_from, split_message};
 use crate::Malformed;
 
+/// The most parts a walk will collect. A report or an RFC 3156 envelope has a
+/// handful; a message with millions of delimiter lines is a memory amplifier,
+/// not mail, and is refused before the vector grows.
+const MAX_PARTS: usize = 1024;
+
 /// One body part: its header block, the empty line that ends it, and its body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Part<'a> {
@@ -66,6 +71,9 @@ pub fn walk_multipart<'a>(body: &'a [u8], boundary: &str) -> Result<Multipart<'a
         let closes = is_delimiter(line.text, &close);
         if !closes && !is_delimiter(line.text, &open) {
             continue;
+        }
+        if parts.len() == MAX_PARTS {
+            return Err(Malformed::new("too many MIME parts"));
         }
         let end = part_end(body, part_start, line.start)?;
         let message = split_message(&body[part_start..end])?;
@@ -136,7 +144,13 @@ pub fn boundary_param(value: &[u8]) -> Option<String> {
             String::from_utf8(value[start..pos].to_vec()).ok()
         };
         if name.eq_ignore_ascii_case(b"boundary") {
-            return param;
+            // An empty value names no boundary, so keep reading: a later
+            // `boundary=` may be the one the sender meant.
+            if let Some(param) = param {
+                if !param.is_empty() {
+                    return Some(param);
+                }
+            }
         }
     }
     None
@@ -377,6 +391,37 @@ mod tests {
     }
 
     #[test]
+    fn a_body_with_millions_of_delimiter_lines_is_refused_before_it_grows() {
+        // A 35 MB save of `--b` lines used to collect millions of parts. The
+        // cap stops at the 1025th, so the walk stays small and quick.
+        let mut body = Vec::new();
+        for _ in 0..50_000 {
+            body.extend_from_slice(b"--b\r\nX: y\r\n\r\nbody\r\n");
+        }
+        body.extend_from_slice(b"--b--\r\n");
+        let started = std::time::Instant::now();
+        let error = walk_multipart(&body, "b").unwrap_err();
+        assert_eq!(error.reason(), "too many MIME parts");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the cap must stop the walk before it reads the whole body"
+        );
+    }
+
+    #[test]
+    fn exactly_the_part_cap_is_accepted() {
+        let mut body = Vec::new();
+        for _ in 0..MAX_PARTS {
+            body.extend_from_slice(b"--b\r\nX: y\r\n\r\nbody\r\n");
+        }
+        body.extend_from_slice(b"--b--\r\n");
+        assert_eq!(
+            walk_multipart(&body, "b").expect("walks").parts.len(),
+            MAX_PARTS
+        );
+    }
+
+    #[test]
     fn a_missing_or_premature_close_is_refused() {
         assert!(walk_multipart(b"--b1\r\nContent-Type: text/plain\r\n\r\nbody\r\n", "b1").is_err());
         assert!(walk_multipart(b"--b1--\r\n", "b1").is_err());
@@ -418,6 +463,14 @@ mod tests {
         assert_eq!(
             boundary_param(b"multipart/mixed; (a (nested) comment) boundary=real"),
             Some("real".to_string())
+        );
+        assert_eq!(
+            boundary_param(b"multipart/mixed; boundary=; boundary=b1"),
+            Some("b1".to_string())
+        );
+        assert_eq!(
+            boundary_param(b"multipart/mixed; boundary=\"\"; boundary=b1"),
+            Some("b1".to_string())
         );
     }
 }
