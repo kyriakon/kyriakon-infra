@@ -60,13 +60,16 @@ Hetzner has no native OpenBSD image, so install once by hand and snapshot it:
      --label kind=gold \
      <server>
    ```
-8. Record the returned numeric image ID (operational reference only - Terraform
-   selects by the `kind=gold` label, not the ID).
+8. Record the returned numeric image ID and its description. Terraform pins that
+   ID (`image_id`) and checks the description (`image_description`); a label is
+   not a selector, so this pair is what a future box is built from. Both are
+   recorded in `docs/runbook.md` as well, so a plan can be audited against the
+   reviewed image.
 
 ## 2. Provision with Terraform (ticket #22 - apply is human-only)
 
 ```sh
-cp terraform.tfvars.example terraform.tfvars   # set server_name
+cp terraform.tfvars.example terraform.tfvars   # set server_name, image_id, image_description
 export HCLOUD_TOKEN=...
 terraform init
 terraform plan      # read the diff
@@ -85,12 +88,13 @@ slightly behind (proposal section 6.10). Then re-snapshot (section 3).
 ## 3. Re-snapshot after every patch cycle
 
 A snapshot freezes base + packages. After each `syspatch`/`pkg_add -u` cycle,
-build the new `kind=gold` image on a throwaway box, as the runbook's "Rebuild
-the gold image" procedure does - never snapshot the live mail box: its root
-disk holds member mail and the DKIM key, and a `kind=gold` image is the source
-of every future box. `most_recent` makes Terraform pick up the newest matching
-snapshot automatically - never reprovision from a stale one, or a rebuilt box
-boots vulnerable rspamd (section 6.10).
+build the new image on a throwaway box, as the runbook's "Rebuild the gold
+image" procedure does - never snapshot the live mail box: its root disk holds
+member mail and the DKIM key, and the pinned image is the source of every
+future box. A re-snapshot is a new ID, so Terraform picks it up only when
+`image_id` and `image_description` are updated together; a precondition on the
+server refuses the plan when they disagree. Never reprovision from a stale
+image, or a rebuilt box boots vulnerable rspamd (section 6.10).
 
 ## Variables
 
@@ -99,7 +103,8 @@ boots vulnerable rspamd (section 6.10).
 | `server_name`       | -              | host-identifying; set in `terraform.tfvars` |
 | `server_type`       | `cx23`         | disk >= snapshot's source disk; create-time only, later resizes are a hand step in the Hetzner console (runbook) |
 | `location`          | `hel1`         | region the storage box is NOT in |
-| `snapshot_selector` | `kind=gold`   | set at `create-image` time |
+| `image_id`          | -              | numeric ID of the reviewed image; no default, so a plan cannot fall back to a mutable label |
+| `image_description` | -              | that image's description, checked against the ID during plan |
 
 ## The restore template
 
@@ -149,8 +154,8 @@ So the template is section 1 with these differences:
   The standup reaches the throwaway with it after every boot, since the template carries
   it into the snapshot.
 - Snapshot with `--label kind=restore`, not the `kind=gold` label section 1 uses, so a
-  test run can never pick up a provisioning image and provisioning can never pick up the
-  template.
+  test run can never pick up a provisioning image. Provisioning reads a pinned ID rather
+  than a label, so no label can redirect it either.
 
 The installer's answers live in `openbsd/restore-template/install.conf`, written against the
 question text 8.0 actually uses, read out of the release's own `bsd.rd` ramdisk (re-checked

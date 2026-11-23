@@ -1093,14 +1093,20 @@ The base system and the packages move on different clocks. `syspatch` carries ba
 
 		doas rcctl check smtpd dovecot spamd spamlogd httpd gmid inetd nsd
 
-4. Re-snapshot after a patch cycle, because a stale provisioning image reintroduces what the patch removed. Do not snapshot the live mail box for this: its root disk holds member mail and the DKIM key, and a `kind=gold` image is the source of every future box. Build the new gold image on a throwaway box instead. The image carries its own root `authorized_keys`, so reach the new box with the key it holds.
+4. Re-snapshot after a patch cycle, because a stale provisioning image reintroduces what the patch removed. Do not snapshot the live mail box for this: its root disk holds member mail and the DKIM key, and the pinned image is the source of every future box. Build the new image on a throwaway box instead, based on the image recorded in the table below.
+
+   Take that ID from the table, not from a label. A label can be moved onto any snapshot, including a copy of the live box, so selecting by `kind=gold` here would rebuild the next image from whatever the label last pointed at. If the table still says `none`, stop; the first image is built by `terraform/README.md` section 1.
 
 		. /root/.kyriakon-env
-		image_id=$(hcloud image list -t snapshot -l kind=gold -o noheader -o columns=id | tail -1)
+		image_id=REPLACE_WITH_RECORDED_IMAGE_ID
+		if [ "$image_id" = REPLACE_WITH_RECORDED_IMAGE_ID ]; then
+			echo "no pinned image recorded; build the first image by terraform/README.md section 1" >&2
+			exit 1
+		fi
 		hcloud server create --name kyriakon-gold --type "${RESTORE_TEST_SERVER_TYPE:-cx23}" \
 			--image "$image_id" --location "${RESTORE_TEST_LOCATION:-fsn1}" -o json | jq -r '.server.id'
 
-   Match the type and the location to the live box in `terraform/terraform.tfvars` so the image is built on the same footing the box runs on.
+   Match the type and the location to the live box in `terraform/terraform.tfvars` so the image is built on the same footing the box runs on. The image carries its own root `authorized_keys`, so reach the new box with the key it holds.
 
    On that box, apply the patches and shut it down, because a snapshot of a running filesystem can capture a write in progress.
 
@@ -1111,7 +1117,15 @@ The base system and the packages move on different clocks. `syspatch` carries ba
 		hcloud server create-image --type snapshot --label kind=gold --description "kyriakon-openbsd-<rev>" <gold-server-id>
 		hcloud server delete <gold-server-id>
 
-   `terraform/variables.tf` fixes the label convention: provisioning images carry `kind=gold` and point-in-time copies of the live box carry `kind=dr`, so a copy of the live box can never be picked up for provisioning. The terraform data source reads the newest image matching `kind=gold` (`terraform/main.tf`), and the weekly restore test reads the snapshot labelled `kind=restore`. Each label must name exactly one snapshot, and the standup refuses to run when two snapshots carry its label, because which one boots the test would otherwise be decided by the order of an API reply. Remove or relabel the snapshot that a newer one replaces.
+   Then pin the snapshot Terraform provisions from. `terraform/main.tf` reads `image_id`, not a label, and a precondition on the server refuses the plan when the image's description does not match `image_description`, or when the image is not x86. Set both in `terraform/terraform.tfvars` and record them here.
+
+   | Image ID | Description | Recorded |
+   | -------- | ----------- | -------- |
+   | none     | none        | no reviewed image pinned yet |
+
+   Until that pair is set, no image is pinned, and the image the live server was created from (425837263, `kyriakon-live-20260829-213209`) is a snapshot of the live box: never use it for provisioning. Build the first pinned image by `terraform/README.md` section 1 on a throwaway box.
+
+   Labels remain an operator aid. Provisioning images carry `kind=gold` and point-in-time copies of the live box carry `kind=dr`, so `hcloud image list` can tell them apart, but a label grants no provisioning authority. The weekly restore test reads the snapshot labelled `kind=restore`, and the standup refuses to run when two snapshots carry that label, because which one boots the test would otherwise be decided by the order of an API reply. Remove or relabel the snapshot that a newer one replaces, and update the pinned pair with it.
 
 5. Audit the snapshot's age against both clocks.
 
@@ -1119,7 +1133,7 @@ The base system and the packages move on different clocks. `syspatch` carries ba
 		doas syspatch -l
 		uname -a
 
-   Compare the `created` value of the newest `kind=gold` image with the date of the last `syspatch` and `pkg_add -u` run on the box. A snapshot older than the last patch run reprovisions a box without that patch, which is the failure the re-snapshot in step 4 prevents.
+   Compare the `created` value of the image recorded in step 4's table with the date of the last `syspatch` and `pkg_add -u` run on the box. An image older than the last patch run reprovisions a box without that patch, which is the failure the re-snapshot in step 4 prevents. Also check that this is the ID and description `terraform/terraform.tfvars` names, since the table and the variables have to move together.
 
 ## Operator actions before the first payment
 
