@@ -56,6 +56,11 @@ kyriakon_save_pull_stream(const struct kyriakon_pull_stream *stream,
 		stream->skip(context, size);
 		return kyriakon_save_pull(1, NULL, error, error_size);
 	}
+	/* A positive read must have left those bytes in the buffer. If it did
+	   not, there is nothing to consume: DATA would hand the pump an unset
+	   pointer and length, so wait instead. */
+	if (ret > 0)
+		ret = 0;
 	/* Only now may -1 mean EOF; a stream error still fails the save. */
 	return kyriakon_save_pull(ret, stream->error(context), error, error_size);
 }

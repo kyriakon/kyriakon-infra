@@ -227,6 +227,52 @@ limit_pull(void *context, const unsigned char **data_r, size_t *size_r,
 					 error, error_size);
 }
 
+/* A stream that reports a positive read without exposing any bytes. Nothing is
+ * available to hand the pump. */
+static int
+phantom_read(void *context)
+{
+	(void)context;
+	return 1;
+}
+
+static const unsigned char *
+phantom_data(void *context, size_t *size_r)
+{
+	(void)context;
+	*size_r = 0;
+	return NULL;
+}
+
+static void
+phantom_skip(void *context, size_t size)
+{
+	(void)context;
+	(void)size;
+}
+
+static const char *
+phantom_error(void *context)
+{
+	(void)context;
+	return NULL;
+}
+
+static int
+phantom_pull(void *context, const unsigned char **data_r, size_t *size_r,
+	     char *error, size_t error_size)
+{
+	static const struct kyriakon_pull_stream stream = {
+		.read = phantom_read,
+		.data = phantom_data,
+		.skip = phantom_skip,
+		.error = phantom_error,
+	};
+
+	return kyriakon_save_pull_stream(&stream, context, data_r, size_r,
+					 error, error_size);
+}
+
 static bool
 fixture_encrypt(void *context, const unsigned char *plain, size_t plain_len,
 		struct kyriakon_encrypt_result *result)
@@ -440,6 +486,23 @@ test_pull_limit_eof_with_buffered_data(const char *fake)
 	kyriakon_save_deinit(&save);
 }
 
+/* A positive read means bytes were added. If the buffer is empty anyway,
+ * reporting DATA would pass the pump an unset pointer and length; the pull
+ * must wait. */
+static void
+test_pull_positive_read_with_empty_buffer(void)
+{
+	const unsigned char *data = NULL;
+	size_t size = 0;
+	char error[256];
+	int ret;
+
+	error[0] = '\0';
+	ret = phantom_pull(NULL, &data, &size, error, sizeof(error));
+	expect(ret == KYRIAKON_SAVE_PULL_WAIT,
+	       "a positive read with an empty buffer waits");
+}
+
 /* A backend save_begin that fails leaves the save failed even though the
  * backend was half-started: the next continue must not call its
  * save_continue on the failed context. */
@@ -610,6 +673,7 @@ main(int argc, char **argv)
 	test_pull_status();
 	test_pull_error_after_data(fake);
 	test_pull_limit_eof_with_buffered_data(fake);
+	test_pull_positive_read_with_empty_buffer();
 	test_save_ordering(fake);
 	test_backend_begin_failure(fake);
 	test_plaintext_cap(fake);
