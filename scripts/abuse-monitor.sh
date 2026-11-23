@@ -369,9 +369,17 @@ trap_new() {
 }
 
 # deferred_senders_flagged <log> <day> <min>: print how many envelope senders
-# were deferred from <min> or more distinct addresses on <day>. The count only:
-# neither the alert nor the state file may carry a sender (issue #889).
+# were deferred from <min> or more distinct addresses on <day>, or nothing when
+# the log cannot be read. The count only: neither the alert nor the state file
+# may carry a sender (issue #889).
+#
+# An absent or unreadable daemon log is not a finding here: spamd -v is optional
+# (deploy-mail.sh sets it), the log rotates, and a missing one means there is
+# nothing to count. The helper must still exit 0, because it runs inside a
+# command substitution under set -e and a nonzero status there would end the
+# run before the blocklist, drain, certificate, backup and filesystem checks.
 deferred_senders_flagged() {
+	[ -r "$1" ] || return 0
 	awk -v day="$2" -v min="$3" '
 		$0 ~ "^" day && /\(GREY\)/ {
 			f = $8; gsub(/[<>]/, "", f)
@@ -379,7 +387,16 @@ deferred_senders_flagged() {
 			if (!(pair in seen)) { seen[pair] = 1; n[f]++ }
 		}
 		END { c = 0; for (f in n) if (n[f] >= min) c++; print c }
-	' "$1" 2>/dev/null
+	' "$1" 2>/dev/null || true
+}
+
+# deferred_reported <state-line> <day>: the count already mailed for <day>, or
+# nothing when the state was written on another day. The day stamp stops
+# yesterday's count from silencing a different sender that crosses the threshold
+# today with the same number, which a bare count would do.
+deferred_reported() {
+	if [ "${1%% *}" = "$2" ]; then printf '%s' "${1##* }"; fi
+	return 0
 }
 
 newest_snapshot_epoch() {
@@ -551,9 +568,8 @@ log_failure() {
 
 # state_dir <dir>: create the monitor's state directory private, and tighten one
 # an older run left group- or world-readable. umask 077 then covers every file
-# this run writes: deferred-senders holds correspondents' envelope senders and
-# spamd-trapped-list every blocked host, and no local unprivileged process has
-# any business reading either.
+# this run writes: the state is counts and log offsets, and no local
+# unprivileged process has any business reading it.
 state_dir() {
 	install -d -m 0700 "$1"
 	chmod 0700 "$1"
@@ -562,9 +578,9 @@ state_dir() {
 
 # state_write <file>: write stdin to a state file only root can read, by staging
 # a sibling and renaming it. A kill between a truncate and a write would
-# otherwise leave a partial deferred-senders, and the next run would re-alert on
-# every sender. The chmod covers a file an older run left 0644; umask 077 only
-# covers new ones.
+# otherwise leave a partial deferred-senders, and the next run would read a
+# count it cannot parse. The chmod covers a file an older run left 0644; umask
+# 077 only covers new ones.
 state_write() {
 	typeset tmp="$1.new.$$"
 	(umask 077; cat > "$tmp")
@@ -573,15 +589,22 @@ state_write() {
 }
 
 # scan_mtimes <dir>: print "<oldest> <count>" for the regular files under <dir>,
-# or return 1 when the scan itself fails. A find or stat that cannot run
-# is a directory that cannot be seen, not an empty one (issue #897), so the
-# caller must treat the nonzero status as a finding. FIND_CMD and STAT_CMD point
-# the scan at stubs in --self-test, the way ID_CMD and LAPSE_USER_SH do.
+# or return 1 when the directory itself cannot be read. An unreadable directory
+# is a check that cannot see what it is checking, not an empty one (issue #897),
+# so the caller treats the nonzero status as a finding.
+#
+# The readability probe is separate from the mtime listing because the drain and
+# acme-queue remove files while this walks: a file that vanishes between find's
+# -type f test and the batched stat makes find exit nonzero without the
+# directory being unreadable. A vanished file drops out of the listing instead
+# of turning a healthy box's scan into an alert. FIND_CMD and STAT_CMD point the
+# scan at stubs in --self-test, the way ID_CMD and LAPSE_USER_SH do.
 scan_mtimes() {
 	typeset listing
-	if ! listing=$("${FIND_CMD:-find}" "$1" -type f -exec "${STAT_CMD:-stat}" -f '%m' {} + 2>/dev/null); then
+	if ! "${FIND_CMD:-find}" "$1" -type f >/dev/null 2>&1; then
 		return 1
 	fi
+	listing=$("${FIND_CMD:-find}" "$1" -type f -exec "${STAT_CMD:-stat}" -f '%m' {} + 2>/dev/null || true)
 	printf '%s\n' "$listing" | awk 'NF { n++; if (n == 1 || $1 < m) m = $1 } END { print m + 0, n + 0 }'
 }
 
@@ -679,6 +702,27 @@ Nov 22 12:11:00 mail spamd[1]: (GREY) 192.0.2.1: <yesterday@example.org> -> <mem
 DAEMONLOG
 	check "senders over the address threshold are counted, not named" \
 		"$(deferred_senders_flagged "$work/daemonlog" "Nov 23" 6)" "1"
+
+	# A daemon log that was never written or has rotated away leaves nothing to
+	# count. The helper has to exit 0, because the production assignment runs it
+	# under set -e and a nonzero status there would end the run before the later
+	# checks and the success ping.
+	if missing_flagged=$(deferred_senders_flagged "$work/absent-daemon" "Nov 23" 6); then
+		missing_flag_rc=0
+	else
+		missing_flag_rc=$?
+	fi
+	check "a missing daemon log does not fail the check" "$missing_flag_rc" "0"
+	check "and yields no count" "$missing_flagged" ""
+
+	# The state carries the day, so yesterday's equal count does not silence a
+	# different sender that crosses the threshold today with the same number.
+	check "a same-day count is the one already reported" \
+		"$(deferred_reported "2026-11-23 1" "2026-11-23")" "1"
+	check "yesterday's equal count does not silence today" \
+		"$(deferred_reported "2026-11-22 1" "2026-11-23")" ""
+	check "a missing state has nothing reported" \
+		"$(deferred_reported "" "2026-11-23")" ""
 
 	# The cooldown two signals get for being holdable by a stranger.
 	check "a storm signal waits six hours" "$(cooldown_for "ssh guesses")" "360"
@@ -952,6 +996,38 @@ STUB
 	check "and names the directory it could not read" \
 		"$(grep -c "$work/onboard/intents could not be read" "$work/drain.out")" "1"
 	check "and marks the external check down" "$(cat "$CURL_LOG")" "$health_url/fail"
+
+	# The drain and the queue remove files while the scan walks. A file that goes
+	# between find's -type f test and the batched stat makes find exit nonzero,
+	# and that must not page as an unreadable store. The stub removes one file
+	# then answers for the rest, which is the shape a vanishing entry produces.
+	mkdir -p "$work/vanishing"
+	printf 'kept\n' > "$work/vanishing/kept"
+	printf 'gone\n' > "$work/vanishing/gone"
+	cat > "$work/bin/stat-vanish" <<'STUB'
+#!/bin/sh
+rm -f "$LATE_FILE"
+shift 2
+for f in "$@"; do
+	[ -f "$f" ] || continue
+	printf '%s\n' 1700000000
+done
+exit 1
+STUB
+	chmod 0700 "$work/bin/stat-vanish"
+	export LATE_FILE="$work/vanishing/gone"
+	STAT_CMD="$work/bin/stat-vanish"
+	if vanish_out=$(scan_mtimes "$work/vanishing"); then
+		vanish_rc=0
+	else
+		vanish_rc=$?
+	fi
+	unset STAT_CMD
+	unset LATE_FILE
+	check "a file that vanishes mid-scan does not fail the scan" "$vanish_rc" "0"
+	check "and the surviving files are still counted" "${vanish_out##* }" "1"
+	check "and the vanished file is gone" \
+		"$([ -e "$work/vanishing/gone" ] && printf yes || printf no)" "no"
 
 	# The Healthchecks body is a third party's, and the operator's notice names
 	# only Stripe and Hetzner: an alert that names an account and an address must
@@ -1307,17 +1383,21 @@ rm -f "$state/spamd-trapped-list"
 #   "... (GREY) <ip>: <from> -> <to>"
 # With no -v there is nothing to count, and this reports nothing.
 today=$(date '+%b %e')
+today_stamp=$(date '+%F')
 flagged=$(deferred_senders_flagged "$daemon_log" "$today" "$defer_min")
 flagged=${flagged:-0}
-# One alert for the day's count. The state file is a snapshot of the number of
-# senders over the threshold, rewritten every run, so it prunes itself and a
-# sender stuck for days is not news on every run. The count and never the
-# senders: an envelope sender is the per-address detail (issue #889).
-reported=$(cat "$state/deferred-senders" 2>/dev/null || true)
+# One alert for the day's count. The state file is "<day> <count>", rewritten
+# every run, so it prunes itself and a sender stuck for days is not news on
+# every run. The day is part of the key: yesterday's count must not silence a
+# different sender that crosses the threshold today with the same number. The
+# count and never the senders: an envelope sender is the per-address detail
+# (issue #889).
+reported_state=$(cat "$state/deferred-senders" 2>/dev/null || true)
+reported=$(deferred_reported "$reported_state" "$today_stamp")
 if [ "$flagged" -gt 0 ] && [ "$flagged" != "$reported" ]; then
 	alert spamd "deferred senders" "$flagged sender(s) were deferred from $defer_min or more addresses today, so a retry never promotes them and their mail can bounce. The senders are not recorded; today's spamd -v lines on the box name them if one is a real correspondent, and its mail ranges belong in /etc/mail/nospamd (docs/planning/research/spamd-greylisting.md)"
 fi
-printf '%s\n' "$flagged" | state_write "$state/deferred-senders"
+printf '%s %s\n' "$today_stamp" "$flagged" | state_write "$state/deferred-senders"
 
 # --- 6. IP reputation blocklist ------------------------------------------
 ip="${PUBLIC_IP:-$(ifconfig egress inet 2>/dev/null | awk '/inet / { print $2; exit }')}"
