@@ -300,6 +300,18 @@ jobs:
             # from a package.
             cargo build --release --manifest-path control/Cargo.toml -p kyriakon-control-static
             ksh scripts/verify-hosting.sh
+            # The drain is the one root program, and #849 makes it unveil its
+            # paths and pledge its syscalls before the first pass. Only a real
+            # OpenBSD kernel can prove that: a missing promise aborts the
+            # process. The binary is the commit under test, built here for the
+            # same reason the responder is.
+            cargo build --release --manifest-path control/Cargo.toml -p kyriakon-control-drain -p kyriakon-admin
+            ksh scripts/verify-drain-sandbox.sh
+            # The unit tests gated on OpenBSD and `test` cannot run in the
+            # Ubuntu control job, and this is the only host whose kernel
+            # behaviour they exercise. `--lib` keeps it to the crate's own
+            # tests; the acceptance suite runs its Linux half above.
+            cargo test --manifest-path control/Cargo.toml -p kyriakon-control-drain --lib
 
   terraform:
     name: terraform
