@@ -1741,7 +1741,21 @@ pub async fn write_payment_copy(
         if !store::is_status_token(token) {
             return Ok(());
         }
-        if store.filed_application_text(token).await?.is_some() {
+        if let Some(filed) = store.filed_application_text(token).await? {
+            // The account copy is written before the decision stamp and can be
+            // stale. Merge only the block into the shared record, so its stage,
+            // its decision and its purged answers are not replaced by the
+            // mailbox's copy.
+            let mut record: Value = serde_json::from_str(&filed)
+                .map_err(|e| Error::context("the application record does not parse", e))?;
+            record["payment"] = serde_json::to_value(payment).map_err(|source| Error::Json {
+                context: "encode the payment block",
+                source,
+            })?;
+            let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
+                context: "encode the application record",
+                source,
+            })?;
             let owner = store.dir_owner("applications");
             store
                 .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)

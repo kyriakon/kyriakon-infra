@@ -1888,6 +1888,10 @@ fn a_lapsed_card_group_stops_its_subscription_once() {
         "status": "active"
     });
     group["payment"]["window"]["state"] = json!("closed");
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(6));
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+    assert!(fix.drain().status.success());
+    let mut group: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
     std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
 
@@ -3684,6 +3688,191 @@ fn a_group_grace_ends_in_one_deletion_of_every_account() {
     );
 }
 
+/// A group whose site owner record is gone has no addressee. It is reported,
+/// and the group record waits until no member account is left. Deleting the
+/// members silently is the failure the hold prevents.
+#[test]
+fn a_group_with_no_site_owner_record_waits_for_its_accounts_then_goes() {
+    let fix = Fix::new("group-no-owner");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let path = fix.dir.join("store/groups/parish.example/group.json");
+    let mut group: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    group["payment"]["window"]["state"] = json!("closed");
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+    std::fs::remove_dir_all(fix.dir.join("store/accounts/parish-secretary")).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir.join("store/groups/parish.example").exists(),
+        "the group went while a member account was still there"
+    );
+    assert!(
+        !fix.scripts_log().contains("remove-group.sh parish.example"),
+        "{}",
+        fix.scripts_log()
+    );
+    assert!(
+        fix.sent().contains("has no addressee"),
+        "the missing addressee was not reported: {}",
+        fix.sent()
+    );
+
+    // The last member record goes, as its own deletion would remove it.
+    std::fs::remove_dir_all(fix.dir.join("store/accounts/parish-office")).unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/groups/parish.example").exists(),
+        "the group stayed after every member record was gone"
+    );
+    assert!(
+        fix.scripts_log().contains("remove-group.sh parish.example"),
+        "{}",
+        fix.scripts_log()
+    );
+}
+
+/// A group final notice whose enqueue fails holds the deletion. When the mail
+/// path is repaired the notice leaves and the group gets the seven days it
+/// promises.
+#[test]
+fn a_group_final_notice_that_cannot_leave_holds_the_deletion() {
+    let fix = Fix::new("group-final-enqueue");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    let path = fix.dir.join("store/groups/parish.example/group.json");
+    let mut group: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    group["payment"]["window"]["state"] = json!("closed");
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+
+    fix.enqueuer_fails();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir.join("store/groups/parish.example").exists(),
+        "the group went without its final notice"
+    );
+    assert!(
+        !fix.scripts_log().contains("remove-group.sh parish.example"),
+        "{}",
+        fix.scripts_log()
+    );
+
+    fix.enqueuer_works();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.sent().contains("will be deleted in seven days"),
+        "the retry did not send the group final notice: {}",
+        fix.sent()
+    );
+    assert!(
+        fix.dir.join("store/groups/parish.example").exists(),
+        "the group went in the pass that first sent its notice"
+    );
+    let group: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        group["grace_until"],
+        json!(kyriakon_control_core::util::date_after_days(7)),
+        "a notice sent for the first time gets its seven days: {group}"
+    );
+}
+
+/// A body approved past the ninety-day boundary keeps its payment join, and
+/// the answers in every mailbox copy are stripped. A card payment through the
+/// mailed link still resolves to the group and credits it.
+#[test]
+fn a_group_approved_on_the_purge_boundary_keeps_its_join_and_takes_a_payment() {
+    let fix = Fix::new("group-purge-window");
+    let mut record = fix.filed_body("warden");
+    record["rail"] = json!("card");
+    record["answers"]["rail"] = json!("card");
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    // The review ran late: the record is past ninety days when it is approved.
+    fix.amend_application(TOKEN, |record| {
+        record["filed_at"] = json!(kyriakon_control_core::util::after_days(-100));
+    });
+    fix.decide("approve", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let group_path = fix.dir.join("store/groups/parish.example/group.json");
+    assert!(
+        group_path.exists(),
+        "the approval made no group\njournal:{}\nsent:{}\nintents:{:?}",
+        fix.journal(),
+        fix.sent(),
+        fix.intents()
+    );
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    let token = group["payment"]["token_ref"]
+        .as_str()
+        .expect("a charged group draws one token")
+        .to_string();
+
+    // The purge pass: past ninety days, with the window the approval opened.
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let app: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert_eq!(
+        app["payment"]["token_ref"],
+        json!(token),
+        "the group payment join did not survive: {app}"
+    );
+    assert!(
+        app["answers"]
+            .as_object()
+            .is_some_and(|answers| answers.is_empty()),
+        "the group answers were kept: {app}"
+    );
+    let copy = fix.read("accounts/parish-secretary/application.json");
+    assert!(
+        copy.contains(&token),
+        "the mailbox copy lost the join: {copy}"
+    );
+    assert!(
+        !copy.contains("body_addresses") && !copy.contains("body_dns_contact"),
+        "the mailbox copy kept the answers: {copy}"
+    );
+
+    // The card payment the link opens still finds the group and credits it.
+    fix.stripe_session_repair(TOKEN);
+    fix.webhook(
+        "evt_group_purge_paid",
+        "invoice.paid",
+        invoice_with("in_group_purge_paid", 4_000, 1_790_000_000),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let group: Value = serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    assert!(
+        group["payment"]["paid_until"].is_string(),
+        "the payment after the purge pass did not credit the group: {group}"
+    );
+    assert_eq!(payment_lines(&fix).len(), 1, "{:?}", payment_lines(&fix));
+}
+
 /// The tier's own price: a group year is GBP 40, a GBP 20 credit is refused as
 /// short with the ledger and the window untouched, and the approval mail names
 /// the group's figure rather than a person's.
@@ -3928,8 +4117,17 @@ fn a_readded_group_gets_its_own_deletion() {
     let mut group: Value =
         serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
     group["created_at"] = json!("2020-01-01T00:00:00Z");
-    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(6));
     group["payment"]["window"]["state"] = json!("closed");
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
     std::fs::write(
         fix.dir.join("store/groups/parish.example/group.json"),
         serde_json::to_vec_pretty(&group).unwrap(),
@@ -3961,8 +4159,17 @@ fn a_readded_group_gets_its_own_deletion() {
         serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
     let stamp = group["created_at"].as_str().unwrap().to_string();
     assert_ne!(stamp, "2020-01-01T00:00:00Z", "{group}");
-    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(6));
     group["payment"]["window"]["state"] = json!("closed");
+    std::fs::write(
+        fix.dir.join("store/groups/parish.example/group.json"),
+        serde_json::to_vec_pretty(&group).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+    let mut group: Value =
+        serde_json::from_str(&fix.read("groups/parish.example/group.json")).unwrap();
+    group["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
     std::fs::write(
         fix.dir.join("store/groups/parish.example/group.json"),
         serde_json::to_vec_pretty(&group).unwrap(),

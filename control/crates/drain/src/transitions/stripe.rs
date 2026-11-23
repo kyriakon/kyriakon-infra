@@ -21,7 +21,7 @@ use kyriakon_control_core::util;
 use serde_json::Value;
 use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
+use time::{Date, OffsetDateTime};
 
 /// How far a webhook's timestamp may be from this box's clock at the moment
 /// the handler accepted the delivery. Stripe's own libraries default to five
@@ -383,6 +383,29 @@ async fn webhook_received(store: &Store, id: &str) -> Option<i64> {
         .modified()
         .ok()?;
     Some(OffsetDateTime::from(modified).unix_timestamp())
+}
+
+/// Whether a delivery still queued arrived on or after `day`. A grace sweep
+/// uses this to defer one account rather than every account when a payment
+/// event for it may still be waiting. An arrival that cannot be read is
+/// treated as recent, which holds the deletion rather than guessing it old.
+pub async fn queued_on_or_after(store: &Store, day: Date) -> Result<bool, Error> {
+    for name in store.list("webhooks").await? {
+        let Some(id) = name.strip_suffix(".body") else {
+            continue;
+        };
+        let Some(received) = webhook_received(store, id).await else {
+            return Ok(true);
+        };
+        let arrived = match OffsetDateTime::from_unix_timestamp(received) {
+            Ok(arrived) => arrived,
+            Err(_) => return Ok(true),
+        };
+        if arrived.date() >= day {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Drop the first-sight record once the event has settled, so `verified/` does

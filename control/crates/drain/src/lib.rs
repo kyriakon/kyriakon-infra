@@ -115,16 +115,25 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
     // payment that arrived before this pass on the grace date restores the
     // account here, before the sweep can delete it. The error is held rather
     // than raised, so a misconfigured signing secret does not hold up the rest
-    // of the pass; the sweep is skipped below, because a delivery still queued
-    // may be that payment.
+    // of the pass. A delivery that survives the pass is reported, and the
+    // sweep defers only the accounts whose grace date it could still concern.
     let stripe = transitions::stripe::stripe_webhooks(cfg, store, &journal).await;
-    let card_queue_empty = stripe.is_ok()
-        && !store
-            .list("webhooks")
-            .await?
-            .iter()
-            .any(|name| name.ends_with(".body"));
-    if bounces_settled && card_queue_empty {
+    let queued = store.list("webhooks").await?;
+    let unapplied = queued.iter().filter(|name| name.ends_with(".body")).count();
+    if unapplied > 0 {
+        transitions::report_failure(
+            cfg,
+            store,
+            &journal,
+            "stripe-queue",
+            "webhook",
+            &Error::Failed(format!(
+                "{unapplied} card deliveries remain unapplied and are retried on the next pass"
+            )),
+        )
+        .await;
+    }
+    if bounces_settled && stripe.is_ok() {
         // A lapsed account's grace: the final notice at day 33, and the one
         // deletion transition when the 40 days end.
         transitions::lifecycle::grace_sweep(cfg, store, &journal).await?;

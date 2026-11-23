@@ -814,11 +814,15 @@ fn a_missing_webhook_secret_is_mailed_once_and_keeps_the_delivery() {
         sent.contains("Subject: kyriakon: control: drain failed"),
         "{sent}"
     );
-    assert!(sent.contains("config stripe-secret"), "{sent}");
     assert_eq!(
-        sent.matches("Subject:").count(),
+        sent.matches("config stripe-secret").count(),
         1,
         "a second pass mailed the same failure: {sent}"
+    );
+    assert_eq!(
+        sent.matches("card deliveries remain unapplied").count(),
+        1,
+        "the surviving queue was not surfaced once: {sent}"
     );
     assert!(
         fix.webhooks()

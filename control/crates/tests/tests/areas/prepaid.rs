@@ -2799,8 +2799,8 @@ fn a_final_notice_that_cannot_leave_is_retried_before_the_account_is_deleted() {
         "a refused enqueue left a notice line that suppresses the retry"
     );
 
-    // The mail path is repaired: the same notice leaves, and then the deletion
-    // runs on that pass.
+    // The mail path is repaired: the same notice leaves, and the clock moves
+    // out the seven days the notice promises instead of deleting that pass.
     fix.enqueuer_works();
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
@@ -2810,8 +2810,33 @@ fn a_final_notice_that_cannot_leave_is_retried_before_the_account_is_deleted() {
         fix.sent()
     );
     assert!(
+        fix.dir.join("store/accounts/secretary").exists(),
+        "the account was deleted in the pass that first sent its notice"
+    );
+    assert_eq!(
+        fix.account("secretary")["grace_until"],
+        json!(kyriakon_control_core::util::date_after_days(7)),
+        "a notice sent for the first time gets the seven days it promises"
+    );
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+
+    // Seven days later, with the notice recorded, the deletion runs.
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
         !fix.dir.join("store/accounts/secretary").exists(),
-        "the account was not deleted after the notice left"
+        "the account was not deleted after the seven days ran"
     );
     assert!(
         fix.scripts_log().contains("delete-user.sh secretary"),
@@ -2917,6 +2942,53 @@ fn a_prepaid_member_is_reminded_once_before_the_date_runs_out() {
             .read("accounts/secretary/notices.jsonl")
             .contains("prepaid.renewal"),
         "a card account gets no platform reminder"
+    );
+}
+
+/// A deferred card delivery that arrived long before this pass does not stop
+/// the grace sweep for everyone: the midpoint notice still goes.
+#[test]
+fn an_old_deferred_card_delivery_does_not_stop_the_grace_notice() {
+    let fix = Fix::new("grace-old-queue");
+    let _token = approved_paid(&fix, "secretary", "cash");
+    let mut account = fix.account("secretary");
+    account["payment"]["window"]["closes_at"] = json!("2020-01-01T00:00:00Z");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+
+    // Ten days into the grace, with the midpoint note due.
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(30));
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    // A delivery with no account reference is deferred forever, and stays in
+    // the queue after every pass.
+    fix.stripe_session_without_reference();
+    fix.webhook(
+        "evt_old_deferred",
+        "invoice.paid",
+        invoice("in_old_deferred"),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.read("accounts/secretary/notices.jsonl")
+            .contains("prepaid.grace"),
+        "a permanently deferred delivery stopped the grace notice"
+    );
+    assert!(
+        fix.webhooks()
+            .iter()
+            .any(|name| name.starts_with("evt_old_deferred.body")),
+        "the delivery settled, so it does not test a deferred queue: {:?}",
+        fix.webhooks()
     );
 }
 

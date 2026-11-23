@@ -1509,15 +1509,6 @@ fn age_filed_at(fix: &Fix, rel: &str, days: i64) {
     std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
 }
 
-/// Close the payment window an approval opened, so a test about the ninety-day
-/// boundary is not also about the live window a payment can still use.
-fn close_payment_window(fix: &Fix, rel: &str) {
-    let path = fix.dir.join("store").join(rel);
-    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    record["payment"]["window"]["state"] = json!("closed");
-    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
-}
-
 /// ADR 0005's ninety days: an approved application's answers are cleared from
 /// the mailbox's copy and the token record on the first pass after the window,
 /// while `account.json` keeps the payment and the outside address. The token is
@@ -1590,7 +1581,11 @@ fn an_approved_applications_answers_purge_after_ninety_days() {
 #[test]
 fn an_application_approved_on_the_purge_boundary_survives_its_open_window() {
     let fix = Fix::new("purge-open-window");
-    let record = fix.filed("secretary", "card", &[("rail", "card")]);
+    let record = fix.filed(
+        "secretary",
+        "card",
+        &[("rail", "card"), ("cannot_pay", "I have no money")],
+    );
     fix.file_application(&record);
     assert!(fix.drain().status.success());
 
@@ -1600,6 +1595,10 @@ fn an_application_approved_on_the_purge_boundary_survives_its_open_window() {
     fix.decide("approve", "secretary");
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
+    let token_ref = fix.account("secretary")["payment"]["token_ref"]
+        .as_str()
+        .expect("a paid approval draws a token")
+        .to_string();
 
     let copy = "accounts/secretary/application.json";
     let application = format!("applications/{TOKEN}.json");
@@ -1624,6 +1623,35 @@ fn an_application_approved_on_the_purge_boundary_survives_its_open_window() {
         fix.journal()
     );
 
+    // The join survives and the application text does not, in both copies.
+    let kept: Value = serde_json::from_str(&fix.read(&application)).unwrap();
+    assert_eq!(
+        kept["payment"]["token_ref"],
+        json!(token_ref),
+        "the payment join did not survive: {kept}"
+    );
+    assert!(
+        kept["answers"].as_object().is_some_and(|a| a.is_empty()),
+        "the answers were kept: {kept}"
+    );
+    assert!(
+        kept["mail_keys"].as_array().is_some_and(|k| k.is_empty()),
+        "the keys were kept: {kept}"
+    );
+    assert!(
+        kept.get("outside_address").is_none(),
+        "the applicant's address was kept: {kept}"
+    );
+    let copy_text = fix.read(copy);
+    assert!(
+        copy_text.contains(&token_ref),
+        "the mailbox copy lost the join: {copy_text}"
+    );
+    assert!(
+        !copy_text.contains("cannot_pay") && !copy_text.contains("I have no money"),
+        "the mailbox copy kept the answers: {copy_text}"
+    );
+
     // The card payment the mailed link opens still resolves through that
     // record and credits the account.
     fix.stripe_session_repair(TOKEN);
@@ -1635,6 +1663,60 @@ fn an_application_approved_on_the_purge_boundary_survives_its_open_window() {
         "the payment after the purge pass did not credit the account"
     );
     assert_eq!(payment_lines(&fix).len(), 1, "{:?}", payment_lines(&fix));
+}
+
+/// A shortfall credit rewrites the mailbox's payment block while the window
+/// stays open. That write merges only the block, so the shared record keeps its
+/// decision stage and its stripped answers.
+#[test]
+fn a_shortfall_credit_does_not_restore_the_purged_answers() {
+    let fix = Fix::new("purge-shortfall");
+    let token = approved_paid(&fix, "secretary", "cash");
+    let copy = "accounts/secretary/application.json";
+    let application = format!("applications/{TOKEN}.json");
+    age_filed_at(&fix, copy, 100);
+    age_filed_at(&fix, &application, 100);
+    assert!(fix.drain().status.success());
+    let stripped: Value = serde_json::from_str(&fix.read(&application)).unwrap();
+    assert!(
+        stripped["answers"]
+            .as_object()
+            .is_some_and(|answers| answers.is_empty()),
+        "the answers were not stripped: {stripped}"
+    );
+
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "cash",
+        "--amount",
+        "1.00",
+        "--received",
+        "2026-10-04",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let kept: Value = serde_json::from_str(&fix.read(&application)).unwrap();
+    assert_eq!(
+        kept["stage"],
+        json!("approved: an account was made"),
+        "the credit put the mailbox copy's stale stage back: {kept}"
+    );
+    assert!(
+        kept["answers"]
+            .as_object()
+            .is_some_and(|answers| answers.is_empty()),
+        "the credit restored the purged answers: {kept}"
+    );
+    assert_eq!(
+        kept["payment"]["window"]["state"],
+        json!("open"),
+        "the shortfall closed the window: {kept}"
+    );
 }
 
 /// Inside the window the answers stay: the boundary is the ninetieth day, and
@@ -1935,7 +2017,9 @@ fn a_groups_application_copy_in_every_mailbox_purges_once() {
             "{mailbox} has no copy"
         );
         age_filed_at(&fix, &copy, 100);
+        close_payment_window(&fix, &copy);
     }
+    close_payment_window(&fix, &format!("applications/{TOKEN}.json"));
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     for mailbox in ["parish-secretary", "parish-office"] {
@@ -4144,9 +4228,38 @@ fn a_suspension_starts_the_grace_and_resume_clears_it() {
     assert!(fix.drain().status.success());
     assert!(fix.dir.join("store/accounts/secretary").exists());
 
-    // A suspension left unanswered runs out: the deletion transition erases it.
-    let out = fix.ctl(&["suspend", "secretary", "--reason", reason]);
+    // A suspension left unanswered runs out. The notice goes at the deadline,
+    // and because this is its first send for this reason the clock moves out
+    // the seven days it promises rather than deleting the same pass.
+    let out = fix.ctl(&[
+        "suspend",
+        "secretary",
+        "--reason",
+        "a second, unanswered suspension",
+    ]);
     assert!(out.status.success(), "{}", body(&out));
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(0));
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.dir.join("store/accounts/secretary").exists(), "{out:?}");
+    assert_eq!(
+        fix.account("secretary")["grace_until"],
+        json!(kyriakon_control_core::util::date_after_days(7)),
+        "the suspended notice sent at the deadline gets its seven days"
+    );
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+
+    // The next deadline deletes, because the notice is already recorded.
     let mut account = fix.account("secretary");
     account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
     std::fs::write(
@@ -4355,6 +4468,13 @@ fn a_soft_bounce_or_ordinary_mail_does_not_stop_the_grace() {
             .contains("\"delivery\""),
         "a soft bounce was recorded as a failure"
     );
+
+    // The final notice's week, so the deadline pass that follows finds it
+    // recorded rather than sending it and moving the clock out seven days.
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(6));
+    fix.write_account("secretary", &account);
+    assert!(fix.drain().status.success());
 
     let mut account = fix.account("secretary");
     account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));

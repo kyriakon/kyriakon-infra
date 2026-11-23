@@ -1596,6 +1596,15 @@ pub fn approved_paid(fix: &Fix, username: &str, rail: &str) -> String {
         .to_string()
 }
 
+/// Close the payment window an approval opened, so a test about the ninety-day
+/// boundary is not also about the live window a payment can still use.
+pub fn close_payment_window(fix: &Fix, rel: &str) {
+    let path = fix.dir.join("store").join(rel);
+    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    record["payment"]["window"]["state"] = json!("closed");
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+}
+
 /// The ledger's parsed lines.
 pub fn ledger_lines(fix: &Fix) -> Vec<Value> {
     fix.read("ledger/payments.jsonl")
