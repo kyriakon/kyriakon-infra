@@ -779,7 +779,7 @@ async fn group_lapse_notice(
         group.domain,
         kyriakon_control_core::account::LAPSE_NOTE
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         &group.site_owner,
@@ -820,7 +820,7 @@ async fn group_grace_notice(
         group.domain,
         kyriakon_control_core::account::LAPSE_NOTE
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         &group.site_owner,
@@ -840,9 +840,9 @@ async fn group_final_notice(
     journal: &Journal,
     group: &GroupRecord,
     grace: time::Date,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let Some(to) = group_notice_recipient(cfg, store, journal, group).await else {
-        return Ok(());
+        return Ok(false);
     };
     let grace = util::date_string(grace);
     let token = group.payment.token_ref.as_deref().unwrap_or("");
@@ -859,7 +859,7 @@ async fn group_final_notice(
          admin@kyriakon.net before that date.\n",
         group.domain
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         &group.site_owner,
@@ -868,8 +868,41 @@ async fn group_final_notice(
         &to,
         &body,
     )
-    .await?;
-    Ok(())
+    .await
+    .map_err(Error::from)
+}
+
+/// Whether a lapsed group mailbox still has a body-level addressee. When it
+/// does, the group's own grace and notice cover the mailbox. When the site
+/// owner's record is gone there is nobody for a group notice to reach, so the
+/// mailbox runs its own grace instead of waiting forever on the group.
+async fn group_mailbox_has_addressee(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    account: &Account,
+) -> bool {
+    let Some(domain) = account.group.as_deref() else {
+        return false;
+    };
+    let group = match group_record(store, domain).await {
+        Ok(Some(group)) => group,
+        Ok(None) => return false,
+        Err(e) => {
+            report_record(cfg, store, journal, "group", domain, &e).await;
+            return true;
+        }
+    };
+    match store.account(&group.site_owner).await {
+        Ok(owner) => owner.is_some(),
+        Err(e) => {
+            Error::from(e).report(&format!(
+                "the notice record for {} of {domain}",
+                group.site_owner
+            ));
+            true
+        }
+    }
 }
 
 /// The lapse notice and the forty-day grace's own two events, run once per drain
@@ -881,15 +914,20 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
     let now = OffsetDateTime::now_utc();
     let today = now.date();
     for username in store.list("accounts").await? {
-        let Some(account) = sweep_account(cfg, store, journal, &username).await else {
+        let Some(mut account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
         };
         // A lapsed group mailbox's grace is the group's: one conversation and
         // one deletion for the whole body, handled below. A suspended mailbox's
         // grace is its own, even inside a group: the suspension is a decision
         // about that mailbox, and deleting the paid, active group with it would
-        // take its siblings down too.
-        if account.group.is_some() && account.state == "lapsed" {
+        // take its siblings down too. When the site owner's record is gone the
+        // body has no addressee, so the mailbox runs its own grace and its own
+        // recorded notice instead.
+        if account.group.is_some()
+            && account.state == "lapsed"
+            && group_mailbox_has_addressee(cfg, store, journal, &account).await
+        {
             continue;
         }
         // A suspension runs the same clock as a lapse: the same final week and
@@ -916,6 +954,34 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
             // restart the clock. Only `notice resend` clears it, and that
             // extends the grace.
             if account.notice_stopped.is_some() {
+                continue;
+            }
+            // The final notice is sent, or found already recorded, before the
+            // deletion: an enqueue that failed leaves no notice line, and the
+            // account must not be erased without the warning it exists for.
+            let warned = if account.state == "suspended" {
+                suspension_final_notice(cfg, store, &username, &account).await
+            } else {
+                final_notice(cfg, store, &username, &account).await
+            };
+            match warned {
+                // This pass sent the notice for the first time. The text
+                // promises seven days, so it gets them.
+                Ok(true) => {
+                    account.grace_until = Some(util::date_after_days(7));
+                    save_account(store, &account).await?;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    e.report(&format!("the final notice for {username}"));
+                    continue;
+                }
+            }
+            // A card delivery that arrived on or after this grace date may be
+            // the payment that should stop the deletion. Only this account is
+            // deferred; an older event for another account does not hold it.
+            if crate::transitions::stripe::queued_on_or_after(store, grace).await? {
                 continue;
             }
             if let Err(e) = delete_account(cfg, store, journal, &username).await {
@@ -949,7 +1015,7 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
     // every account in the group, keyed on the group's own journal id so a
     // failed erase backs off.
     for domain in store.list("groups").await? {
-        let group = match group_record(store, &domain).await {
+        let mut group = match group_record(store, &domain).await {
             Ok(Some(group)) => group,
             Ok(None) => continue,
             Err(e) => {
@@ -985,14 +1051,78 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
             // A body's lifecycle notices are recorded against its site owner,
             // so a hard bounce that reached no address latches that account.
             // The group's deletion waits on the same latch: the person the
-            // body's mail names was not reached.
-            match store.account(&group.site_owner).await {
-                Ok(Some(owner)) if owner.notice_stopped.is_some() => continue,
-                Ok(_) => {}
+            // body's mail names was not reached. A read error is a failure to
+            // retry; an absent owner is a body with no addressee.
+            let owner = match store.account(&group.site_owner).await {
+                Ok(owner) => owner,
                 Err(e) => {
                     Error::from(e).report(&format!("the notice record for {}", group.site_owner));
                     continue;
                 }
+            };
+            if owner
+                .as_ref()
+                .is_some_and(|owner| owner.notice_stopped.is_some())
+            {
+                continue;
+            }
+            if owner.is_some() {
+                // The body's last notice must have left before its accounts
+                // are erased, for the same reason the individual account
+                // waits. A notice sent for the first time gets its seven days.
+                match group_final_notice(cfg, store, journal, &group, grace).await {
+                    Ok(true) => {
+                        group.grace_until = Some(util::date_after_days(7));
+                        write_group_record(store, &group).await?;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        e.report(&format!("the final notice for {domain}"));
+                        continue;
+                    }
+                }
+            } else {
+                // No addressee exists, so no notice can be sent. Say so loudly
+                // and let the member accounts finish their own recorded
+                // notices before the group record goes. Erasing them silently
+                // here is the failure this hold prevents.
+                report_failure(
+                    cfg,
+                    store,
+                    journal,
+                    &format!("{id}-no-owner"),
+                    "delete",
+                    &Error::Failed(format!(
+                        "the site owner record for {} is gone, so the group {domain} has no addressee; its member accounts are deleted under their own notices before the group record goes",
+                        group.site_owner
+                    )),
+                )
+                .await;
+                let mut remaining = None;
+                for mailbox in &group.accounts {
+                    match store.account(mailbox).await {
+                        Ok(Some(_)) => {
+                            remaining = Some(mailbox.clone());
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            Error::from(e)
+                                .report(&format!("the account record for {mailbox} in {domain}"));
+                            remaining = Some(mailbox.clone());
+                            break;
+                        }
+                    }
+                }
+                if remaining.is_some() {
+                    continue;
+                }
+            }
+            // A card delivery that arrived on or after this grace date may be
+            // the body's payment, so this group waits for the next pass.
+            if crate::transitions::stripe::queued_on_or_after(store, grace).await? {
+                continue;
             }
             if let Err(e) = delete_group(cfg, store, journal, &group, &id).await {
                 report_failure(cfg, store, journal, &id, "delete", &e).await;
@@ -1100,7 +1230,7 @@ async fn grace_notice(
          Your payment reference is {token}.\n",
         kyriakon_control_core::account::LAPSE_NOTE
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         username,
@@ -1172,7 +1302,7 @@ async fn final_notice(
     store: &Store,
     username: &str,
     account: &Account,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let grace = account.grace_until.as_deref().unwrap_or("");
     let token = account
         .payment_state()
@@ -1188,7 +1318,7 @@ async fn final_notice(
          Your payment reference is {token}. If you have posted the money, write to\n\
          admin@kyriakon.net before that date.\n"
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         username,
@@ -1197,8 +1327,8 @@ async fn final_notice(
         &to,
         &body,
     )
-    .await?;
-    Ok(())
+    .await
+    .map_err(Error::from)
 }
 
 /// The last notice before a suspended account's grace ends. It names the reason
@@ -1210,7 +1340,7 @@ async fn suspension_final_notice(
     store: &Store,
     username: &str,
     account: &Account,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let grace = account.grace_until.as_deref().unwrap_or("");
     let reason = account.suspension_reason.as_deref().unwrap_or("");
     let to = account.notice_address();
@@ -1227,7 +1357,7 @@ async fn suspension_final_notice(
          admin@kyriakon.net. A suspension the operator resolves is lifted with\n\
          `kyriakon-admin resume {username}` and the deletion does not run.\n"
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         username,
@@ -1236,8 +1366,8 @@ async fn suspension_final_notice(
         &to,
         &body,
     )
-    .await?;
-    Ok(())
+    .await
+    .map_err(Error::from)
 }
 
 /// `kyriakon-admin notice resend`: the runbook's step for a lifecycle notice
@@ -1497,7 +1627,7 @@ async fn lapse_notice(
          seven days before the end.\n",
         kyriakon_control_core::account::LAPSE_NOTE
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         username,
@@ -1600,7 +1730,7 @@ pub async fn suspend(
          that is not resolved enters the same forty-day grace as an unpaid account, and\n\
          that grace ends in deletion.\n"
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         username,
@@ -1795,7 +1925,7 @@ pub async fn delete_account(
         .await?;
     }
     if let Some(to) = account.outside_address.as_deref() {
-        notice::send_account_notice(
+        notice::send_account_notice_retryable(
             cfg,
             store,
             username,
@@ -2436,7 +2566,7 @@ pub async fn test_mail(
          not restored: look for a PGP/MIME or protected-headers setting in the client. \
          Nothing about the account changes either way; this message is the whole test.\n"
     );
-    let sent = notice::send_account_notice(
+    let sent = notice::send_account_notice_retryable(
         cfg,
         store,
         &intent.username,
@@ -2493,8 +2623,16 @@ async fn rotation_notices(
         } else {
             format!("{notice_type}.{request}.outside")
         };
-        notice::send_account_notice(cfg, store, &account.username, &kind, subject, to, body)
-            .await?;
+        notice::send_account_notice_retryable(
+            cfg,
+            store,
+            &account.username,
+            &kind,
+            subject,
+            to,
+            body,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2895,7 +3033,7 @@ async fn check_one_group(
              observed again on the next check. This notice is sent once per outage.\n",
             domain = group.domain
         );
-        notice::send_account_notice(
+        notice::send_account_notice_retryable(
             cfg,
             store,
             &group.site_owner,
@@ -3295,7 +3433,7 @@ pub async fn free_anniversaries(
         // One account's refused notice is reported and skipped, the way the DNS
         // sweep treats one group's: it must not stop the pass's mail spool or
         // the DNS check behind it.
-        if let Err(e) = notice::send_account_notice(
+        if let Err(e) = notice::send_account_notice_retryable(
             cfg,
             store,
             &username,
@@ -3377,7 +3515,7 @@ pub async fn prepaid_renewals(
              arrange the renewal or if you have already sent the money; the renewal is\n\
              handled by the operator, and no automatic deletion runs from this date.\n"
         );
-        if let Err(e) = notice::send_account_notice(
+        if let Err(e) = notice::send_account_notice_retryable(
             cfg,
             store,
             &username,
@@ -3434,7 +3572,7 @@ pub async fn prepaid_renewals(
                 continue;
             }
         };
-        if let Err(e) = notice::send_account_notice(
+        if let Err(e) = notice::send_account_notice_retryable(
             cfg,
             store,
             &group.site_owner,
@@ -3943,6 +4081,79 @@ fn purge_due(filed_at: &str, today: time::Date) -> bool {
         .is_some_and(|filed| !export::within_purge(filed.date(), today))
 }
 
+/// Whether an approval's payment window is still open on `today`. Only the
+/// payment block is read: a mailbox copy is written before the decision stamp,
+/// and a group's shared record is stamped after provisioning, so `stage` is not
+/// a field both shapes share.
+fn payment_window_open(payment: Option<&Payment>, today: time::Date) -> bool {
+    let Some(payment) = payment else {
+        return false;
+    };
+    payment.paid_until.is_none()
+        && payment.window.as_ref().is_some_and(|window| {
+            window.state == "open"
+                && OffsetDateTime::parse(&window.closes_at, &Rfc3339)
+                    .ok()
+                    .is_some_and(|closes| closes.date() >= today)
+        })
+}
+
+/// The payment block a mailbox copy carries, for the loop that reads the copy
+/// as `Value`.
+fn copy_payment(copy: &Value) -> Option<Payment> {
+    copy.get("payment")
+        .and_then(|payment| serde_json::from_value(payment.clone()).ok())
+}
+
+/// Write a mailbox copy back with only the token, the filing date and the
+/// payment block. The answers, keys, addresses and acceptances go.
+async fn keep_copy_join(
+    store: &Store,
+    mailbox: &str,
+    copy: &Value,
+    token: &str,
+    payment: Option<&Value>,
+) -> Result<(), Error> {
+    let mut kept = json!({
+        "status_token": token,
+        "filed_at": copy.get("filed_at").cloned().unwrap_or(Value::Null),
+    });
+    if let Some(payment) = payment.or_else(|| copy.get("payment")) {
+        kept["payment"] = payment.clone();
+    }
+    let bytes = serde_json::to_vec_pretty(&kept).map_err(|source| Error::Json {
+        context: "encode the application copy",
+        source,
+    })?;
+    store
+        .write_record(&format!("accounts/{mailbox}"), "application.json", &bytes)
+        .await
+        .map_err(Error::from)
+}
+
+/// Write the shared record back with its answers gone and its payment join
+/// kept, so the card pass can still resolve a payment through it.
+async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result<(), Error> {
+    let mut kept = record.clone();
+    kept.answers.clear();
+    kept.mail_keys.clear();
+    kept.upload_key = None;
+    kept.acceptances.clear();
+    kept.outside_address = None;
+    kept.domain = None;
+    kept.password_link = None;
+    kept.confirmation_at = None;
+    let bytes = serde_json::to_vec_pretty(&kept).map_err(|source| Error::Json {
+        context: "encode the application record",
+        source,
+    })?;
+    let owner = store.dir_owner("applications");
+    store
+        .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
+        .await
+        .map_err(Error::from)
+}
+
 /// The status tokens queued intents name. An approval writes `mark_decided`
 /// last, so a failure or a backoff leaves the record at `received` with its
 /// intent still in `intents/`; the purge must not take the record out from under
@@ -4004,12 +4215,14 @@ pub async fn purge_applications(
                 continue;
             }
         };
+        let copy: Value = match serde_json::from_str(&text) {
+            Ok(copy) => copy,
+            Err(_) => continue,
+        };
         let (Some(token), Some(filed)) = (
-            serde_json::from_str::<Value>(&text).ok().and_then(|copy| {
-                copy.get("status_token")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            }),
+            copy.get("status_token")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             export::filed_day(&text),
         ) else {
             continue;
@@ -4025,6 +4238,33 @@ pub async fn purge_applications(
             store
                 .remove(&format!("accounts/{mailbox}"), "application.json")
                 .await?;
+            continue;
+        }
+        // The shared record is the join the card pass reads. It is stamped
+        // after a group's copies are written, so an open window is looked for
+        // in both before either file goes.
+        let shared = match store.application(&token).await {
+            Ok(shared) => shared,
+            Err(e) => {
+                let e = Error::from(e);
+                report_record(cfg, store, journal, "application", &mailbox, &e).await;
+                continue;
+            }
+        };
+        let copy_payment = copy_payment(&copy);
+        let shared_payment = shared.as_ref().and_then(|record| record.payment.as_ref());
+        if payment_window_open(copy_payment.as_ref(), today)
+            || payment_window_open(shared_payment, today)
+        {
+            // ADR 0005 still bounds the answers. Keep only the token, the
+            // filing date and the payment block, and take the same text out of
+            // the shared record.
+            let shared_value =
+                shared_payment.and_then(|payment| serde_json::to_value(payment).ok());
+            keep_copy_join(store, &mailbox, &copy, &token, shared_value.as_ref()).await?;
+            if let Some(record) = shared.as_ref() {
+                keep_record_join(store, &token, record).await?;
+            }
             continue;
         }
         let purge_id = format!("purge-{token}");
@@ -4079,6 +4319,13 @@ pub async fn purge_applications(
             continue;
         };
         if !purge_due(&record.filed_at, today) {
+            continue;
+        }
+        // An approval whose payment window is still open is not abandoned: its
+        // link can still be charged, and this record is what resolves that
+        // payment to the account. Keep the join, and take the answers out.
+        if payment_window_open(record.payment.as_ref(), today) {
+            keep_record_join(store, &record.status_token, &record).await?;
             continue;
         }
         // A received record with its decision still queued is mid-approval, not

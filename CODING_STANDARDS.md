@@ -26,18 +26,22 @@ The handler holds no key. Anything it cannot prove is proved by the drain: a lin
 
 A store file ending `.jsonl` is a record and stays append-only. It is reached
 through `Store::log`, which has no write, and `Store::write_record` refuses the
-name. Four writes complete a line that has to be completed later rather than
+name. Five writes change a line that has to be completed later rather than
 appended again: a refund's settlement, a held payment's attribution, a
-request's close, and a notice's delivery status when a DSN reports a permanent
-failure. The notice completion is `mail::bounce`, and it calls
-`Store::rewrite_log_mode` rather than `Store::rewrite_log` because
-`notices.jsonl` is 0640 for the handler to read and the rewrite must keep that
-mode and the accounts directory's group. A retention prune removes whole lines
-once their window has run, as `lifecycle::holds_sweep` does for a released
-username. Each takes `Store::log(...).lock()` across its read and its write and
-calls the one named API, `Store::rewrite_log` or `Store::rewrite_log_mode`.
-Appends take the same lock, and the code says why: a rewrite without it can drop
-a line another process appended between the read and the rename.
+request's close, a notice's delivery status when a DSN reports a permanent
+failure, and a notice line whose enqueue returned an error. The delivery status
+is `mail::bounce`, and it calls `Store::rewrite_log_mode` rather than
+`Store::rewrite_log` because `notices.jsonl` is 0640 for the handler to read and
+the rewrite must keep that mode and the accounts directory's group. The retry
+removal is `mail::notice::unrecord`, the one case where a line is taken away
+instead of completed: `already_sent` matches on type and subject, so leaving the
+line would suppress every later attempt to send a mail that never left. It uses
+the same locked rewrite and mode. A retention prune removes whole lines once
+their window has run, as `lifecycle::holds_sweep` does for a released username.
+Each takes `Store::log(...).lock()` across its read and its write and calls the
+one named API, `Store::rewrite_log` or `Store::rewrite_log_mode`. Appends take
+the same lock, and the code says why: a rewrite without it can drop a line
+another process appended between the read and the rename.
 
 ## Errors and outcomes
 

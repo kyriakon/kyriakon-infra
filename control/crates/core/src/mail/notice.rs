@@ -196,9 +196,9 @@ pub async fn send_account_notice(
     Ok(true)
 }
 
-/// The approval mail's send. A failed enqueue takes its notice line back, so
-/// the retry after provisioning sends the approval and the durable-medium
-/// confirmation it carries instead of treating it as already sent.
+/// The retryable send every lifecycle notice uses. A failed enqueue takes its
+/// notice line back, so the next pass sends the same mail instead of reading it
+/// as already sent and letting the grace sweep erase the account unwarned.
 pub async fn send_account_notice_retryable(
     cfg: &DrainConfig,
     store: &Store,

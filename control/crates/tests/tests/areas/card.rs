@@ -814,11 +814,15 @@ fn a_missing_webhook_secret_is_mailed_once_and_keeps_the_delivery() {
         sent.contains("Subject: kyriakon: control: drain failed"),
         "{sent}"
     );
-    assert!(sent.contains("config stripe-secret"), "{sent}");
     assert_eq!(
-        sent.matches("Subject:").count(),
+        sent.matches("config stripe-secret").count(),
         1,
         "a second pass mailed the same failure: {sent}"
+    );
+    assert_eq!(
+        sent.matches("card deliveries remain unapplied").count(),
+        1,
+        "the surviving queue was not surfaced once: {sent}"
     );
     assert!(
         fix.webhooks()
@@ -1087,4 +1091,44 @@ fn an_invoice_below_the_price_extends_nothing() {
         sent.contains("no year was added"),
         "the alert does not say nothing was extended: {sent}"
     );
+}
+
+/// #902: a payment that arrived before the grace-date pass is applied before
+/// the sweep deletes the account, so the member who paid is not erased.
+#[test]
+fn a_payment_on_the_grace_date_is_applied_before_the_sweep_deletes() {
+    let fix = Fix::new("card-grace-order");
+    fix.card_account("secretary", Some("2026-01-01"));
+    fix.amend_account("secretary", |account| {
+        account["state"] = json!("lapsed");
+        account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(0));
+        account["payment"]["window"]["state"] = json!("closed");
+    });
+    fix.webhook("evt_grace_paid", "invoice.paid", invoice("in_grace_paid"));
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(
+        fix.dir.join("store/accounts/secretary").exists(),
+        "the account was deleted before its queued payment was applied"
+    );
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("active"), "{account}");
+    assert!(account["grace_until"].is_null(), "{account}");
+    assert!(
+        paid_until(&fix, "secretary").is_some(),
+        "the queued payment did not credit the account: {account}"
+    );
+    assert!(
+        fix.read("webhooks/processed.jsonl")
+            .contains("evt_grace_paid"),
+        "the payment was not settled"
+    );
+    assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
 }
