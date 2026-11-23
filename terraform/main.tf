@@ -1,22 +1,11 @@
 # The provisioning image is pinned by numeric ID, never by a label selector: a
 # label is mutable, so anyone holding HCLOUD_TOKEN could give a snapshot of the
 # live box the provisioning label and have the next create boot it, disk and
-# all. The ID is reviewed in a diff instead, and the check below makes a
-# mismatched pair fail visibly at plan time.
+# all. The ID and its description are recorded in the pinned-image table in
+# docs/runbook.md, which is the review surface, and the preconditions on the
+# server below refuse a plan whose pair disagrees.
 data "hcloud_image" "openbsd" {
   id = var.image_id
-}
-
-check "provisioning_image" {
-  assert {
-    condition     = data.hcloud_image.openbsd.description == var.image_description
-    error_message = "Image ${var.image_id} is described \"${data.hcloud_image.openbsd.description}\", not \"${var.image_description}\". Set both variables from `hcloud image list` and record them together in docs/runbook.md."
-  }
-
-  assert {
-    condition     = data.hcloud_image.openbsd.architecture == "x86"
-    error_message = "Image ${var.image_id} is ${data.hcloud_image.openbsd.architecture}, not x86; the server types this stack uses are x86."
-  }
 }
 
 resource "hcloud_server" "mail" {
@@ -39,6 +28,23 @@ resource "hcloud_server" "mail" {
     # the box off at the softraid passphrase prompt. A resize is a hand step in
     # the Hetzner console (docs/runbook.md, "How much the box carries"), and
     # `terraform plan` should show no diff after one.
+    #
+    # Preconditions, not a `check` block: a check assertion only warns and the
+    # plan still exits 0, while these fail it. They are evaluated on every plan
+    # that includes this resource, not only when it is being replaced, because
+    # they defend the image a state-loss rebuild would boot more than they
+    # defend a diff. The second guards an ID that resolves somewhere
+    # unintended, retyped, reused, or a live-box snapshot.
+    precondition {
+      condition     = data.hcloud_image.openbsd.description == var.image_description
+      error_message = "Image ${var.image_id} is described \"${data.hcloud_image.openbsd.description}\", not \"${var.image_description}\". Set both variables from `hcloud image list` and record them together in docs/runbook.md."
+    }
+
+    precondition {
+      condition     = data.hcloud_image.openbsd.architecture == "x86"
+      error_message = "Image ${var.image_id} is ${data.hcloud_image.openbsd.architecture}, not x86; the server types this stack uses are x86."
+    }
+
     ignore_changes = [image, server_type]
 
     # Terraform is refused the chance to plan this server's removal at all, replacement

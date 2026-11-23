@@ -92,9 +92,9 @@ build the new image on a throwaway box, as the runbook's "Rebuild the gold
 image" procedure does - never snapshot the live mail box: its root disk holds
 member mail and the DKIM key, and the pinned image is the source of every
 future box. A re-snapshot is a new ID, so Terraform picks it up only when
-`image_id` and `image_description` are updated together; the plan check refuses
-the pair when they disagree. Never reprovision from a stale image, or a rebuilt
-box boots vulnerable rspamd (section 6.10).
+`image_id` and `image_description` are updated together; a precondition on the
+server refuses the plan when they disagree. Never reprovision from a stale
+image, or a rebuilt box boots vulnerable rspamd (section 6.10).
 
 ## Variables
 

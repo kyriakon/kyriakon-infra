@@ -4,7 +4,8 @@
 server_name = "example.invalid"
 
 # The reviewed provisioning image, from `hcloud image list`. The two values are
-# recorded together in docs/runbook.md and the plan fails when they disagree, so
-# the placeholders below cannot quietly boot the wrong disk.
+# recorded together in docs/runbook.md, and a precondition on the server fails
+# the plan when they disagree, so the placeholders below cannot quietly boot the
+# wrong disk.
 image_id          = 0
 image_description = "REPLACE_ME"

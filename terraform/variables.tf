@@ -21,6 +21,6 @@ variable "image_id" {
 }
 
 variable "image_description" {
-  description = "Description of the image named by image_id, as set at `create-image` time. The plan check in main.tf compares it with the description the ID resolves to, so a mistyped or stale ID shows up during plan rather than at first boot."
+  description = "Description of the image named by image_id, as set at `create-image` time. The server precondition in main.tf compares it with the description the ID resolves to, so a mistyped or stale ID fails the plan rather than first boot."
   type        = string
 }
