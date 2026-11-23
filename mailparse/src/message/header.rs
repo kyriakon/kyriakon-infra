@@ -22,11 +22,6 @@ impl<'a> Line<'a> {
     pub fn end(&self) -> usize {
         self.start + self.text.len()
     }
-
-    /// The line ending as the message wrote it: `\n`, `\r\n`, or `\r`.
-    pub fn ending<'b>(&self, block: &'b [u8]) -> &'b [u8] {
-        &block[self.end()..self.next]
-    }
 }
 
 /// The lines of `block` under the strict line-ending rule.

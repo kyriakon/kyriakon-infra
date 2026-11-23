@@ -27,7 +27,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kyriakon_mailparse::{boundary_param, headers, split_message};
+use kyriakon_mailparse::{boundary_param, headers, split_message, walk_multipart, Part};
 
 /// On-box keyring location - sync of the git-tracked published key set.
 pub const DEFAULT_KEYRING: &str = "/etc/kyriakon/keys";
@@ -250,7 +250,19 @@ fn envelope_ciphertext(input: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let boundary = boundary_param(value).filter(|boundary| !boundary.is_empty())?;
-    let (version, ciphertext) = two_parts(message.body, &boundary)?;
+    let multipart = walk_multipart(message.body, &boundary).ok()?;
+    // The builder ends at the closing delimiter. An epilogue is readable text
+    // the store would keep in the clear, so it is not this wrapper's shape.
+    if multipart
+        .epilogue
+        .iter()
+        .any(|byte| !matches!(byte, b'\n' | b'\r'))
+    {
+        return None;
+    }
+    let [version, ciphertext] = multipart.parts.as_slice() else {
+        return None;
+    };
     if !is_version_part(version) {
         return None;
     }
@@ -267,86 +279,33 @@ fn media_type(value: &[u8]) -> Option<String> {
     Some(value[..end].to_ascii_lowercase())
 }
 
-/// The two parts of a multipart body that starts at the opening delimiter and
-/// ends at the closing one, with nothing after it. Anything before the opening
-/// delimiter is the RFC 3156 preamble, which is a readable notice rather than
-/// message content and is discarded by the rebuild.
-fn two_parts<'a>(body: &'a [u8], boundary: &str) -> Option<(&'a [u8], &'a [u8])> {
-    let delim = format!("--{boundary}");
-    let close = format!("--{boundary}--");
-    let (delim, close) = (delim.as_bytes(), close.as_bytes());
-
-    let mut pos = 0;
-    loop {
-        let (line, next) = next_line(body, pos)?;
-        if line == close {
-            return None;
-        }
-        if line == delim {
-            pos = next;
-            break;
-        }
-        pos = next;
-    }
-    let first_start = pos;
-    let mut first_end = None;
-    let mut second_start = 0;
-    let mut parts = 0;
-    while let Some((line, next)) = next_line(body, pos) {
-        if line == delim {
-            parts += 1;
-            if parts > 1 {
-                return None; // a third part
-            }
-            first_end = Some(pos);
-            second_start = next;
-        } else if line == close {
-            parts += 1;
-            if parts != 2 {
-                return None;
-            }
-            if body[next..].iter().any(|b| !matches!(b, b'\n' | b'\r')) {
-                return None;
-            }
-            return Some((&body[first_start..first_end?], &body[second_start..pos]));
-        }
-        pos = next;
-    }
-    None
-}
-
 /// Whether a part is the RFC 3156 version part: `application/pgp-encrypted`
 /// with exactly `Version: 1` as its body.
-fn is_version_part(part: &[u8]) -> bool {
-    let Ok(message) = split_message(part) else {
-        return false;
-    };
-    if message.separator.is_empty() {
+fn is_version_part(part: &Part<'_>) -> bool {
+    if part.separator.is_empty() {
         return false;
     }
-    let Some(header) = headers(message.headers)
+    let Some(header) = headers(part.headers)
         .into_iter()
         .find(|header| header.is("content-type"))
     else {
         return false;
     };
-    let Some(media_type) = media_type(header.value(message.headers)) else {
+    let Some(media_type) = media_type(header.value(part.headers)) else {
         return false;
     };
-    media_type == "application/pgp-encrypted" && message.body.trim_ascii_end() == b"Version: 1"
+    media_type == "application/pgp-encrypted" && part.body.trim_ascii_end() == b"Version: 1"
 }
 
-/// The body of a MIME part whose Content-Type is `application/octet-stream`.
-fn part_body(part: &[u8]) -> Option<&[u8]> {
-    let message = split_message(part).ok()?;
-    if message.separator.is_empty() {
-        return None;
-    }
-    let header = headers(message.headers)
+/// The bytes of a MIME part whose Content-Type is `application/octet-stream`,
+/// including the line ending before the closing delimiter. The armour ends with
+/// that newline, and gpg will not parse an armour that lacks it.
+fn part_body<'a>(part: &Part<'a>) -> Option<&'a [u8]> {
+    let header = headers(part.headers)
         .into_iter()
         .find(|header| header.is("content-type"))?;
-    (media_type(header.value(message.headers))?.as_str() == "application/octet-stream")
-        .then_some(message.body)
+    (media_type(header.value(part.headers))?.as_str() == "application/octet-stream")
+        .then_some(part.body_with_ending)
 }
 
 /// The bare ASCII-armoured PGP message in a MIME part body, when the body is

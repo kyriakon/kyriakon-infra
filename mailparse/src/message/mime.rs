@@ -5,7 +5,7 @@
 //! `bchars`. The walk therefore cannot be moved by text inside a part that
 //! merely mentions a boundary or a Content-Type.
 
-use crate::header::{lines, lines_from, split_message};
+use super::header::{lines, lines_from, split_message};
 use crate::Malformed;
 
 /// One body part: its header block, the empty line that ends it, and its body.
@@ -13,7 +13,18 @@ use crate::Malformed;
 pub struct Part<'a> {
     pub headers: &'a [u8],
     pub separator: &'a [u8],
+    /// The part body without the line ending that introduces the delimiter.
     pub body: &'a [u8],
+    /// The body and that line ending, for a caller that must keep the bytes it
+    /// was given, such as an armoured message that needs its final newline.
+    pub body_with_ending: &'a [u8],
+}
+
+/// The parts of a multipart body and the epilogue after the closing delimiter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Multipart<'a> {
+    pub parts: Vec<Part<'a>>,
+    pub epilogue: &'a [u8],
 }
 
 /// Walk a multipart body with `boundary`.
@@ -21,8 +32,10 @@ pub struct Part<'a> {
 /// The preamble before the opening delimiter and the epilogue after the closing
 /// one are ignored, as RFC 2046 says. Each part's body ends at its delimiter
 /// line, with the line ending that introduces the delimiter excluded, so a part
-/// body does not carry the separator that belongs to the boundary.
-pub fn walk_multipart<'a>(body: &'a [u8], boundary: &str) -> Result<Vec<Part<'a>>, Malformed> {
+/// body does not carry the separator that belongs to the boundary. The
+/// epilogue is returned because a caller that rebuilds a wrapper must decide
+/// whether trailing bytes are allowed.
+pub fn walk_multipart<'a>(body: &'a [u8], boundary: &str) -> Result<Multipart<'a>, Malformed> {
     if !valid_boundary(boundary) {
         return Err(Malformed::new("not an RFC 2046 boundary"));
     }
@@ -56,13 +69,18 @@ pub fn walk_multipart<'a>(body: &'a [u8], boundary: &str) -> Result<Vec<Part<'a>
         }
         let end = part_end(body, part_start, line.start)?;
         let message = split_message(&body[part_start..end])?;
+        let body_start = part_start + message.headers.len() + message.separator.len();
         parts.push(Part {
             headers: message.headers,
             separator: message.separator,
             body: message.body,
+            body_with_ending: &body[body_start..line.start],
         });
         if closes {
-            return Ok(parts);
+            return Ok(Multipart {
+                parts,
+                epilogue: &body[line.next..],
+            });
         }
         part_start = line.next;
     }
@@ -76,30 +94,37 @@ pub fn walk_multipart<'a>(body: &'a [u8], boundary: &str) -> Result<Vec<Part<'a>
 pub fn boundary_param(value: &[u8]) -> Option<String> {
     let mut pos = 0;
     while pos < value.len() {
+        // A comment is CFWS, so a `;` inside one is text, not a separator.
         while pos < value.len() && value[pos] != b';' {
-            pos += 1;
+            if value[pos] == b'(' {
+                if !skip_comment(&mut pos, value) {
+                    return None;
+                }
+            } else {
+                pos += 1;
+            }
         }
         if pos >= value.len() {
             return None;
         }
         pos += 1;
-        while pos < value.len() && is_wsp(value[pos]) {
-            pos += 1;
+        if !skip_cfws(&mut pos, value) {
+            return None;
         }
         let name_start = pos;
         while pos < value.len() && is_token(value[pos]) {
             pos += 1;
         }
         let name = &value[name_start..pos];
-        while pos < value.len() && is_wsp(value[pos]) {
-            pos += 1;
+        if !skip_cfws(&mut pos, value) {
+            return None;
         }
         if pos >= value.len() || value[pos] != b'=' {
             continue;
         }
         pos += 1;
-        while pos < value.len() && is_wsp(value[pos]) {
-            pos += 1;
+        if !skip_cfws(&mut pos, value) {
+            return None;
         }
         let param = if pos < value.len() && value[pos] == b'"' {
             quoted(&mut pos, value)
@@ -115,6 +140,44 @@ pub fn boundary_param(value: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+fn skip_cfws(pos: &mut usize, value: &[u8]) -> bool {
+    loop {
+        while *pos < value.len() && is_wsp(value[*pos]) {
+            *pos += 1;
+        }
+        if value.get(*pos) != Some(&b'(') {
+            return true;
+        }
+        if !skip_comment(pos, value) {
+            return false;
+        }
+    }
+}
+
+/// Skip one comment at `pos`, nested and with backslash quoted-pairs. Returns
+/// false when it never closes.
+fn skip_comment(pos: &mut usize, value: &[u8]) -> bool {
+    let mut depth = 0usize;
+    while *pos < value.len() {
+        match value[*pos] {
+            b'\\' => *pos += 2,
+            b'(' => {
+                depth += 1;
+                *pos += 1;
+            }
+            b')' => {
+                depth -= 1;
+                *pos += 1;
+                if depth == 0 {
+                    return true;
+                }
+            }
+            _ => *pos += 1,
+        }
+    }
+    false
 }
 
 /// The body of the part that starts at `start`, ending before the line ending
@@ -216,6 +279,7 @@ fn quoted(pos: &mut usize, value: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::header::headers;
 
     const REPORT: &[u8] = b"Content-Type: multipart/report; report-type=delivery-status;\r\n\
         \tboundary=\"b1\"\r\n\
@@ -227,9 +291,12 @@ mod tests {
         --b1 is not a boundary here\r\n\
         Content-Type: message/delivery-status\r\n\
         \r\n\
-        Action: delivered\r\n\
+        Action: failed\r\n\
+        Status: 5.1.1\r\n\
         --b1\r\n\
         Content-Type: message/delivery-status\r\n\
+        \r\n\
+        Reporting-MTA: dns; mail.example\r\n\
         \r\n\
         Action: failed\r\n\
         Status: 5.1.1\r\n\
@@ -238,35 +305,46 @@ mod tests {
 
     #[test]
     fn a_boundary_shaped_line_inside_text_plain_is_not_a_part() {
-        let parts = walk_multipart(REPORT, "b1").expect("walks");
-        assert_eq!(parts.len(), 2);
-        let first = String::from_utf8_lossy(parts[0].body);
+        let multipart = walk_multipart(REPORT, "b1").expect("walks");
+        assert_eq!(multipart.parts.len(), 2);
+        let first = String::from_utf8_lossy(multipart.parts[0].body);
+        // The #908 shape: a whole DSN header block and a permanent failure are
+        // inside the text part, and the walk must not promote them to a part.
         assert!(
             first.contains("Content-Type: message/delivery-status"),
             "{first}"
         );
-        assert!(first.contains("Action: delivered"), "{first}");
-        let second = String::from_utf8_lossy(parts[1].body);
-        assert!(second.contains("Status: 5.1.1"), "{second}");
-        assert!(!second.contains("Action: delivered"), "{second}");
+        assert!(first.contains("Action: failed"), "{first}");
+        assert!(first.contains("Status: 5.1.1"), "{first}");
+        let second = String::from_utf8_lossy(multipart.parts[1].body);
+        assert!(
+            second.contains("Reporting-MTA: dns; mail.example"),
+            "{second}"
+        );
+        assert!(!second.contains("is not a boundary here"), "{second}");
+        assert_eq!(multipart.epilogue, b"epilogue\r\n");
     }
 
     #[test]
     fn a_boundary_prefix_is_not_the_boundary() {
         let body = b"--b1\r\nContent-Type: text/plain\r\n\r\n--b1x\r\n--b1-not\r\n--b1--\r\n";
-        let parts = walk_multipart(body, "b1").expect("walks");
-        assert_eq!(parts.len(), 1);
+        let multipart = walk_multipart(body, "b1").expect("walks");
+        assert_eq!(multipart.parts.len(), 1);
         // The line ending before the closing delimiter belongs to the boundary.
-        assert_eq!(parts[0].body, b"--b1x\r\n--b1-not");
+        assert_eq!(multipart.parts[0].body, b"--b1x\r\n--b1-not");
+        assert_eq!(
+            multipart.parts[0].body_with_ending,
+            b"--b1x\r\n--b1-not\r\n"
+        );
     }
 
     #[test]
     fn transport_padding_and_lf_endings_are_accepted() {
         let body = b"--b1 \nContent-Type: text/plain\n\none\n--b1\t\nContent-Type: text/plain\n\ntwo\n--b1-- \n";
-        let parts = walk_multipart(body, "b1").expect("walks");
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].body, b"one");
-        assert_eq!(parts[1].body, b"two");
+        let multipart = walk_multipart(body, "b1").expect("walks");
+        assert_eq!(multipart.parts.len(), 2);
+        assert_eq!(multipart.parts[0].body, b"one");
+        assert_eq!(multipart.parts[1].body, b"two");
     }
 
     #[test]
@@ -285,24 +363,17 @@ mod tests {
             --inner--\r\n\
             --outer--\r\n";
         let outer = walk_multipart(body, "outer").expect("walks");
-        assert_eq!(outer.len(), 1);
-        let value = outer[0]
-            .headers
-            .split(|byte| *byte == b'\n')
-            .next()
-            .expect("a header line");
-        assert!(
-            value
-                .windows(b"Content-Type".len())
-                .any(|window| window.eq_ignore_ascii_case(b"Content-Type")),
-            "{}",
-            String::from_utf8_lossy(value)
-        );
-        let boundary = boundary_param(value).expect("boundary");
+        assert_eq!(outer.parts.len(), 1);
+        let part = outer.parts[0];
+        let header = headers(part.headers)
+            .into_iter()
+            .find(|header| header.is("content-type"))
+            .expect("a Content-Type header");
+        let boundary = boundary_param(header.value(part.headers)).expect("boundary");
         assert_eq!(boundary, "inner");
-        let inner = walk_multipart(outer[0].body, &boundary).expect("walks");
-        assert_eq!(inner.len(), 2);
-        assert_eq!(inner[0].body, b"plain");
+        let inner = walk_multipart(part.body, &boundary).expect("walks");
+        assert_eq!(inner.parts.len(), 2);
+        assert_eq!(inner.parts[0].body, b"plain");
     }
 
     #[test]
@@ -339,6 +410,14 @@ mod tests {
         assert_eq!(
             boundary_param(b"multipart/mixed; BOUNDARY=abc"),
             Some("abc".to_string())
+        );
+        assert_eq!(
+            boundary_param(b"multipart/mixed (; boundary=evil); boundary=real"),
+            Some("real".to_string())
+        );
+        assert_eq!(
+            boundary_param(b"multipart/mixed; (a (nested) comment) boundary=real"),
+            Some("real".to_string())
         );
     }
 }

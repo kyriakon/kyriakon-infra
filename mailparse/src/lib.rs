@@ -6,17 +6,16 @@
 //! they arrived, never after a normalising step that could disagree with the
 //! parser next to it.
 //!
-//! The crate has no dependencies: the encryptor links it without gaining one,
-//! and the control plane depends on it by path rather than through a workspace
-//! lockfile.
+//! The crate has no dependencies: the encryptor links it without gaining one.
+//! The control consumers land with #945, #947, #908 and #919, and the crate
+//! joins the control build when the first of them lands.
 
-mod address;
-mod header;
-mod mime;
+mod message;
 
-pub use address::{parse_address_list, Mailbox};
-pub use header::{headers, lines, split_message, Header, Line, Lines, Message};
-pub use mime::{boundary_param, walk_multipart, Part};
+pub use message::{
+    boundary_param, headers, lines, parse_address_list, split_message, walk_multipart, Header,
+    Line, Lines, Mailbox, Message, Multipart, Part,
+};
 
 use std::fmt;
 

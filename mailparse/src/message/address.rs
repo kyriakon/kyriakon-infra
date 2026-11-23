@@ -20,9 +20,7 @@ pub struct Mailbox {
     /// strings keep their quotes and escapes.
     pub address: String,
     /// The domain after the `@`, lowercased only by the caller's comparison.
-    /// `None` for a bare localpart, which cron and mail(1) write and which the
-    /// local enqueuer accepts.
-    pub domain: Option<String>,
+    pub domain: String,
 }
 
 /// Parse a header value as an RFC 5322 address list.
@@ -171,9 +169,15 @@ impl<'a> Parser<'a> {
         }
         loop {
             while self.skip_atext() {}
-            if !self.eat(b'.') {
+            // A dot continues the atom only when text follows it. A trailing
+            // dot or an empty label is not part of the address, so the parse
+            // stops before it and the leftover makes the header malformed.
+            if self.peek() != Some(b'.')
+                || !self.input.get(self.pos + 1).is_some_and(|b| is_atext(*b))
+            {
                 return true;
             }
+            self.pos += 1;
         }
     }
 
@@ -348,7 +352,7 @@ impl<'a> Parser<'a> {
         }
         Ok(Some(Mailbox {
             address: format!("{local}@{domain}"),
-            domain: Some(domain),
+            domain,
         }))
     }
 
@@ -420,25 +424,6 @@ impl<'a> Parser<'a> {
         Ok(None)
     }
 
-    fn skip_bare_local(&mut self) -> Result<Option<Mailbox>, Malformed> {
-        let start = self.pos;
-        // A bare localpart is a dot-atom, as cron writes `root`. A quoted string
-        // with no `@` is a display name, not a mailbox, and must not pass as one.
-        if !self.skip_dot_atom()? {
-            self.pos = start;
-            return Ok(None);
-        }
-        let address = normalize(&self.input[start..self.pos]);
-        if address.is_empty() {
-            self.pos = start;
-            return Ok(None);
-        }
-        Ok(Some(Mailbox {
-            address,
-            domain: None,
-        }))
-    }
-
     fn mailbox(&mut self) -> Result<Mailbox, Malformed> {
         let start = self.pos;
         if let Some(mailbox) = self.skip_name_addr()? {
@@ -446,10 +431,6 @@ impl<'a> Parser<'a> {
         }
         self.pos = start;
         if let Some(mailbox) = self.skip_addr_spec()? {
-            return Ok(mailbox);
-        }
-        self.pos = start;
-        if let Some(mailbox) = self.skip_bare_local()? {
             return Ok(mailbox);
         }
         self.pos = start;
@@ -553,7 +534,7 @@ mod tests {
                 .expect("parses");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].address, "alice@example.invalid");
-        assert_eq!(parsed[0].domain.as_deref(), Some("example.invalid"));
+        assert_eq!(parsed[0].domain, "example.invalid");
     }
 
     #[test]
@@ -652,14 +633,6 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_localpart_is_a_mailbox_with_no_domain() {
-        let parsed = parse_address_list(b"root (Cron Daemon)").expect("parses");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].address, "root");
-        assert_eq!(parsed[0].domain, None);
-    }
-
-    #[test]
     fn a_header_the_grammar_cannot_read_is_refused() {
         for value in [
             b"alice@example.invalid (unterminated".as_slice(),
@@ -668,6 +641,11 @@ mod tests {
             b"Group: alice@example.invalid, bob@example.invalid;",
             b"alice@example.invalid,",
             b"\"a quoted display name\"",
+            b"alice.@example.invalid",
+            b"a..b@example.invalid",
+            b"alice@example.invalid.",
+            b"root (Cron Daemon)",
+            b"root",
         ] {
             assert!(parse_address_list(value).is_err(), "{value:?}");
         }

@@ -30,8 +30,8 @@ fuzz_target!(|data: &[u8]| {
         }
         if header.is("content-type") {
             if let Some(boundary) = boundary_param(value) {
-                if let Ok(parts) = walk_multipart(message.body, &boundary) {
-                    for part in parts {
+                if let Ok(multipart) = walk_multipart(message.body, &boundary) {
+                    for part in multipart.parts {
                         assert!(
                             part.headers.len() + part.separator.len() + part.body.len()
                                 <= message.body.len()

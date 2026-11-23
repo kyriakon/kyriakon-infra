@@ -1041,7 +1041,8 @@ for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/gmid.conf \
 	openbsd/dovecot/dovecot.conf \
 	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf openbsd/etc/nospamd \
 	openbsd/etc/kyriakon.env openbsd/etc/newsyslog.conf \
-	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys scripts/setup-env.sh; do
+	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml mailparse/Cargo.toml \
+	keys scripts/setup-env.sh; do
 	[ -e "$repo_dir/$f" ] || { printf 'missing from repo_dir: %s\n' "$f" >&2; exit 1; }
 done
 
