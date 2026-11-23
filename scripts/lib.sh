@@ -925,6 +925,36 @@ self_test() {
 	check "and the lock is released" \
 		"$([ -d "$tree/concurrent.lock" ] && printf held || printf free)" free
 
+	# manifest_targets_route is the join every deploy that shares a destination
+	# reads. It used to carry a statement at awk top level after a bare rule,
+	# which awk rejects, so it exited 2 and printed nothing; a caller read that
+	# as "no row" and either installed nothing or reported the table as empty.
+	printf 'lib.sh\t/root/bin\t-\t\tmail\t-\tactive\nopenbsd/restore-template/install.conf\t/home/www/kyriakon.net/www\t-\t\tmail\tinstall.conf\tactive\nother.conf\t/home/www/kyriakon.net/www\t-\t\tcontrol\tother.conf\tactive\n' \
+		>"$tree/route-table.tsv"
+	check "the route query returns the mail row" \
+		"$(manifest_targets_route "$tree/route-table.tsv" /home/www/kyriakon.net/www mail)" \
+		"$(printf 'openbsd/restore-template/install.conf\tinstall.conf')"
+	check "and omits the row for another deploy" \
+		"$(manifest_targets_route "$tree/route-table.tsv" /home/www/kyriakon.net/www mail |
+			grep -c '^other\.conf' || true)" 0
+	# A table that cannot be read is a failure, not an empty set.
+	code=0
+	manifest_targets_route "$tree/no-such-table.tsv" /root/bin mail >/dev/null 2>&1 || code=$?
+	check "a missing table is an error, not an empty set" "$code" 1
+	# So is an awk that cannot run. The query's output is empty either way, and
+	# only the exit status tells the caller which happened.
+	mkdir "$tree/broken-bin"
+	printf '#!/bin/sh\nexit 2\n' >"$tree/broken-bin/awk"
+	chmod 0755 "$tree/broken-bin/awk"
+	old_path=$PATH
+	PATH="$tree/broken-bin:$PATH"
+	code=0
+	manifest_targets_route "$tree/route-table.tsv" /home/www/kyriakon.net/www mail \
+		>"$tree/broken.out" 2>&1 || code=$?
+	PATH=$old_path
+	check "a query that cannot run is an error" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+
 	self_test_end
 }
 

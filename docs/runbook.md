@@ -33,7 +33,7 @@ The Titan upload listener has a public port of its own because gmid holds 1965 a
 
 Both changes are propose-only. The relayd listener block stays commented in the tracked file, and `pf-apply.sh` only prints the candidate diff until an operator runs it without `--check`. No agent runs the firewall step or turns the relay on. A run with no `TITAN_PORT`, or with the matching rule already present, changes nothing.
 
-Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box without changing anything. It reports permission drift against mtree, the blocklist verdict for the box's address, whether a cron job can still reach the tools it needs, whether the finger service is intact, whether the deployed catalogue matches the tracked one, whether the terraform guard and the restore snapshot are still in place, and whether the two files naming the mail domains agree. It exits non-zero when something is wrong.
+Run `doas ksh scripts/check-hygiene.sh` when you want the state of the box without changing anything. It reports permission drift against mtree, the blocklist verdict for the box's address, whether a cron job can still reach the tools it needs, whether the finger service is intact, whether the deployed catalogue matches the tracked one, whether the terraform guard and the restore snapshot are still in place, whether the restore installer's response file served from the site matches the tracked one, and whether the two files naming the mail domains agree. It exits non-zero when something is wrong.
 
 ## Test on the OpenBSD VM
 
@@ -804,6 +804,8 @@ The first form creates a throwaway box from the snapshot labelled `kind=restore`
 The test already runs these checks, in this order: the newest snapshot is less than 30 hours old, which catches a backup that silently stopped; `restic check` for repository structure and pack integrity; a full restore; the canary byte-identical, which catches a backup that stopped including `/home`; that `/etc/mail/dkim/private.rsa.key` and `/etc/mail/smtpd.conf` are in the snapshot while `/root/.kyriakon-env` and `/root/.restic-pass` are not; that the control store, the keyring, the account database, the generated daemon directories and the certificate queue restored; that every restored Maildir message is PGP ciphertext; `git fsck` on every restored repository; and that the restored node count matches the snapshot's. It pings its Healthchecks check on success and its failure URL on error, so a run that never happens alerts on its own.
 
 To prove a restored copy becomes a working mail server, rather than merely restoring, run the rehearsal on a throwaway box provisioned from the template.
+
+The restore template's installer fetches its response file over HTTPS from the landing site's document root, because the VNC console takes a URL and the file has to be reachable before the new box exists. `scripts/deploy-mail.sh` installs it from `openbsd/restore-template/install.conf` through its row in `scripts/install-set.tsv`, and `doas ksh scripts/check-hygiene.sh` compares the served copy with the tracked one. Run that check before building or refreshing the `kind=restore` snapshot. The bytes at that URL set root access and disk encryption for every restore.
 
 1. Restore the latest snapshot into the box's real paths. `doas` resets the environment, so the credentials go through `doas env`.
 

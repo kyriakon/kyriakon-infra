@@ -76,6 +76,17 @@ retired_copies() {
 	manifest_retired_names "$install_set" "$1"
 }
 
+# docroot_targets: the manifest rows for the landing site's document root, one
+# "source<TAB>installed-name" per line. An empty set is refused rather than
+# installed as nothing: the restore installer fetches install.conf from this
+# tree, and a deploy that skips it leaves the URL 404ing.
+docroot_targets() {
+	typeset targets
+	targets=$(manifest_targets_route "$install_set" /home/www/kyriakon.net/www mail) || return 1
+	[ -n "$targets" ] || return 1
+	printf '%s\n' "$targets"
+}
+
 start_service() {
 	rcctl enable "$1"
 	if rcctl check "$1" >/dev/null 2>&1; then
@@ -1021,9 +1032,41 @@ EOF
 		kyriakon-authcheck
 	# The login checker and the modules it sources are the control deploy's, so
 	# this deploy must not install them just because they share its directory.
+	# The query runs before the count: `grep -c` returns 0 for both "no match"
+	# and "the join failed", so a masked query would pass this check while the
+	# deploy could not read the table at all.
+	mail_libexec=$(manifest_targets_route "$install_set" /usr/local/libexec mail) \
+		|| mail_libexec=''
+	check "the mail libexec rows were read" \
+		"$([ -n "$mail_libexec" ] && printf yes || printf no)" yes
 	check "the mail libexec set excludes the control rows" \
-		"$(manifest_targets_route "$install_set" /usr/local/libexec mail |
-			grep -cE '^(kyriakon-authcheck\.sh|lib\.sh|lib/)' || true)" 0
+		"$(printf '%s\n' "$mail_libexec" |
+			awk '/^(kyriakon-authcheck\.sh|lib\.sh|lib\/)/ { n++ } END { print n + 0 }')" 0
+	# The restore response file is served from the landing site's document root,
+	# and the installer fetches it by that name. The row's source is a repo path,
+	# so the installed name has to be given rather than defaulted, or the file
+	# lands under openbsd/restore-template/ in the doc root and the URL 404s.
+	check "the restore response file keeps the name the installer fetches" \
+		"$(manifest_installed_name "$install_set" openbsd/restore-template/install.conf \
+			/home/www/kyriakon.net/www)" install.conf
+	check "the restore response file is the mail deploy's" \
+		"$(manifest_routes "$install_set" openbsd/restore-template/install.conf)" mail
+	check "the document root query returns that row" \
+		"$(docroot_targets)" \
+		"$(printf 'openbsd/restore-template/install.conf\tinstall.conf')"
+	# A table with no matching row, or one that cannot be read, must fail the
+	# deploy rather than install nothing and call it success.
+	printf 'other.conf\t/home/www/kyriakon.net/www\t-\t\tcontrol\tother.conf\tactive\n' \
+		>"$tree/no-docroot.tsv"
+	install_set="$tree/no-docroot.tsv"
+	code=0
+	docroot_targets >/dev/null 2>&1 || code=$?
+	check "an empty document-root set is refused" "$code" 1
+	install_set="$tree/no-such.tsv"
+	code=0
+	docroot_targets >/dev/null 2>&1 || code=$?
+	check "a table that cannot be read is refused" "$code" 1
+	install_set="$script_dir/install-set.tsv"
 
 	self_test_end
 }
@@ -1176,6 +1219,20 @@ for host in kyriakon.net oliver.kyriakon.net kleio.kyriakon.net press.kyriakon.n
 	install -d -m 0755 "/home/www/$host/www" "/home/www/$host/gemini"
 done
 install -d -m 0755 /home/www/signup.kyriakon.net/www
+# The restore installer's response file, fetched over HTTPS at the VNC console
+# (terraform/README.md). httpd serves the doc root directly, so these bytes are
+# the root key, password policy and disk-encryption answer every template built
+# from this box trusts. The manifest row says this deploy installs it, and
+# check-hygiene.sh compares the installed copy with the tracked one; the source
+# is outside scripts/, so the row names its repo path.
+restore_conf_targets=$(docroot_targets) \
+	|| { printf 'no %s row names a file for /home/www/kyriakon.net/www, or the table cannot be read; the restore installer fetches install.conf there\n' "$install_set" >&2; exit 1; }
+while IFS="$(printf '\t')" read -r s installed; do
+	install_staged "$repo_dir/$s" "/home/www/kyriakon.net/www/$installed" -m 0644 -o root -g wheel
+done <<EOF
+$restore_conf_targets
+EOF
+printf 'restore response file installed in /home/www/kyriakon.net/www\n'
 # The vhosts serve from /home/www now, and the directories above are created
 # empty. If the old tree is still there, its content has not moved, and saying so
 # here is cheaper than debugging a site that returns 404 with every service up.

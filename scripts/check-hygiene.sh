@@ -58,8 +58,8 @@
 # the daily mail already covers the permissions half.
 #
 #   ksh scripts/check-hygiene.sh --self-test   the checks that run on fixtures:
-#                                              sections 1, 4, 6, 7, 8, 9 and 10,
-#                                              and section 3's remedy lines
+#                                              sections 1, 4, 6, 7, 8, 9, 10 and
+#                                              12, and section 3's remedy lines
 
 set -euo pipefail
 
@@ -101,6 +101,22 @@ domains_missing_from() {
 		[ -n "$line" ] || continue
 		grep -qxF "@$line" "$allowed" || printf '%s\n' "$line"
 	done < "$list"
+}
+
+# served_copy_problem <tracked> <served>
+#
+# One line when the document root's copy is missing or differs from the tracked
+# one, and nothing when the bytes agree. httpd serves the doc-root file directly,
+# so this is the bytes the restore installer fetches at the VNC console: they
+# decide root access and disk encryption for every image built from the template.
+served_copy_problem() {
+	typeset tracked="$1" served="$2"
+	if [ ! -f "$served" ]; then
+		printf '%s: not installed, and the installer fetches it from the web\n' "$served"
+		return 0
+	fi
+	cmp -s "$served" "$tracked" \
+		|| printf '%s differs from %s\n' "$served" "$tracked"
 }
 
 # tool_remedy <tool>... — one line of remedy per tool cron could not find.
@@ -701,6 +717,29 @@ EOF
 	*) printf 'FAIL: a missing installed table is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
 	esac
 
+	# The restore response file served from the doc root: the installer trusts
+	# these bytes, so a matching copy passes and a missing or stale one is a
+	# finding.
+	printf 'same\n' > "$dir/tracked-install.conf"
+	printf 'same\n' > "$dir/served-install.conf"
+	out=$(served_copy_problem "$dir/tracked-install.conf" "$dir/served-install.conf")
+	[ -z "$out" ] || {
+		printf 'FAIL: matching served bytes are not a finding; got [%s]\n' "$out" >&2
+		exit 1
+	}
+	printf 'old\n' > "$dir/served-install.conf"
+	out=$(served_copy_problem "$dir/tracked-install.conf" "$dir/served-install.conf")
+	case "$out" in
+	*"$dir/served-install.conf differs"*) ;;
+	*) printf 'FAIL: a stale served copy is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+	rm "$dir/served-install.conf"
+	out=$(served_copy_problem "$dir/tracked-install.conf" "$dir/served-install.conf")
+	case "$out" in
+	*"not installed"*) ;;
+	*) printf 'FAIL: a missing served copy is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+
 	# The member session shell and the renamed login checker are the
 	# /usr/local/libexec rows; a stale copy is a finding for the same reason
 	# /root/bin's is, and the installed name comes from the row.
@@ -1275,6 +1314,46 @@ if [ -n "$stale_vhosts" ]; then
 	status=1
 else
 	printf 'generated vhosts: every one hands its paths to the responder\n'
+fi
+
+# --- 12. the restore response file the installer fetches -------------------
+# The installer at the VNC console fetches https://kyriakon.net/install.conf,
+# and httpd serves it straight from the landing site's document root. The bytes
+# decide the root key, the password policy and disk encryption for every image
+# built from the template, so a copy that differs from the tracked one is a
+# second, unreviewed answer to those questions. deploy-mail.sh installs it from
+# the row in install-set.tsv; this reads the same row, so a renamed source or
+# served name moves both, and compares what is served with what is tracked.
+hygiene_install_set="$repo_dir/scripts/install-set.tsv"
+install_conf_rows=''
+install_conf_rows=$(manifest_targets_route "$hygiene_install_set" /home/www/kyriakon.net/www mail) \
+	|| install_conf_rows=''
+install_conf_count=$(printf '%s' "$install_conf_rows" | grep -c . || true)
+if [ "$install_conf_count" -ne 1 ]; then
+	printf 'restore response file: %s names %s row(s) for /home/www/kyriakon.net/www, so the served copy was not checked\n' \
+		"$hygiene_install_set" "$install_conf_count"
+	printf '  the manifest should name exactly the file the installer fetches\n'
+	status=1
+else
+	IFS="$(printf '\t')" read -r install_conf_source install_conf_name <<EOF
+$install_conf_rows
+EOF
+	tracked_install_conf="$repo_dir/$install_conf_source"
+	served_install_conf="/home/www/kyriakon.net/www/$install_conf_name"
+	if [ ! -f "$tracked_install_conf" ]; then
+		printf 'restore response file: %s is missing from the checkout, so the served copy was not compared\n' \
+			"$tracked_install_conf"
+		status=1
+	else
+		install_conf_problem=$(served_copy_problem "$tracked_install_conf" "$served_install_conf")
+		if [ -n "$install_conf_problem" ]; then
+			printf 'restore response file: %s\n' "$install_conf_problem"
+			printf '  scripts/deploy-mail.sh installs it from the manifest row; rerun it from this checkout\n'
+			status=1
+		else
+			printf 'restore response file: the served copy matches the tracked one\n'
+		fi
+	fi
 fi
 
 exit "$status"
