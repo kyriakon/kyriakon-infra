@@ -67,6 +67,13 @@ one, from the session's own terminal rather than from a flag, so a session with 
 terminal and a screen reader both get the plain one.
 _Avoid_: terminal wizard (the ksh program it replaced, gone from the repository in #373)
 
+**Line-ending rule**:
+The rule the shared message parsers use: a line ends at LF, CRLF, or a bare CR.
+A bare CR is a real line end, so the header split, the header spans, and the
+multipart walk cannot disagree about where the body starts. It lives in
+`mailparse/`, and the encryptor reads every message through it.
+_Avoid_: LF-only split, normalise then parse
+
 ## Conventions that have already bitten
 
 **The shell is pdksh.** Every script here runs under the box's `/bin/ksh`, which is

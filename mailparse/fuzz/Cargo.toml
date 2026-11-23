@@ -1,0 +1,29 @@
+# The shared message parsers under libFuzzer. Not part of any service build:
+# `cargo-fuzz` builds this on nightly, which is why it is a crate of its own.
+#
+#   cargo +nightly fuzz run mailparse
+#
+# Seeds are committed in `corpus/mailparse/`; a crash lands in
+# `artifacts/mailparse/` and is turned into a test in `../src/`. See
+# docs/runbook.md, "Fuzz the parsers".
+[package]
+name = "kyriakon-mailparse-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.kyriakon-mailparse]
+path = ".."
+
+[[bin]]
+name = "mailparse"
+path = "fuzz_targets/mailparse.rs"
+test = false
+doc = false
+bench = false
