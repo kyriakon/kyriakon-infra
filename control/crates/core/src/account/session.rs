@@ -43,7 +43,7 @@ pub const TTL_HOURS: i64 = 12;
 pub const AUTHCHECK: &str = "/usr/local/libexec/kyriakon-authcheck";
 
 /// The `doas` the box installs.
-const DOAS: &str = "/usr/bin/doas";
+pub const DOAS: &str = "/usr/bin/doas";
 
 /// The command that verifies a mail password: `doas` in production, and the
 /// checker directly in a test, where a root rule cannot exist.

@@ -44,7 +44,7 @@ use std::process::ExitCode;
 use kyriakon_control_core::{config, flow::catalogue, flow::questions, flow::validate, ipc};
 use kyriakon_control_tui as tui;
 use kyriakon_control_tui::Error;
-use kyriakon_control_tui::{Departure, Filing, Input, Key, Mode, Word};
+use kyriakon_control_tui::{sandbox, Departure, Filing, Input, Key, Mode, Word};
 
 /// The handler's own configuration, read for the one value the portal needs from
 /// it: the path the catalogue is installed at. Named here rather than derived, the
@@ -116,6 +116,19 @@ fn run() -> Result<Departure, Error> {
         &std::fs::read_to_string(&cfg.reserved)
             .map_err(|e| Error::context(format!("cannot read {}", cfg.reserved), e))?,
     );
+    // The session directory is created while the view is still whole: the
+    // deploy makes the live one, and a run whose `--state` names a new directory
+    // must not fail because the veil cannot create it.
+    std::fs::create_dir_all(&state).map_err(|e| {
+        Error::context(
+            format!("cannot create the state directory {}", state.display()),
+            e,
+        )
+    })?;
+    // The mode is decided before the view narrows, because the full screen needs
+    // the `tty` promise and the plain one does not.
+    let mode = forced.unwrap_or_else(chosen);
+    sandbox::restrict(&cfg, &state, mode != Mode::Plain).map_err(Error::Failed)?;
 
     // The session's member, where the key it presented names one: [#381] asks the
     // handler which account a key fingerprint belongs to and passes the answer
@@ -147,7 +160,6 @@ fn run() -> Result<Departure, Error> {
         address: address.map(|a| a.to_string()),
         filed: false,
     };
-    let mode = forced.unwrap_or_else(chosen);
     let mut term = Term::new(mode);
     let mut screen =
         tui::SessionOut::timed(std::io::stdout(), tui::IDLE_TIMEOUT, tui::SESSION_LIFETIME);

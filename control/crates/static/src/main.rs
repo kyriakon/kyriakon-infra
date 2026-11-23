@@ -29,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kyriakon_control_core::fastcgi::{self, Answer, Http, Reply, Request};
 use kyriakon_control_core::util::{self, percent_decode};
 use kyriakon_control_core::Error;
-use kyriakon_control_static::{open, Refusal, Served};
+use kyriakon_control_static::{open, sandbox, Refusal, Served};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
 /// The web tree's index. A directory request serves this and never a listing,
@@ -240,6 +240,22 @@ async fn run() -> Result<(), Error> {
     }
 
     let cfg = Arc::new(Config::load(&cfg_path)?);
+    // Both sockets are bound before the view narrows: bind(2) removes whatever
+    // a previous run left at the path and creates the new socket, and neither
+    // operation is one this process needs again.
+    let httpd_listener =
+        kyriakon_control_core::socket::bind(&cfg.httpd_socket).map_err(|source| Error::Io {
+            what: "listen on",
+            path: Some(cfg.httpd_socket.clone()),
+            source,
+        })?;
+    let gemini_listener =
+        kyriakon_control_core::socket::bind(&cfg.gemini_socket).map_err(|source| Error::Io {
+            what: "listen on",
+            path: Some(cfg.gemini_socket.clone()),
+            source,
+        })?;
+    sandbox::restrict(&cfg.root, &cfg.hosts).map_err(Error::Failed)?;
     util::log(&format!(
         "kyriakon-control-static: httpd {}, gemini {}, root {}",
         cfg.httpd_socket.display(),
@@ -268,7 +284,7 @@ async fn run() -> Result<(), Error> {
         }
     };
     let httpd = async {
-        fastcgi::serve(&cfg.httpd_socket, limits, MAX_BODY, listen(FrontEnd::Httpd))
+        fastcgi::serve_listener(httpd_listener, limits, MAX_BODY, listen(FrontEnd::Httpd))
             .await
             .map_err(|source| Error::Io {
                 what: "serve",
@@ -277,18 +293,13 @@ async fn run() -> Result<(), Error> {
             })
     };
     let gemini = async {
-        fastcgi::serve(
-            &cfg.gemini_socket,
-            limits,
-            MAX_BODY,
-            listen(FrontEnd::Gemini),
-        )
-        .await
-        .map_err(|source| Error::Io {
-            what: "serve",
-            path: Some(cfg.gemini_socket.clone()),
-            source,
-        })
+        fastcgi::serve_listener(gemini_listener, limits, MAX_BODY, listen(FrontEnd::Gemini))
+            .await
+            .map_err(|source| Error::Io {
+                what: "serve",
+                path: Some(cfg.gemini_socket.clone()),
+                source,
+            })
     };
     tokio::try_join!(httpd, gemini).map(|_| ())
 }

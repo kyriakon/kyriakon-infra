@@ -505,9 +505,11 @@ fn list_packets(input: &[u8], gpg_home: &Path) -> Option<Vec<u8>> {
     })
 }
 
-/// Create the gpg scratch dir (0700). Idempotent; run per message because the
-/// save path cannot assume external setup completed.
-fn ensure_gpg_home(gpg_home: &Path) -> Result<(), Error> {
+/// Create the gpg scratch dir (0700). Idempotent. The CLI calls it before
+/// narrowing its view, because `unveil` cannot name a directory that does not
+/// exist; the save path calls it per message because it cannot assume external
+/// setup completed.
+pub fn ensure_gpg_home(gpg_home: &Path) -> Result<(), Error> {
     std::fs::create_dir_all(gpg_home)
         .map_err(|e| Error::Gpg(format!("cannot create gpg homedir: {e}")))?;
     use std::os::unix::fs::PermissionsExt;
