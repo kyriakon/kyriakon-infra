@@ -55,7 +55,10 @@ on a provisioned member rewrites the same files and changes nothing else.
 - Its two subdirectories belong to the member: `install -d -m 0755 -o <name> -g members`
   for `www/` and for `gemini/`, empty and ready for upload.
 - `/home/<name>/repos` is created mode 0700 owned by the member, beside the Maildir
-  `scripts/add-user.sh` already makes. Both stay outside every chroot.
+  `scripts/add-user.sh` already makes. Both stay outside every chroot. The
+  `pass.git` repository inside it is bare and owned by the member, because the
+  git shell serves only `<repo>.git` directly under that directory and never
+  creates one.
 - The account, its Maildir and its quota record come from `scripts/add-user.sh`, which the
   signup path calls first; this script asserts the account exists and is in `members`
   rather than creating it.
