@@ -19,6 +19,23 @@
 PATH="/usr/local/bin:$PATH"
 export PATH
 
+# The three deep modules, installed beside lib.sh in <dir>/lib. $0 is the
+# calling script, which sources this file from its own directory, so the
+# modules resolve from there. A missing module is a broken install rather than
+# a helper that silently does not exist.
+lib_sh_dir=${0%/*}
+[ "$lib_sh_dir" = "$0" ] && lib_sh_dir=.
+for lib_module in atomic-fs tls-acme identity; do
+	if [ ! -f "$lib_sh_dir/lib/$lib_module.sh" ]; then
+		printf '%s: lib/%s.sh is missing; install lib.sh with its lib/ directory\n' \
+			"$0" "$lib_module" >&2
+		exit 1
+	fi
+	# shellcheck disable=SC1090 # resolved at runtime from this script's directory
+	. "$lib_sh_dir/lib/$lib_module.sh"
+done
+unset lib_module lib_sh_dir
+
 # ping_url <url> — best-effort GET that never fails the caller. A monitoring ping
 # must not turn a transient curl failure into a script failure / cron mail storm.
 ping_url() {
@@ -74,31 +91,6 @@ if [ -r "$KYRIAKON_ENV" ]; then
 fi
 
 
-# install_staged <src> <dst> [install flags...]: install one file without ever
-# leaving a partial one at <dst>. install writes a sibling temp in <dst>'s own
-# directory, so the rename cannot cross a filesystem, and mv puts it in place
-# atomically with the mode and owner install gave it: a run killed mid-write
-# leaves <dst> as it was, and a reader sees either the old file or the whole new
-# one. A failure removes the temp and prints what it was doing, because the
-# caller runs under `set -e` and would otherwise exit without a word.
-install_staged() {
-	typeset staging_src="$1" staging_dst="$2" staging_tmp
-	shift 2
-	staging_tmp="$staging_dst.new.$$"
-	if ! install "$@" "$staging_src" "$staging_tmp"; then
-		rm -f "$staging_tmp"
-		printf 'could not stage %s; %s left as it was\n' "$staging_src" "$staging_dst" >&2
-		return 1
-	fi
-	if ! mv "$staging_tmp" "$staging_dst"; then
-		rm -f "$staging_tmp"
-		printf 'could not rename %s into place; %s left as it was\n' \
-			"$staging_tmp" "$staging_dst" >&2
-		return 1
-	fi
-}
-
-
 # install_rows <table> <destination>: the scripts the install-set table gives one
 # destination, one per line. scripts/install-set.tsv names the destination every
 # installed script lands in, and this is the one query its readers used to run
@@ -146,106 +138,6 @@ need_packages() {
 	for pkg in $selected; do
 		need_pkg "$pkg"
 	done
-}
-
-
-# --- generated files -------------------------------------------------------
-#
-# write_generated <target> <body-fn> [<cert> <key>]: write <target> from the
-# body function, atomically, and only when the bytes differ.
-#
-# Contract:
-#   - <body-fn> prints the whole file on stdout and nothing else; a non-zero
-#     status means nothing is written and <target> is left as it was.
-#   - the body runs under umask 077, so the candidate it creates is never
-#     readable by a member even before the chmod below.
-#   - the candidate is compared with the existing file and only then renamed
-#     into place, at 0644. A run killed at any point leaves the file the daemon
-#     is reading as it was, and a run that would write the same bytes leaves its
-#     inode and mtime alone.
-#   - sets conf_changed to yes or no, the answer the callers print and the --web
-#     pass keys off, and returns 1 with a message on stderr on any failure.
-#
-# <cert> and <key> are for a file that names a relayd pair. The guard trips when
-# the certificate is present and not empty and the key is not, which is the half
-# pair that passes `httpd -n` and fails `relayd -n`; an empty file is an
-# interrupted write, not half a pair. Lanes whose pair is always generated
-# together pass neither and are not guarded by a rule they cannot break.
-write_generated() {
-	typeset gen_target="$1" gen_body="$2" gen_cert="${3:-}" gen_key="${4:-}" gen_candidate
-	if [ -n "$gen_cert" ] && [ -s "$gen_cert" ] && [ ! -s "$gen_key" ]; then
-		printf '%s is there and %s is not, so %s was left alone: the relay needs both halves of the pair\n' \
-			"$gen_cert" "$gen_key" "$gen_target" >&2
-		return 1
-	fi
-	gen_candidate="$gen_target.new.$$"
-	# The redirection is inside the subshell, because the shell that opens the
-	# file is the one whose umask applies to it; the caller's is untouched.
-	if ! ( umask 077; "$gen_body" >"$gen_candidate" ); then
-		rm -f "$gen_candidate"
-		printf 'could not write %s for %s; %s left as it was\n' \
-			"$gen_body" "$gen_target" "$gen_target" >&2
-		return 1
-	fi
-	if [ -f "$gen_target" ] && cmp -s "$gen_candidate" "$gen_target"; then
-		rm -f "$gen_candidate"
-		# shellcheck disable=SC2034 # the caller reads it
-		conf_changed=no
-		return 0
-	fi
-	chmod 0644 "$gen_candidate"
-	if ! mv "$gen_candidate" "$gen_target"; then
-		rm -f "$gen_candidate"
-		printf 'could not rename %s into place; %s left as it was\n' \
-			"$gen_candidate" "$gen_target" >&2
-		return 1
-	fi
-	# shellcheck disable=SC2034 # the caller reads it
-	conf_changed=yes
-	return 0
-}
-
-
-# cert_paths <ssl-dir> <private-dir> <name>: set cert_chain, cert_key and
-# cert_link to the files relayd's keypair <name> is made of. One place, because
-# a link made or removed under a different name than the pair is a keypair
-# relayd cannot open, and the relay deploy, the member pass and the removal
-# scripts all touch the same three.
-cert_paths() {
-	cert_chain="$1/$3.fullchain.pem"
-	cert_key="$2/$3.key"
-	cert_link="$1/$3.crt"
-	# Exported so shellcheck sees the cross-file use, the same way CANARY_* is.
-	export cert_chain cert_key cert_link
-}
-
-# link_cert <ssl-dir> <private-dir> <name>: make cert_link the symlink relayd
-# reads <name>'s pair through, and never over a file that is not a link: a real
-# file at that path is somebody else's certificate and deleting it would take a
-# name down. Says what it did when it changed something, so a run that repairs a
-# link removed by hand reads as one that changed something. A missing half of the
-# pair is the caller's check: the deploy names what it needs, and the member pass
-# skips a name that is not ready.
-link_cert() {
-	# Names of their own, because ksh93 binds a function's typeset to a local of
-	# the same name in its caller: a plain `target` here became the caller's.
-	typeset cert_target cert_now
-	cert_paths "$1" "$2" "$3"
-	cert_target="$3.fullchain.pem"
-	if [ -L "$cert_link" ]; then
-		cert_now=$(readlink "$cert_link")
-		[ "$cert_now" = "$cert_target" ] && return 0
-		ln -sfn "$cert_target" "$cert_link"
-		printf '%s: relinked to %s (was %s)\n' "$cert_link" "$cert_target" "$cert_now"
-		return 0
-	fi
-	if [ -e "$cert_link" ]; then
-		printf '%s is not a symlink; refusing to replace a file that may be a certificate\n' \
-			"$cert_link" >&2
-		return 1
-	fi
-	ln -s "$cert_target" "$cert_link"
-	printf 'linked %s -> %s\n' "$cert_link" "$cert_target"
 }
 
 
@@ -483,98 +375,6 @@ uid_warnings() {
 # helpers are the one write shape, and each takes the same lock for its whole
 # read-modify-write: a signup and an operator deploy can overlap, and a rewrite
 # that read before the other's append would move the old table back over it.
-
-# table_lock <table> [tries] [interval]
-#
-# mkdir(2) is the lock: it fails when the directory exists, and nothing else
-# needs a base tool. The owner writes its pid inside, so a lock left by a killed
-# writer can be told from one being held. By default a writer waits five seconds
-# in whole seconds; a lock whose pid is gone, or that has been held for more than
-# thirty seconds, is reaped once and the acquisition retried. `tries` and
-# `interval` pace that wait: a caller whose lock is held for milliseconds under a
-# burst passes a finer interval so a queue of waiters drains in the time it
-# takes, where the mail tables' one-write-a-minute callers are happy with the
-# second.
-# The drain's Rust writer takes the same <table>.lock directory with the same
-# pid file, so the two exclude each other.
-table_lock() {
-	typeset table="$1" lock="$1.lock" tries=0 reaped=no stale
-	typeset limit=${2:-5} interval=${3:-1}
-	while [ "$tries" -lt "$limit" ]; do
-		if mkdir "$lock" 2>/dev/null; then
-			if ! printf '%s\n' "$$" > "$lock/pid"; then
-				rm -rf "$lock"
-				printf 'could not write the owner pid into %s\n' "$lock" >&2
-				return 2
-			fi
-			return 0
-		fi
-		if [ ! -d "$lock" ]; then
-			printf 'could not lock %s: cannot create %s\n' "$table" "$lock" >&2
-			return 2
-		fi
-		if [ "$reaped" = no ]; then
-			stale=$(table_lock_stale "$table")
-			if [ -n "$stale" ]; then
-				printf 'reaping stale lock %s: %s\n' "$lock" "$stale" >&2
-				rm -rf "$lock"
-				reaped=yes
-				continue
-			fi
-		fi
-		tries=$((tries + 1))
-		[ "$tries" -ge "$limit" ] || sleep "$interval"
-	done
-	printf 'could not lock %s: %s exists and did not clear; remove it if no writer is running\n' \
-		"$table" "$lock" >&2
-	return 2
-}
-
-# table_lock_stale <table>: why <table>.lock is not being held by a live writer,
-# one line, or nothing when it is absent or looks live. Used by table_lock to
-# decide whether to reap, and by check-hygiene.sh to report a wedged table.
-table_lock_stale() {
-	typeset table="$1" lock="$1.lock" pid mtime now age
-	lock="$table.lock"
-	[ -d "$lock" ] || return 0
-	pid=$(cat "$lock/pid" 2>/dev/null || true)
-	case "$pid" in
-	'' | *[!0-9]*) ;;
-	*)
-		if kill -0 "$pid" 2>/dev/null; then
-			# A live owner is holding it, however long the write is taking.
-			return 0
-		fi
-		printf 'the owner pid %s is gone\n' "$pid"
-		return 0
-		;;
-	esac
-	# OpenBSD and macOS stat use -f, GNU stat uses -c.
-	mtime=$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || printf '')
-	[ -n "$mtime" ] || return 0
-	now=$(date +%s)
-	age=$((now - mtime))
-	if [ "$age" -gt 30 ]; then
-		printf 'it has been held for %s seconds\n' "$age"
-	fi
-	return 0
-}
-
-table_unlock() {
-	typeset table="$1"
-	rm -rf "$table.lock"
-}
-
-# valid_localpart <name> — the username and mailbox charset: 1-31 lowercase
-# letters, digits and interior hyphens, starting and ending alphanumeric: a
-# single DNS label. It is a filesystem path component, a subdomain label and a
-# keyring filename, so every script that takes a member name checks it here.
-valid_localpart() {
-	# Before the pattern check: grep matches any line of its input, so a newline
-	# would let a valid first line carry an arbitrary second one through.
-	case "$1" in *[!a-z0-9-]*) return 1 ;; esac
-	printf '%s' "$1" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,29}[a-z0-9])?$'
-}
 
 # mail_domains_first <file>: the first line of mail_domains, the platform's own
 # domain. One read, because deploy-mail.sh, check-hygiene.sh and
@@ -893,107 +693,6 @@ dkim_domains_args() {
 	printf '%s\n' "${dk_args# }"
 }
 
-# install_smtpd_conf <template> <dkim-domains> <queue-key-file> <destination> [<parser>]
-#
-# The shipped config with the queue key and the filter's domain list substituted,
-# staged beside <destination> and renamed onto it, 0600 because it carries the
-# key. Both placeholders are substituted in the one pass, so the file is never
-# left with the key and not the list, or the reverse. The redirect used to go
-# straight onto the live file, which empties the MTA's only configuration before
-# filling it, and the chmod landed two lines later: for that window the file
-# carrying the substituted queue key existed under the caller's umask.
-#
-# With a fifth argument the candidate is parsed before the rename, as
-# `"$parser" -n -f <candidate>`; the live callers pass `smtpd`. A self-test sets
-# SMTPD_CONF_CHECK=no: `smtpd -n` validates the live tree, maildir and filter,
-# which a fixture tree does not have, and the deploy self-test proves the check
-# with a stub parser instead.
-install_smtpd_conf() {
-	typeset conf_template="$1" conf_domains="$2" conf_keyfile="$3" conf_dst="$4" \
-		conf_key conf_args conf_candidate
-	conf_args=$(dkim_domains_args "$conf_domains") || return 1
-	conf_key=$(cat "$conf_keyfile" 2>/dev/null) \
-		|| { printf 'could not read the queue key from %s\n' "$conf_keyfile" >&2; return 1; }
-	[ -n "$conf_key" ] || { printf '%s holds no queue key\n' "$conf_keyfile" >&2; return 1; }
-	# smtpd's crypto_setup() rejects anything but exactly 32 characters and
-	# exits, so a restored or hand-edited key of another length is a daemon that
-	# will not start. A replacement key is only safe when the queue is empty, so
-	# this refuses to install a config built from it and names the decision the
-	# operator has to make; deploy-mail.sh refuses the same file for the same
-	# reason rather than rotating over it.
-	if [ "${#conf_key}" -ne 32 ]; then
-		printf '%s holds a %s-character queue key, not 32; it is replaced only deliberately: remove it and run scripts/deploy-mail.sh, which discards anything still queued under it\n' \
-			"$conf_keyfile" "${#conf_key}" >&2
-		return 1
-	fi
-	conf_candidate=$(mktemp "$conf_dst.XXXXXX") || {
-		printf 'could not create a candidate beside %s\n' "$conf_dst" >&2
-		return 1
-	}
-	if ! sed -e "s|REPLACE_ME_QUEUE_KEY|$conf_key|" \
-		-e "s|REPLACE_ME_DKIM_DOMAINS|$conf_args|" \
-		"$conf_template" > "$conf_candidate"; then
-		printf 'could not render %s from %s\n' "$conf_dst" "$conf_template" >&2
-		rm -f "$conf_candidate"
-		return 1
-	fi
-	if ! chmod 0600 "$conf_candidate"; then
-		printf 'could not set the mode of %s\n' "$conf_candidate" >&2
-		rm -f "$conf_candidate"
-		return 1
-	fi
-	# The candidate is parsed before it becomes the live file when the caller
-	# names the parser. The live callers pass `smtpd`. A checkout without it (the
-	# deploy self-test, a laptop) skips the parse: the box has smtpd in base, so
-	# the check is never skipped where it matters.
-	if [ -n "${5:-}" ] && [ "${SMTPD_CONF_CHECK:-yes}" = yes ] \
-		&& command -v "$5" >/dev/null 2>&1; then
-		if ! "$5" -n -f "$conf_candidate"; then
-			printf '%s fails its own syntax check; %s is unchanged\n' \
-				"$conf_candidate" "$conf_dst" >&2
-			rm -f "$conf_candidate"
-			return 1
-		fi
-	fi
-	if ! mv "$conf_candidate" "$conf_dst"; then
-		printf 'could not replace %s\n' "$conf_dst" >&2
-		rm -f "$conf_candidate"
-		return 1
-	fi
-	return 0
-}
-
-# install_validated <source> <destination> <checker> [<args>...]: install a
-# config to <destination>.new, run the daemon's own parser over the candidate,
-# then rename it onto the live path. A parser that refuses leaves the live file
-# exactly as it was and removes the candidate.
-#
-# The other order — install, then check — leaves a file that cannot start at the
-# live path, and the next restart or reboot takes the service down with nothing
-# to roll back to. relayd.conf was fixed this way first; this is the shared body.
-install_validated() {
-	typeset src="$1" dst="$2"
-	shift 2
-	install -m 0644 "$src" "$dst.new" || {
-		printf 'could not stage %s.new; %s is unchanged\n' "$dst" "$dst" >&2
-		rm -f "$dst.new"
-		return 1
-	}
-	# The parsers print the normalised config on success; only a refusal is
-	# worth the deploy log's space.
-	if ! "$@" "$dst.new" >/dev/null; then
-		printf '%s fails its own syntax check; %s is unchanged\n' "$dst.new" "$dst" >&2
-		rm -f "$dst.new"
-		return 1
-	fi
-	if ! mv "$dst.new" "$dst"; then
-		printf 'could not replace %s\n' "$dst" >&2
-		rm -f "$dst.new"
-		return 1
-	fi
-	return 0
-}
-
 # --- self-tests ------------------------------------------------------------
 #
 # A --self-test is the one check a script can run without the box's own state, so
@@ -1072,6 +771,37 @@ self_test() {
 		"$(valid_localpart "$(printf 'alice\n../../etc')" && printf yes || printf no)" no
 	check "a valid first line does not carry an option" \
 		"$(valid_localpart "$(printf 'alice\n-rf')" && printf yes || printf no)" no
+
+	check "a plain domain is accepted" \
+		"$(valid_domain parish.example && printf yes || printf no)" yes
+	check "a single label is refused" \
+		"$(valid_domain parish && printf yes || printf no)" no
+	check "a label starting with a hyphen is refused" \
+		"$(valid_domain -parish.example && printf yes || printf no)" no
+	check "a slash is refused" \
+		"$(valid_domain parish.example/x && printf yes || printf no)" no
+	# #895: grep matches any line, so a valid first line must not carry a second.
+	check "a valid first line does not carry a second domain" \
+		"$(valid_domain "$(printf 'parish.example\n--san evil.example')" && printf yes || printf no)" no
+	check "a valid first line does not carry a path" \
+		"$(valid_domain "$(printf 'parish.example\n../../etc/passwd')" && printf yes || printf no)" no
+
+	# A pid 0 is not a writer, so its lock is reaped rather than wedging the
+	# table (#887). A live pid is never reaped.
+	mkdir "$tree/pid0.lock"
+	printf '0\n' > "$tree/pid0.lock/pid"
+	code=0
+	lock_dir "$tree/pid0.lock" 1 >/dev/null 2>&1 || code=$?
+	check "a pid-0 lock is reaped" "$code" 0
+	check "and the new lock carries this pid" "$(cat "$tree/pid0.lock/pid")" "$$"
+	unlock_dir "$tree/pid0.lock"
+	mkdir "$tree/live.lock"
+	printf '%s\n' "$$" > "$tree/live.lock/pid"
+	code=0
+	lock_dir "$tree/live.lock" 1 >/dev/null 2>&1 || code=$?
+	check "a live lock is not taken" "$code" 1
+	check "and its pid is left alone" "$(cat "$tree/live.lock/pid")" "$$"
+	rm -rf "$tree/live.lock"
 
 	# The fixture that motivated the helper: the last line has no newline, so a
 	# plain append joins the new entry to it and both keys stop matching.

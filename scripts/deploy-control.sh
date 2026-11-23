@@ -613,6 +613,11 @@ install -d -m 0755 -o root -g wheel /usr/local/libexec
 # It is a 0644 source file, not a program, so it adds nothing the doas rule can
 # run: the rule still names only /usr/local/libexec/kyriakon-authcheck.
 install_staged "$repo_dir/scripts/lib.sh" /usr/local/libexec/lib.sh -m 0644
+install -d -m 0755 /usr/local/libexec/lib
+for lib_module in atomic-fs tls-acme identity; do
+	install_staged "$repo_dir/scripts/lib/$lib_module.sh" \
+		"/usr/local/libexec/lib/$lib_module.sh" -m 0644
+done
 install_staged "$repo_dir/scripts/kyriakon-authcheck.sh" /usr/local/libexec/kyriakon-authcheck -m 0755
 
 # The login proofs: one file per admitted login, named by a random token, written
@@ -895,6 +900,7 @@ scripts_dir=$(awk -F'"' '/^scripts[[:space:]]*=/ { print $2; exit }' /etc/kyriak
 [ -n "$scripts_dir" ] || die "/etc/kyriakon/onboard/drain.toml names no scripts directory"
 scripts_root=$(dirname "$scripts_dir")
 install -d -m 0755 "$scripts_dir"
+install -d -m 0755 "$scripts_dir/lib"
 for s in $drain_scripts; do
 	install_staged "$repo_dir/scripts/$s" "$scripts_dir/$s" -m 0755
 done

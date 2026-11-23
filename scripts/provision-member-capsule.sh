@@ -74,11 +74,6 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 # below runs.
 umask 077
 
-# write_generated and the self-test harness, from the directory this script sits
-# in: deploy-mail.sh installs the two side by side.
-# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-. "$(dirname "$0")/lib.sh"
-
 # The base system's LibreSSL, which is the openssl the runbook's step and this
 # script agree on. Named in full rather than looked up on PATH because a package
 # openssl in /usr/local is a different parser and this invocation is written for
@@ -86,8 +81,8 @@ umask 077
 openssl=/usr/bin/openssl
 
 gmid_d=/etc/gmid.d
-ssl_dir=/etc/ssl
-ssl_private=/etc/ssl/private
+ssl_dir=${SSL_DIR:-/etc/ssl}
+ssl_private=${SSL_PRIVATE_DIR:-/etc/ssl/private}
 public_root=/home/www
 conf_owner="root:wheel"
 
@@ -145,7 +140,7 @@ EOF
 }
 
 pair_present() {
-	[ -f "$(capsule_cert)" ] && [ -f "$(capsule_key)" ]
+	capsule_pair_present "$(capsule_cert)" "$(capsule_key)" "$openssl"
 }
 
 write_capsule_cnf() {
@@ -187,24 +182,8 @@ ensure_capsule_pair() {
 		generated=yes
 	fi
 
-	write_capsule_cnf
-
-	if ! "$openssl" req -x509 -new -nodes -days 3650 -config "$(capsule_cnf)" \
-		-keyout "$key" -out "$cert"; then
-		die "$openssl req failed; $cert and $key may be half written, remove both and run this again"
-	fi
-	chmod 0644 "$cert"
-	chmod 0600 "$key"
-
-	# The pair is the thing every capsule is served from, so it is checked here as
-	# well as in the self-test: present, non-empty, and parseable. What it covers is
-	# asserted in the self-test, where the extension text is this openssl's.
-	for f in "$cert" "$key"; do
-		[ -s "$f" ] || die "$f is empty after the generation step"
-	done
-	"$openssl" x509 -in "$cert" -noout >/dev/null 2>&1 \
-		|| die "$cert does not parse as a certificate"
-	[ "$(stat -f '%Lp' "$key")" = 600 ] || die "$key is not mode 0600"
+	tls_ensure_capsule_pair "$cert" "$key" "$(capsule_cnf)" "$openssl" ||
+		die "the capsule pair could not be written; nothing was installed"
 
 	if [ "$generated" = no ]; then
 		printf 'capsule pair: generated at %s (ten years, kyriakon.net and *.kyriakon.net)\n' "$cert"
@@ -370,6 +349,20 @@ self_test() {
 	check "half a pair is rebuilt" "$(pair_present && echo yes || echo no)" yes
 	check "and says the help page fingerprint changed" \
 		"$(grep -c 'help page publishes has to be updated' "$tree/half.out")" 1
+
+	# A pair interrupted after openssl opened both paths: both files exist but
+	# the certificate is truncated. Pair presence needs a parse, so the next run
+	# regenerates rather than serving it (#933).
+	before="$(stat -f '%i' "$(capsule_cert)") $(stat -f '%i' "$(capsule_key)")"
+	: > "$(capsule_cert)"
+	: > "$(capsule_key)"
+	ensure_capsule_pair > "$tree/truncated.out" 2>&1
+	check "a truncated pair is rebuilt" "$(pair_present && echo yes || echo no)" yes
+	check "and the certificate is no longer empty" \
+		"$([ -s "$(capsule_cert)" ] && printf yes || printf no)" yes
+	check "and the key is mode 0600" "$(stat -f '%Lp' "$(capsule_key)")" 600
+	check "and it is a different pair" \
+		"$(printf '%s' "$before" | grep -c "^$(stat -f '%i' "$(capsule_cert)") " || true)" 0
 
 	# 7. a member whose tree is not built is refused rather than served
 	user=nobody

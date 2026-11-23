@@ -80,7 +80,7 @@ gmid_d=${GMID_D:-/etc/gmid.d}
 acme_d=${ACME_D:-/etc/acme-client.d}
 authorized_keys_dir=${AUTHORIZED_KEYS_DIR:-/etc/ssh/authorized_keys}
 ssl_dir=${SSL_DIR:-/etc/ssl}
-ssl_private=${SSL_PRIVATE:-/etc/ssl/private}
+ssl_private=${SSL_PRIVATE_DIR:-${SSL_PRIVATE:-/etc/ssl/private}}
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
 mail_from=${MAIL_FROM:-/etc/mail/mail_from}
 onboard_store=${ONBOARD_STORE:-/var/db/onboard}
@@ -139,6 +139,16 @@ would() {
 # remove_member: the whole job, in the spec's order.
 # shellcheck disable=SC2154 # cert_chain and cert_key come from cert_paths in lib.sh
 remove_member() {
+	# A name that passes the charset is not yet a member: root and the operator's
+	# own account pass it too. The full predicate is required before the first
+	# recursive removal, while an absent account still lets a partial run finish.
+	if account_exists; then
+		require_member "$user" || {
+			printf 'refusing: %s is not a member account (missing %s)\n' \
+				"$user" "$member_phase" >&2
+			return 1
+		}
+	fi
 	did=no
 	reindex=no
 
@@ -439,6 +449,7 @@ self_test() {
 	VIRTUALS="$tree/etc/mail/virtuals"
 	MAIL_FROM="$tree/etc/mail/mail_from"
 	ONBOARD_STORE="$tree/store"
+	HOME_ROOT="$tree/home"
 	AUTHORIZED_KEYS_DIR="$tree/etc/ssh/authorized_keys"
 	www_root="$WWW_ROOT"; httpd_d="$HTTPD_D"
 	gmid_d="$GMID_D"; acme_d="$ACME_D"; ssl_dir="$SSL_DIR"
@@ -451,6 +462,18 @@ self_test() {
 		"$(dirname "$virtuals")" "$authorized_keys_dir"
 
 	# The predicate and the steps, recorded rather than run.
+	# require_member reads uid and home; the fixture accounts answer from the
+	# throwaway tree, and root is uid 0 so it must be refused.
+	id() {
+		case "$1:$2" in
+		-u:alice) printf '1001\n' ;;
+		-u:root) printf '0\n' ;;
+		-u:*) return 1 ;;
+		-un:* | -gn:*) printf 'self-test\n' ;;
+		*) command id "$@" ;;
+		esac
+	}
+	# shellcheck disable=SC2329 # redefined in the self-test's fixture
 	account_exists() { return 0; }
 	group_exists() { return 0; }
 	remove_account() { printf 'userdel -r %s\n' "$user" >>"$case_dir/calls"; }
@@ -468,6 +491,8 @@ self_test() {
 	show=no
 	public="$www_root/$user.kyriakon.net"
 	mkdir -p "$public/www" "$onboard_store/accounts/$user"
+	mkdir -p "$HOME_ROOT/$user/Maildir" "$HOME_ROOT/$user/.ssh"
+	: > "$onboard_store/accounts/$user/account.json"
 	: >"$httpd_d/$user.kyriakon.net.conf"
 	: >"$gmid_d/$user.kyriakon.net.conf"
 	: >"$acme_d/$user.kyriakon.net.conf"
@@ -489,6 +514,17 @@ self_test() {
 		printf 'alice: alice@kyriakon.net,secretary@parish.example\n'
 		printf 'oliver: oliver@kyriakon.net\n'
 	} >"$mail_from"
+
+	# root passes the charset but is not a member: uid 0 is refused before any
+	# recursive removal (#884).
+	account_exists() { return 0; }
+	user=root
+	code=0
+	remove_member >"$tree/root.out" 2>"$tree/root.err" || code=$?
+	check "root is refused" "$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and the refusal names the phase" \
+		"$(grep -c 'not a member account (missing account)' "$tree/root.err")" 1
+	user=alice
 
 	remove_member >"$tree/first.out" 2>"$tree/first.err"
 	check "the vhost went" "$([ -e "$httpd_d/$user.kyriakon.net.conf" ] && echo present || echo gone)" gone
@@ -542,7 +578,8 @@ self_test() {
 	# --show removes nothing and reports what it would.
 	account_exists() { return 0; }
 	: >"$case_dir/calls"
-	mkdir -p "$public"
+	mkdir -p "$public" "$onboard_store/accounts/$user"
+	: > "$onboard_store/accounts/$user/account.json"
 	: >"$httpd_d/$user.kyriakon.net.conf"
 	show=yes
 	remove_member >"$tree/third.out" 2>&1
@@ -555,6 +592,8 @@ self_test() {
 	# A failed regeneration fails the run and does not print the success line:
 	# otherwise the deletion would report a finger page it did not write.
 	account_exists() { return 0; }
+	mkdir -p "$onboard_store/accounts/$user"
+	: > "$onboard_store/accounts/$user/account.json"
 	regen_finger() { printf 'gen-finger-page\n' >>"$case_dir/calls"; return 1; }
 	show=no
 	: >"$case_dir/calls"

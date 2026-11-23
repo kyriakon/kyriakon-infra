@@ -55,8 +55,8 @@ umask 077
 script_dir=$(cd "$(dirname "$0")" && pwd)
 
 httpd_d=${RELAYD_MEMBERS_HTTPD_D:-/etc/httpd.d}
-ssl_dir=${RELAYD_MEMBERS_SSL_DIR:-/etc/ssl}
-ssl_private=${RELAYD_MEMBERS_SSL_PRIVATE:-/etc/ssl/private}
+ssl_dir=${RELAYD_MEMBERS_SSL_DIR:-${SSL_DIR:-/etc/ssl}}
+ssl_private=${RELAYD_MEMBERS_SSL_PRIVATE:-${SSL_PRIVATE_DIR:-/etc/ssl/private}}
 
 # link_cert: the certificate link is made here and by deploy-relayd.sh, so the
 # two cannot disagree about which name it points at.

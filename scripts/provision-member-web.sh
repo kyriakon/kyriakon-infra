@@ -80,8 +80,8 @@ umask 077
 . "$(dirname "$0")/lib.sh"
 
 httpd_d=/etc/httpd.d
-ssl_dir=/etc/ssl
-ssl_private=/etc/ssl/private
+ssl_dir=${SSL_DIR:-/etc/ssl}
+ssl_private=${SSL_PRIVATE_DIR:-/etc/ssl/private}
 public_root=/home/www
 conf_owner="root:wheel"
 

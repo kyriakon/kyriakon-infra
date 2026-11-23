@@ -73,15 +73,20 @@ remove() {
 	valid_localpart "$user" ||
 		die "not a member name: $user (lowercase [a-z0-9-], starts and ends alphanumeric, at most 31 characters)"
 	is_root || die "run this with doas: the member's home is not yours to change"
-	account_exists "$user" || die "there is no account named $user"
-	home="$home_root/$user"
-	has_maildir "$home" ||
-		die "$user has no Maildir, so it is not a member account name; nothing was removed"
+	if ! require_member "$user"; then
+		# shellcheck disable=SC2154 # require_member sets member_phase
+		die "$user is not a member account (missing $member_phase); nothing was removed"
+	fi
+	home="${HOME_ROOT:-$home_root}/$user"
 
 	# Both copies, because a box that has not applied the sshd_config hand step
-	# reads the home one and a box that has reads the managed one.
+	# reads the home one and a box that has reads the managed one. A symlinked
+	# .ssh or key is refused: as root, following one would delete somebody
+	# else's authorized_keys (#934).
+	[ ! -L "$home/.ssh" ] || die "$home/.ssh is a symlink; nothing was removed"
 	for key_file in "$keys_root/$user" "$home/.ssh/authorized_keys"; do
-		[ -f "$key_file" ] || continue
+		[ -e "$key_file" ] || continue
+		[ ! -L "$key_file" ] || die "$key_file is a symlink; nothing was removed"
 		rm -f "$key_file" || {
 			printf 'remove-upload-key: could not remove %s\n' "$key_file" >&2
 			exit 1
@@ -99,12 +104,22 @@ self_test() {
 	home_root="$tree/home"
 	keys_root="$tree/etc/ssh/authorized_keys"
 
-	# The fixture is a member with one key, and the two predicates answer for it
-	# so no real account is touched.
+	# The fixture is a member with one key, and the predicates answer for it so no
+	# real account is touched.
+	HOME_ROOT="$home_root"
+	ONBOARD_STORE="$tree/store"
+	mkdir -p "$home_root/alice/Maildir" "$home_root/alice/.ssh" "$keys_root" \
+		"$ONBOARD_STORE/accounts/alice"
+	: > "$ONBOARD_STORE/accounts/alice/account.json"
+	id() {
+		case "$1:$2" in
+		-u:alice) printf '1001\n' ;;
+		*) return 1 ;;
+		esac
+	}
 	account_exists() { [ "$1" = "alice" ]; }
 	has_maildir() { [ -d "$1/Maildir" ]; }
 	is_root() { return 0; }
-	mkdir -p "$home_root/alice/Maildir" "$home_root/alice/.ssh" "$keys_root"
 	key_file="$home_root/alice/.ssh/authorized_keys"
 	managed_key="$keys_root/alice"
 	printf 'ssh-ed25519 AAAAexample alice@example\n' >"$key_file"
@@ -128,6 +143,22 @@ self_test() {
 	set -e
 	check "a second run succeeds" "$rc" 0
 	check "and prints nothing" "$(wc -c <"$tree/second.out" | tr -d ' ')" 0
+
+	# #934: a member-owned ~/.ssh replaced by a symlink must not lead root to
+	# remove a key outside the fixture tree.
+	mkdir -p "$tree/elsewhere"
+	printf 'ssh-ed25519 AAAAexample victim@example\n' >"$tree/elsewhere/authorized_keys"
+	rm -rf "$home_root/alice/.ssh"
+	ln -s "$tree/elsewhere" "$home_root/alice/.ssh"
+	set +e
+	( remove alice ) >"$tree/symlink.out" 2>&1
+	rc=$?
+	set -e
+	check "a symlinked .ssh is refused" "$rc" 2
+	check "and the target's key is untouched" \
+		"$([ -f "$tree/elsewhere/authorized_keys" ] && printf yes || printf no)" yes
+	rm -f "$home_root/alice/.ssh"
+	mkdir -p "$home_root/alice/.ssh"
 
 	# A name that is not an account, and a name that is not a member name, both
 	# stop before any path is built.

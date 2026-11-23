@@ -288,18 +288,17 @@ self_test() {
 
 	# --- an install that dies mid-write ---
 	# install_staged writes a sibling temp and renames it over the live file. install
-	# is stubbed to write half a copy into that temp and fail, which is what a killed
-	# install leaves on disk: the live file must still hold the bytes it had, and the
-	# temp must not be left for the next run to explain.
+	# is stubbed to write half a candidate and fail, which is what a killed copy
+	# leaves on disk: the live file must still hold the bytes it had, and the
+	# candidate must not be left for the next run to explain.
 	failbin="$tree/failbin"
 	mkdir -p "$failbin"
-	cat > "$failbin/install" <<'STUB'
+	cat > "$failbin/cat" <<'STUB'
 #!/bin/sh
-for last; do :; done
-printf 'half a file\n' > "$last"
+printf 'half a file\n'
 exit 1
 STUB
-	chmod 0755 "$failbin/install"
+	chmod 0755 "$failbin/cat"
 	before=$(cat "$tree/etc/relayd.conf")
 	printf 'http protocol "changed" {}\n' > "$tree/changed.conf"
 	saved_path=$PATH
@@ -313,7 +312,7 @@ STUB
 	check "and the installed file keeps its bytes" "$(cat "$tree/etc/relayd.conf")" "$before"
 	check "and the failure says the file was left as it was" \
 		"$(grep -c 'left as it was' "$tree/killed.out")" 1
-	set -- "$tree/etc"/relayd.conf.new.*
+	set -- "$tree/etc"/.relayd.conf.*
 	check "and no temp is left behind" "$([ -e "$1" ] && printf yes || printf no)" no
 
 	# --- checking the configuration before installing it ---

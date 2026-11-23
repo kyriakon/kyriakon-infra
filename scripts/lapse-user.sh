@@ -38,6 +38,8 @@ die() {
 }
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
 class_src_dir=${CLASS_SRC_DIR:-$script_dir/../openbsd/etc/login.conf.d}
 login_conf_d=${LOGIN_CONF_D:-/etc/login.conf.d}
 usermod_cmd=${USERMOD:-usermod}
@@ -72,6 +74,10 @@ set_groups() {
 
 lapse() {
 	user=$1
+	if ! require_member "$user"; then
+		# shellcheck disable=SC2154 # require_member sets member_phase
+		die "$user is not a member account (missing $member_phase)"
+	fi
 	install_class lapsed
 	set_class lapsed "$user"
 	set_groups "" "$user"
@@ -80,6 +86,10 @@ lapse() {
 
 restore() {
 	user=$1
+	if ! require_member "$user"; then
+		# shellcheck disable=SC2154 # require_member sets member_phase
+		die "$user is not a member account (missing $member_phase)"
+	fi
 	install_class member
 	set_class member "$user"
 	set_groups members "$user"
@@ -87,8 +97,6 @@ restore() {
 }
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$script_dir/lib.sh"
 	self_test_begin
 	class_src_dir="$script_dir/../openbsd/etc/login.conf.d"
 	check "the lapsed class ships" \
@@ -106,6 +114,26 @@ SH
 	chmod 0755 "$self_test_work/usermod"
 	export USERMOD_LOG="$usermod_log"
 	usermod_cmd="$self_test_work/usermod"
+	# require_member reads the passwd uid, the home Maildir, the store record and
+	# .ssh; the fixture answers without a real account.
+	HOME_ROOT="$self_test_work/home"
+	ONBOARD_STORE="$self_test_work/store"
+	mkdir -p "$HOME_ROOT/alice/Maildir" "$HOME_ROOT/alice/.ssh" \
+		"$ONBOARD_STORE/accounts/alice"
+	: > "$ONBOARD_STORE/accounts/alice/account.json"
+	id() {
+		case "$1:$2" in
+		-u:alice) printf '1001\n' ;;
+		-u:root) printf '0\n' ;;
+		-u:*) return 1 ;;
+		*) command id "$@" ;;
+		esac
+	}
+	# #884: lapse used to accept root because only the name's shape was checked.
+	code=0
+	( lapse root ) >"$self_test_work/root.out" 2>&1 || code=$?
+	check "root is not a member to lapse" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
 	# shellcheck disable=SC2329 # called indirectly through lapse/restore
 	user_exists() { return 0; }
 

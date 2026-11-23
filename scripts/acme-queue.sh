@@ -83,7 +83,8 @@
 #                                                    pruned to the last seven days
 #   own log        <store>/attempts.own-domain      the same for own-domain attempts
 #   burst limit    40 attempts per seven days       the reserve below the CA's fifty
-#   run lock       <store>/run.lock                 one pass at a time
+#   run lock       /var/run/kyriakon-acme.lock      one pass at a time, shared
+#                                                    with renew-acme.sh
 #   spacing        202 minutes                      the CA's published refill
 #   alert age      1440 minutes (24 hours)          read by scripts/abuse-monitor.sh
 # The store and the client and resolver commands are overridable (ACME_QUEUE_DIR,
@@ -241,7 +242,7 @@ name_ok() {
 	*.*) ;;
 	*) return 1 ;;
 	esac
-	printf '%s' "$1" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+	valid_domain "$1"
 }
 
 # minutes_until_slot <now> <last_attempt> : 0 when a slot is open, else the whole
@@ -617,27 +618,19 @@ status() {
 run() {
 	install -d -m 0700 "$queue_dir" "$pending_dir"
 
-	# One pass at a time. mkdir is the atomic test-and-set available in base (no
-	# shlock(1), no flock(1) wrapper), and two passes could otherwise both read the
-	# same open slot and attempt in the same moment. A lock left by a killed run is
-	# taken over once its pid is gone, so a reboot cannot wedge the queue.
-	lock="$queue_dir/run.lock"
-	if ! mkdir -m 0700 "$lock" 2>/dev/null; then
-		holder=$(cat "$lock/pid" 2>/dev/null || true)
-		if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-			# A pass that attempts nothing prints nothing, like every other such
-			# pass: the run holding the lock reports its own outcome, and the age
-			# alert is what covers one that never finishes.
-			return 0
-		fi
-		rm -f "$lock/pid"
-		rmdir "$lock" 2>/dev/null || true
-		if ! mkdir -m 0700 "$lock" 2>/dev/null; then
-			die "could not take $lock, and no live process holds it"
-		fi
-	fi
-	printf '%s\n' "$$" > "$lock/pid"
-	trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
+	# One pass at a time, with the same lock renew-acme.sh takes: the two lanes
+	# must never run acme-client for one certificate pair at the same moment. A
+	# pass that loses the lock prints nothing, like every other pass with nothing
+	# to do; the holder reports its own outcome.
+	lock=$(acme_lock_path)
+	lock_rc=0
+	lock_message=$(lock_dir "$lock" 1 2>&1) || lock_rc=$?
+	case "$lock_rc" in
+	0) ;;
+	1) return 0 ;;
+	*) die "$lock_message" ;;
+	esac
+	trap 'unlock_dir "$lock"' EXIT
 
 	now=$(date +%s)
 	# Each lane has its own window, and only the lanes decide whether this pass has
@@ -686,6 +679,8 @@ self_test() {
 	check "a self-test drops the operator address" "${ALERT_EMAIL:-}" ""
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	work=$self_test_work
+	ACME_LOCK_DIR="$work/acme.lock"
+	export ACME_LOCK_DIR
 
 	check "a member name is accepted" "$(name_ok foo.kyriakon.net && printf yes)" "yes"
 	check "an own-domain FQDN is accepted" "$(name_ok parish.example && printf yes || printf no)" "yes"
@@ -694,6 +689,8 @@ self_test() {
 	check "a single-label domain is refused" "$(name_ok localhost && printf yes || printf no)" "no"
 	check "a leading hyphen is refused" "$(name_ok -parish.example && printf yes || printf no)" "no"
 	check "a path is refused" "$(name_ok ../etc/passwd.kyriakon.net && printf yes || printf no)" "no"
+	check "a newline is refused" \
+		"$(name_ok "$(printf 'alice.kyriakon.net\nbob.kyriakon.net')" && printf yes || printf no)" "no"
 	check "a site owner is a member account name" "$(valid_localpart parish-secretary && printf yes || printf no)" "yes"
 	check "and a path is not a site owner" "$(valid_localpart ../parish && printf yes || printf no)" "no"
 	# The shell implication of the contract: every name valid_localpart accepts

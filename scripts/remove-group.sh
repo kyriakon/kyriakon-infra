@@ -92,7 +92,7 @@ gmid_d=${GMID_D:-/etc/gmid.d}
 static_hosts=${STATIC_HOSTS:-/etc/onboard/static-hosts}
 acme_d=${ACME_D:-/etc/acme-client.d}
 ssl_dir=${SSL_DIR:-/etc/ssl}
-ssl_private=${SSL_PRIVATE:-/etc/ssl/private}
+ssl_private=${SSL_PRIVATE_DIR:-${SSL_PRIVATE:-/etc/ssl/private}}
 acme_queue_dir=${ACME_QUEUE_DIR:-/var/db/kyriakon-acme-queue}
 
 usage() {
@@ -112,13 +112,8 @@ usage() {
 # mail table lines, vhosts and certificate. The platform's name is the first line
 # of mail_domains, read the way provision-member.sh reads it.
 domain_ok() {
-	typeset name="$1" platform
-	[ "${#name}" -le 253 ] || return 1
-	case "$name" in
-	*.*) ;;
-	*) return 1 ;;
-	esac
-	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' || return 1
+	typeset platform
+	valid_domain "$1" || return 1
 	# A table that is missing or empty refuses every name rather than guessing:
 	# without its first line there is no way to tell the operator's domain from a
 	# body's.
@@ -126,7 +121,7 @@ domain_ok() {
 	[ -n "$platform" ] || return 1
 	# kyriakon.com is the platform's defensive registration: the box serves it
 	# with its own certificate and relayd keypair, which a removal would delete.
-	case "$name" in
+	case "$1" in
 	"$platform" | *."$platform" | kyriakon.com | *.kyriakon.com) return 1 ;;
 	esac
 	return 0

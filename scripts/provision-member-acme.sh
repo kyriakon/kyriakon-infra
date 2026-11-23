@@ -67,6 +67,8 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 # shellcheck disable=SC1091 # resolves at runtime from this script's directory
 . "$script_dir/lib.sh"
 acme_d=${ACME_D:-/etc/acme-client.d}
+ssl_dir=${SSL_DIR:-/etc/ssl}
+ssl_private=${SSL_PRIVATE_DIR:-/etc/ssl/private}
 public_root=${PUBLIC_ROOT:-/home/www}
 acme_queue=${ACME_QUEUE:-/root/bin/acme-queue.sh}
 conf_owner="root:wheel"
@@ -87,8 +89,8 @@ die() {
 # The paths, as functions rather than variables so the self-test rebinds the
 # directory once and every caller follows.
 member_conf() { printf '%s/%s.kyriakon.net.conf' "$acme_d" "$user"; }
-cert_file() { printf '/etc/ssl/%s.kyriakon.net.fullchain.pem' "$user"; }
-key_file() { printf '/etc/ssl/private/%s.kyriakon.net.key' "$user"; }
+cert_file() { printf '%s/%s.kyriakon.net.fullchain.pem' "$ssl_dir" "$user"; }
+key_file() { printf '%s/%s.kyriakon.net.key' "$ssl_private" "$user"; }
 
 # The file body, printed rather than written so the caller can compare it with
 # what is already there. The comment says where it came from, because this file

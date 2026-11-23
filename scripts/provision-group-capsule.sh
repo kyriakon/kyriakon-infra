@@ -62,17 +62,12 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 # is never readable by anyone else even before the chmod below runs.
 umask 077
 
-# write_generated and the self-test harness, from the directory this script sits
-# in: deploy-mail.sh installs the two side by side.
-# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-. "$(dirname "$0")/lib.sh"
-
 # The base system's LibreSSL, which the runbook's step and this script agree on.
 openssl=/usr/bin/openssl
 
 gmid_d=/etc/gmid.d
-ssl_dir=/etc/ssl
-ssl_private=/etc/ssl/private
+ssl_dir=${SSL_DIR:-/etc/ssl}
+ssl_private=${SSL_PRIVATE_DIR:-/etc/ssl/private}
 public_root=/home/www
 # Written by scripts/provision-group-web.sh; the capsule reads the same tree.
 static_hosts=/etc/onboard/static-hosts
@@ -103,17 +98,11 @@ die() {
 # platform's own capsule. The name is the first line of mail_domains, and
 # kyriakon.com is refused for the reason remove-group.sh gives.
 domain_ok() {
-	typeset name="$1"
-	[ "${#name}" -le 253 ] || return 1
-	case "$name" in
-	*.*) ;;
-	*) return 1 ;;
-	esac
-	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' || return 1
+	valid_domain "$1" || return 1
 	# The platform's own names are the operator's, the rule the drain applies
 	# before it runs this lane; lib.sh holds the rule and its `kyriakon.com`
 	# clause so a hand-run does not need a second copy.
-	domain_is_platform "$name" "$mail_domains" && return 1
+	domain_is_platform "$1" "$mail_domains" && return 1
 	return 0
 }
 
@@ -152,7 +141,7 @@ EOF
 }
 
 pair_present() {
-	[ -f "$(capsule_cert)" ] && [ -f "$(capsule_key)" ]
+	capsule_pair_present "$(capsule_cert)" "$(capsule_key)" "$openssl"
 }
 
 write_capsule_cnf() {
@@ -193,27 +182,8 @@ ensure_capsule_pair() {
 		generated=yes
 	fi
 
-	# Staged beside the installed paths and renamed, so a reader never sees half
-	# a pair and an interrupted run leaves no certificate in place.
-	cert_candidate="$ssl_dir/.capsule-$domain.crt.tmp"
-	key_candidate="$ssl_private/.capsule-$domain.key.tmp"
-	rm -f "$cert_candidate" "$key_candidate"
-	if ! "$openssl" req -x509 -new -nodes -days 3650 -config "$(capsule_cnf)" \
-		-keyout "$key_candidate" -out "$cert_candidate"; then
-		rm -f "$cert_candidate" "$key_candidate"
-		die "$openssl req failed; nothing was installed, run this again"
-	fi
-	chmod 0644 "$cert_candidate"
-	chmod 0600 "$key_candidate"
-
-	for f in "$cert_candidate" "$key_candidate"; do
-		[ -s "$f" ] || die "$f is empty after the generation step"
-	done
-	"$openssl" x509 -in "$cert_candidate" -noout >/dev/null 2>&1 \
-		|| die "$cert_candidate does not parse as a certificate"
-	[ "$(stat -f '%Lp' "$key_candidate")" = 600 ] || die "$key_candidate is not mode 0600"
-	mv "$cert_candidate" "$cert"
-	mv "$key_candidate" "$key"
+	tls_ensure_capsule_pair "$cert" "$key" "$(capsule_cnf)" "$openssl" ||
+		die "the capsule pair could not be written; nothing was installed"
 
 	if [ "$generated" = no ]; then
 		printf 'capsule pair: generated at %s (ten years, %s)\n' "$cert" "$domain"
@@ -377,6 +347,16 @@ self_test() {
 	check "half a pair is rebuilt" "$(pair_present && echo yes || echo no)" yes
 	check "and says the account page fingerprint changed" \
 		"$(grep -c 'account page publishes has to be updated' "$tree/half.out")" 1
+
+	# A pair interrupted after openssl opened both paths: both files exist but
+	# the certificate is truncated, so presence needs a parse (#933).
+	: > "$(capsule_cert)"
+	: > "$(capsule_key)"
+	ensure_capsule_pair > "$tree/truncated.out" 2>&1
+	check "a truncated pair is rebuilt" "$(pair_present && echo yes || echo no)" yes
+	check "and the certificate is no longer empty" \
+		"$([ -s "$(capsule_cert)" ] && printf yes || printf no)" yes
+	check "and the key is mode 0600" "$(stat -f '%Lp' "$(capsule_key)")" 600
 
 	# 7. a site owner whose tree is not built is refused
 	account=nobody
