@@ -4340,8 +4340,9 @@ async fn keep_copy_join(
         .map_err(Error::from)
 }
 
-/// Write the shared record back with its answers gone and its payment join
-/// kept, so the card pass can still resolve a payment through it.
+/// Write the shared record back with its answers gone, keeping the payment join
+/// and the domain, so the card pass can resolve a payment through it and a
+/// declined body is still known to be a body.
 async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result<(), Error> {
     let mut kept = record.clone();
     kept.answers.clear();
@@ -4349,7 +4350,6 @@ async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result
     kept.upload_key = None;
     kept.acceptances.clear();
     kept.outside_address = None;
-    kept.domain = None;
     kept.password_link = None;
     kept.confirmation_at = None;
     let bytes = serde_json::to_vec_pretty(&kept).map_err(|source| Error::Json {

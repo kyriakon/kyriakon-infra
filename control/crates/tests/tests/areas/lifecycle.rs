@@ -1337,6 +1337,103 @@ fn a_declined_record_survives_ninety_days_and_purges_on_the_ninety_first() {
     );
 }
 
+/// A body's declined record keeps its domain through the ninety-day sweep, so
+/// the purge reads it as a body and not a half-made personal account. The
+/// applicant's own name is left alone even when the box already holds it.
+#[test]
+fn a_declined_body_keeps_its_domain_and_leaves_the_applicants_name_alone() {
+    let fix = Fix::new("decline-body-purge");
+    let record = fix.filed_body("warden");
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+
+    // The group approval journals `applying` and then fails at provisioning, so
+    // the purge's half-made test has a line to find under this token.
+    fix.provision_fails();
+    fix.decide("approve", "warden");
+    assert!(fix.drain().status.success());
+    let journal = fix.journal();
+    assert!(
+        journal.contains(&format!("\"status_token\":\"{TOKEN}\""))
+            && journal.contains("\"outcome\":\"applying\""),
+        "the approval left no half-made line: {journal}"
+    );
+
+    // The decline records the decision, and the record still names its domain.
+    fix.decide("decline", "warden");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let declined: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert!(
+        declined["stage"].as_str().unwrap().starts_with("declined"),
+        "{declined}"
+    );
+    assert_eq!(declined["domain"], json!("parish.example"), "{declined}");
+
+    // The applicant's name is on the box and in the keyring, with no account
+    // record, which is the shape a person purge would erase.
+    fix.set_passwd("warden:x:1000:1000::/home/warden:/sbin/nologin\n");
+    std::fs::create_dir_all(fix.dir.join("keyring")).unwrap();
+    std::fs::write(fix.dir.join("keyring/warden.asc"), "published key").unwrap();
+
+    // Past ninety days while the link still answers: the answers go and the
+    // domain stays.
+    fix.amend_application(TOKEN, |record| {
+        record["filed_at"] = json!(kyriakon_control_core::util::after_days(-100));
+    });
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let kept: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    assert_eq!(
+        kept["domain"],
+        json!("parish.example"),
+        "the domain went with the answers, so the purge reads a body as a person: {kept}"
+    );
+    assert!(
+        kept["answers"].as_object().is_some_and(|a| a.is_empty()),
+        "the answers survived the ninety days: {kept}"
+    );
+
+    // Both windows past: the record goes, and the applicant's box account and
+    // keyring entry are untouched.
+    fix.amend_application(TOKEN, |record| {
+        record["decided_at"] = json!(kyriakon_control_core::util::after_days(-8));
+    });
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir
+            .join(format!("store/applications/{TOKEN}.json"))
+            .exists(),
+        "the declined body's record was not purged"
+    );
+    assert!(
+        fix.passwd_file().contains("warden:"),
+        "the purge released a body applicant's name as a half-made person: {}",
+        fix.passwd_file()
+    );
+    assert!(
+        fix.dir.join("keyring/warden.asc").exists(),
+        "the purge removed a body applicant's published key"
+    );
+    assert!(
+        !fix.dir.join("store/holds/warden.json").exists(),
+        "the purge held a body applicant's name for ninety days"
+    );
+    let log = fix.scripts_log();
+    assert!(
+        !log.contains("delete-user.sh warden"),
+        "the purge deleted a body applicant's box account: {log}"
+    );
+    assert!(
+        !log.contains("publish-mail-key.sh --remove warden"),
+        "the purge removed a body applicant's key: {log}"
+    );
+    assert!(fix.journal().contains("purged"), "{}", fix.journal());
+}
+
 /// An approval that fails after `add-user.sh` leaves a live OS account, its
 /// Maildir, the keyring file and the virtuals line with no `account.json`: the
 /// record is written last. A decline must erase what the approval made rather

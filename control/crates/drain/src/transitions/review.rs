@@ -1422,10 +1422,8 @@ fn decline_body(record: &Record) -> String {
     let monastic = questions::is_monastic(record.answers.get("orders").map(String::as_str));
     let mut out = format!(
         "Your application for {} was not accepted this time.\n\n\
-         It stays on file for ninety days, as our privacy notice says, and then it is\n\
-         cleared away. The status link answers for a week, and the name is free again.\n\
-         To have us look again, reply if we wrote to you,\n\
-         or write to admin@kyriakon.net from anywhere.\n",
+         The status link answers for a week. To have us look again, reply if we wrote\n\
+         to you, or write to admin@kyriakon.net from anywhere.\n",
         record.username
     );
     if monastic {
