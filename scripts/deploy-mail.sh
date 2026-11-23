@@ -1131,14 +1131,18 @@ install -d -m 0755 -o root -g daemon /home/www/logs
 # change.
 # httpd creates a missing log 0644, so each must exist at 600 before httpd starts
 # in this same deploy; an empty file does not disturb a live one.
-for log in /home/www/logs/access.log /home/www/logs/error.log; do
+# shellcheck disable=SC2086 # HTTPD_LOGS is a deliberate space-separated list
+for name in $HTTPD_LOGS; do
+	log=/home/www/logs/$name
 	[ -e "$log" ] || : > "$log"
 done
-for log in /home/www/logs/access.log /home/www/logs/access.log.* \
-	/home/www/logs/error.log /home/www/logs/error.log.*; do
-	[ -f "$log" ] || continue
-	chmod 600 "$log"
-	chown root:wheel "$log"
+# shellcheck disable=SC2086 # HTTPD_LOGS is a deliberate space-separated list
+for name in $HTTPD_LOGS; do
+	for log in "/home/www/logs/$name" "/home/www/logs/$name".*; do
+		[ -f "$log" ] || continue
+		chmod 600 "$log"
+		chown root:wheel "$log"
+	done
 done
 # acme-client writes the HTTP-01 challenge here. The challenge is served by the
 # httpd vhosts, so it has to be inside httpd's chroot, and the default of

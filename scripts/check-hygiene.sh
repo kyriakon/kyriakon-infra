@@ -328,7 +328,8 @@ log_file_problems() {
 	typeset dir="$1" want="${2:-root:wheel}" name log got mode
 	# A deleted log is not a healthy one: httpd recreates it 0644, so its
 	# absence is the finding rather than a pass.
-	for name in access.log error.log; do
+	# shellcheck disable=SC2086 # HTTPD_LOGS is a deliberate space-separated list
+	for name in $HTTPD_LOGS; do
 		if [ ! -f "$dir/$name" ]; then
 			printf '%s: missing\n' "$dir/$name"
 			continue
@@ -368,6 +369,25 @@ finger_endpoints() {
 # The comparison above, the remedy lines and the address check below, against
 # fixtures, so a change to any of them is not a claim. Each drives a function
 # and not the box, which is why this can run anywhere.
+
+# expect_count <expected> <message> <pattern> <command>...
+#
+# Assert that <command>'s output has <expected> lines matching <pattern>. A bare
+# `grep -c` exits 1 when nothing matches, which under `set -e` ends the self-test
+# with no FAIL line, so the count is taken with `|| true` and every answer is
+# compared and reported.
+expect_count() {
+	typeset want="$1" message="$2" pattern="$3" out count
+	shift 3
+	out=$("$@" || true)
+	count=$(printf '%s\n' "$out" | grep -c -- "$pattern" || true)
+	[ "$count" = "$want" ] || {
+		printf 'FAIL: %s; wanted %s matching [%s], got %s in [%s]\n' \
+			"$message" "$want" "$pattern" "$count" "$out" >&2
+		exit 1
+	}
+}
+
 self_test() {
 	typeset dir out want
 	dir=$(mktemp -d "${TMPDIR:-/tmp}/check-hygiene-test.XXXXXX") || exit 1
@@ -773,45 +793,31 @@ EOF
 	# and client addresses, so a widened mode is a finding and the rotated copies
 	# are covered by the same glob.
 	mkdir "$dir/logs"
-	for name in access.log error.log; do
+	# shellcheck disable=SC2086 # HTTPD_LOGS is a deliberate space-separated list
+	for name in $HTTPD_LOGS; do
 		printf 'x\n' > "$dir/logs/$name"
 		printf 'x\n' > "$dir/logs/$name.0.gz"
 		chmod 600 "$dir/logs/$name" "$dir/logs/$name.0.gz"
 	done
 	pair=$(stat -f '%Su:%Sg' "$dir/logs/access.log")
-	out=$(log_file_problems "$dir/logs" "$pair")
-	[ -z "$out" ] || {
-		printf 'FAIL: a 600 access log is not a finding; got [%s]\n' "$out" >&2
-		exit 1
-	}
+	expect_count 0 "a 600 access log is not a finding" '.' \
+		log_file_problems "$dir/logs" "$pair"
 	chmod 400 "$dir/logs/access.log"
-	out=$(log_file_problems "$dir/logs" "$pair")
-	[ -z "$out" ] || {
-		printf 'FAIL: a 400 access log is not a finding; got [%s]\n' "$out" >&2
-		exit 1
-	}
+	expect_count 0 "a 400 access log is not a finding" '.' \
+		log_file_problems "$dir/logs" "$pair"
 	chmod 600 "$dir/logs/access.log"
 	chmod 644 "$dir/logs/access.log.0.gz"
-	out=$(log_file_problems "$dir/logs" "$pair" | grep -c 'access.log.0.gz')
-	[ "$out" = 1 ] || {
-		printf 'FAIL: a world-readable rotated log is a finding; got [%s]\n' "$out" >&2
-		exit 1
-	}
+	expect_count 1 "a world-readable rotated log is a finding" 'access\.log\.0\.gz' \
+		log_file_problems "$dir/logs" "$pair"
 	# The error log is a second file under the same glob; a check that read only
 	# access.log would call a widened error log clean.
 	chmod 644 "$dir/logs/error.log"
-	out=$(log_file_problems "$dir/logs" "$pair" | grep -c 'error\.log:')
-	[ "$out" = 1 ] || {
-		printf 'FAIL: a world-readable error log is a finding; got [%s]\n' "$out" >&2
-		exit 1
-	}
+	expect_count 1 "a world-readable error log is a finding" 'error\.log:' \
+		log_file_problems "$dir/logs" "$pair"
 	chmod 600 "$dir/logs/error.log"
 	rm "$dir/logs/error.log"
-	out=$(log_file_problems "$dir/logs" "$pair" | grep -c 'error\.log: missing')
-	[ "$out" = 1 ] || {
-		printf 'FAIL: a missing error log is a finding; got [%s]\n' "$out" >&2
-		exit 1
-	}
+	expect_count 1 "a missing error log is a finding" 'error\.log: missing' \
+		log_file_problems "$dir/logs" "$pair"
 	printf 'x\n' > "$dir/logs/error.log"
 	chmod 600 "$dir/logs/error.log"
 	# The live call passes no owner, so the default is what must be compared.
@@ -819,14 +825,8 @@ EOF
 	# default; the mode arm still runs there.
 	chmod 600 "$dir/logs/access.log.0.gz"
 	if [ "$(stat -f '%Su:%Sg' "$dir/logs/access.log")" != root:wheel ]; then
-		out=$(log_file_problems "$dir/logs")
-		case "$out" in
-		*access.log:*) ;;
-		*)
-			printf 'FAIL: a log not owned by root:wheel is a finding; got [%s]\n' "$out" >&2
-			exit 1
-			;;
-		esac
+		expect_count 1 "a log not owned by root:wheel is a finding" 'access\.log:' \
+			log_file_problems "$dir/logs"
 	fi
 
 	# Section 6: a commented-out guard is not the guard. Terraform ignores it, so
@@ -915,6 +915,9 @@ if [ "$(id -u)" -eq 0 ] && [ -d /home/www/logs ]; then
 		printf '%s\n' "$bad" | sed 's/^/  /'
 		printf '  doas chmod 600 /home/www/logs/access.log* /home/www/logs/error.log*\n'
 		printf '  doas chown root:wheel /home/www/logs/access.log* /home/www/logs/error.log*\n'
+		if printf '%s\n' "$bad" | grep -q ': missing$'; then
+			printf '  a missing log must be recreated first: run scripts/deploy-mail.sh, which creates both\n'
+		fi
 		status=1
 	fi
 else

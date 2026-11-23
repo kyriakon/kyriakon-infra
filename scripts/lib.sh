@@ -78,6 +78,13 @@ BACKUP_PATHS='/home
 /etc/ssh/authorized_keys'
 export BACKUP_PATHS
 
+# The httpd logs that newsyslog bounds and that the deploy and checks hold at
+# root:wheel 600. Both carry client addresses and request paths, and the access
+# log also carries capability URLs, so the list is single-sourced here rather
+# than typed per script: a third log added to newsyslog.conf must not leave a
+# checker or the deploy blind to it. Names are relative to /home/www/logs.
+export HTTPD_LOGS='access.log error.log'
+
 # Per-box values, so nothing has to be retyped or passed on a command line:
 # /root/.kyriakon-env, mode 0600, one 'export VAR=value' per line. The tracked
 # template is openbsd/etc/kyriakon.env in the repo, which deploy-mail.sh installs.

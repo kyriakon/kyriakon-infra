@@ -45,7 +45,7 @@ That covers stored content, not the addressing information mail needs to move. S
 
 | What | How long |
 | --- | --- |
-| Log records that identify you: smtpd envelope, Dovecot authentication, sshd, dns, the onboarding handler and httpd access logs | 7 days |
+| Log records that identify you: smtpd envelope, Dovecot authentication, sshd, dns, the onboarding handler, and httpd access and error logs (capability URLs and request paths) | 7 days |
 | Spam greylist and whitelist entries | about 36 days on the whitelist |
 | Application data for an application that is rejected or abandoned, and the text the triage model saw | 90 days |
 | An application draft you started but did not submit, with the answers given so far | 7 days after the last answer |
