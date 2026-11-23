@@ -203,19 +203,21 @@ works](https://docs.stripe.com/payments/managed-payments/how-it-works), read 202
 
 **ADR 0008 and `docs/refusals.md`.** The refusal list says "No customer list held by a
 payment processor", and the public check is "the payment state in the control plane,
-once it lands, with the processor holding no member list" (`docs/refusals.md`, line 50).
+once it lands, with the processor holding no member list" (the "A customer list held by
+a payment processor" refusal in `docs/refusals.md`).
 A MoR is a customer list held by a payment processor by definition. The processor is
 also the seller, so it holds the name, address and purchase history that the platform
 deliberately does not. This is not a wording problem. It reverses a refusal by choice
 that a reader can currently check.
 
-**`docs/transparency.md`.** "What it does not hold is a list of members" (lines 62 to
-64) becomes false for card payers under a MoR.
+**`docs/transparency.md`.** "What it does not hold is a list of members" (the "Payments"
+section) becomes false for card payers under a MoR.
 
 **`docs/threat-model.md`.** The table row "A card processor cannot unilaterally cut the
-platform off" (line 171) becomes false: the MoR can terminate the seller relationship
-and stop card sales. The seizure story also gains a third party that holds a member
-list, which is the property the platform's payment design exists to avoid.
+platform off" (the "Prepaid payment rails" row under "Defence priorities") becomes
+false: the MoR can terminate the seller relationship and stop card sales. The seizure
+story also gains a third party that holds a member list, which is the property the
+platform's payment design exists to avoid.
 
 **`docs/privacy.md`.** "We collect no postal address at signup or at approval" and "We
 hold no country on your account" remain true of the platform's own record, but checkout
@@ -247,8 +249,8 @@ you pay" promise unless the supplier controls the price in practice.
 - `docs/transparency.md`: the payments section.
 - `docs/threat-model.md`: the payment row and the third-party list.
 - `docs/terms.md`: seller, refunds, invoices, renewal reminders, statement descriptor.
-- `docs/planning/research/stripe-rail-set.md`: section 4 on Stripe Tax, section 5 on
-  the Customer object being compatible with ADR 0008.
+- `docs/planning/research/stripe-rail-set.md`: the "Stripe Tax" subsection, and the
+  Answer paragraph on the Customer object being compatible with ADR 0008.
 - `docs/planning/research/sole-trader-obligations.md`: sections 1.4 and 3.2, because
   the refund and invoice duties move to the seller.
 - `docs/planning/specs/prepaid-rails.md`: the card section and the "refusal list stays
@@ -262,10 +264,10 @@ you pay" promise unless the supplier controls the price in practice.
 card, cash by post, cash in hand, and Monero. The prepaid path is offered to every
 member, and nothing in the spec or the terms gates it by country. The terms say "You
 pay by card through Stripe, by cash by post, by cash in hand, or in Monero"
-(`docs/terms.md`, line 28), and the #163 resolution is that anyone may apply, anywhere,
-with the Union served once the OSS registration and the Article 27 representative
-exist. A Union consumer may therefore pay by cash or Monero today, and the platform is
-the seller for that supply.
+(`docs/terms.md`, "Price and payment"), and the #163 resolution is that anyone may
+apply, anywhere, with the Union served once the OSS registration and the Article 27
+representative exist. A Union consumer may therefore pay by cash or Monero today, and
+the platform is the seller for that supply.
 
 | Rail | Seller of record, recorded plan | Seller of record, with an MoR | Registration the operator still holds |
 |---|---|---|---|
@@ -426,10 +428,10 @@ processor fee and the operator's time per payment.
 No terms, privacy notice or ADR changes are proposed, because the recommendation
 confirms #163 and #249. There is no provider migration. The one documentation change
 worth a follow-up is the correction to `stripe-rail-set.md`: Stripe Tax Basic does not
-register the seller, but Tax Complete does, and the note's section 4 should say which
-plan it means. Section 5's statement that a Stripe Customer is compatible with ADR 0008
-should also be read against this note, because a Customer under a MoR is the customer
-list the ADR refuses.
+register the seller, but Tax Complete does, and the "Receipts, invoices and tax"
+section of that note should say which plan it means. The Answer's statement that a
+Stripe Customer is compatible with ADR 0008 should also be read against this note,
+because a Customer under a MoR is the customer list the ADR refuses.
 
 If the decision is ever reversed, the ADR to amend is 0008, not 0009. Its refusal item
 and the Consequences paragraph are what a MoR contradicts. That is a meta-repo change
