@@ -170,10 +170,6 @@ ensure_dir() {
 	return 0
 }
 
-# git_bin is the git the live run and the self-test share. The box installs it
-# under /usr/local/bin, which PATH above carries; GIT names another one.
-git_bin=${GIT:-git}
-
 # ensure_bare_repo <path> <owner> <group>: the member's default repository.
 # member-git-shell.sh serves only a path of the form ~/repos/<name>.git whose
 # directory resolves to itself, so the path is exactly that. Returns 0 when it
@@ -182,30 +178,39 @@ git_bin=${GIT:-git}
 # refused rather than adopted: a push into a non-bare repository would land in a
 # working tree nothing serves.
 ensure_bare_repo() {
-	typeset path owner group
+	typeset path owner group unowned
 	path=$1
 	owner=$2
 	group=$3
-	# Same reason as ensure_dir: install and chown must never follow a link the
-	# member planted in their own home.
-	refuse_symlink "$path"
+	# A link at the repository name, or at ~/repos itself, would send the init,
+	# chmod and chown below through it into another tree. The parent is checked
+	# again here because it can be replaced between ensure_dir and this call.
+	refuse_symlink "${path%/*}" "$path"
 	if [ -e "$path" ]; then
 		if [ ! -d "$path" ] ||
-			[ "$("$git_bin" -c safe.directory="$path" --git-dir="$path" \
+			[ "$(git -c safe.directory="$path" --git-dir="$path" \
 				rev-parse --is-bare-repository 2>/dev/null)" != true ]; then
 			printf '%s exists and is not a bare git repository\n' "$path" >&2
 			printf 'refusing to adopt a directory the git session cannot serve\n' >&2
 			exit 1
 		fi
-		if [ "$(stat -f '%Su:%Sg %Lp' "$path")" = "$owner:$group $(strip_mode 0700)" ]; then
+		# The top directory's shape is not the whole shape. A repository made by
+		# hand as root leaves objects/ and refs/ in root's ownership, which git
+		# refuses to the member, so the whole tree is checked and corrected with
+		# the same chown the creation branch makes.
+		unowned=$(find "$path" \( ! -user "$owner" -o ! -group "$group" \) -print |
+			wc -l | tr -d ' ')
+		if [ "$(stat -f '%Su:%Sg %Lp' "$path")" = "$owner:$group $(strip_mode 0700)" ] &&
+			[ "$unowned" -eq 0 ]; then
 			return 1
 		fi
 		install -d -m 0700 -o "$owner" -g "$group" "$path"
+		chown -R "$owner:$group" "$path"
 		return 0
 	fi
 	# The umask keeps every path git writes at 0700/0600 before the chown, so
 	# nothing it creates is ever readable by the member's group or others.
-	(umask 077 && "$git_bin" init --bare --quiet "$path") || {
+	(umask 077 && git init --bare --quiet "$path") || {
 		printf 'git init --bare %s failed\n' "$path" >&2
 		exit 1
 	}
@@ -359,6 +364,10 @@ self_test() {
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin
 	tree=$self_test_work
+	# The wrapper compares a repository path with its canonical parent, and
+	# mktemp can hand back a symlinked component (macOS /var). Resolve the tree
+	# once here so the push fixture and the repository it names agree.
+	tree=$(cd "$tree" && pwd -P)
 	# smtpd -n validates the live tree, maildir and filter, which this fixture
 	# does not have. The deploy self-test proves the parser check with a stub.
 	export SMTPD_CONF_CHECK=no
@@ -489,15 +498,18 @@ self_test() {
 	( ensure_bare_repo "$repo" "$(id -un)" "$(id -gn)" ) >/dev/null 2>&1 || rc=$?
 	check "the default repository is created" "$rc" 0
 	check "and git reads it as bare" \
-		"$("$git_bin" --git-dir="$repo" rev-parse --is-bare-repository 2>/dev/null)" true
+		"$(git --git-dir="$repo" rev-parse --is-bare-repository 2>/dev/null)" true
 	check "owned by the member" \
 		"$(stat -f '%Su:%Sg' "$repo")" "$(id -un):$(id -gn)"
 	check "at the mode the other per-member directories use" \
 		"$(stat -f '%Lp' "$repo")" 700
 	repo_inode=$(stat -f '%i' "$repo")
 	rc=0
-	( ensure_bare_repo "$repo" "$(id -un)" "$(id -gn)" ) >/dev/null 2>&1 || rc=$?
+	( ensure_bare_repo "$repo" "$(id -un)" "$(id -gn)" ) \
+		>/dev/null 2>"$tree/repo-second.err" || rc=$?
 	check "a second run leaves it alone" "$rc" 1
+	check "and says nothing" \
+		"$(wc -c <"$tree/repo-second.err" | tr -d ' ')" 0
 	check "and does not replace it" "$(stat -f '%i' "$repo")" "$repo_inode"
 	# A mode that drifted is corrected by the same body, so a later run does not
 	# leave a repository the git session cannot read.
@@ -528,6 +540,45 @@ self_test() {
 		"$(stat -f '%Lp' "$tree/repos/planted-target")" 755
 	check "and the refusal names the link" \
 		"$(grep -c 'is a symlink' "$tree/repo-link.err")" 1
+	# ~/repos itself is the member's and can be swapped between ensure_dir and
+	# this call, so the parent is refused as well.
+	ln -s "$tree/repos" "$tree/repos-link"
+	rc=0
+	( ensure_bare_repo "$tree/repos-link/pass.git" "$(id -un)" "$(id -gn)" ) \
+		>/dev/null 2>"$tree/repo-parent.err" || rc=$?
+	check "a repository under a symlinked parent is refused" "$rc" 1
+	check "and the refusal names the parent" \
+		"$(grep -c "$tree/repos-link is a symlink" "$tree/repo-parent.err")" 1
+
+	# The push itself, through the live wrapper. git runs the fixture as its
+	# remote receive-pack program; the fixture sources the wrapper and names the
+	# fixture home, so the request crosses resolve_repo and the receive-pack
+	# dispatch the session uses. The connection sshd would provide is the only
+	# part not exercised.
+	git_path=$(command -v git)
+	mkdir -p "$tree/bin"
+	cat >"$tree/bin/receive-pack-fixture" <<EOF
+#!/bin/ksh
+. '$script_dir/member-git-shell.sh'
+home='$tree'
+git='$git_path'
+run_command "git-receive-pack '\$1'"
+EOF
+	chmod 0755 "$tree/bin/receive-pack-fixture"
+	mkdir "$tree/push-src"
+	git -C "$tree/push-src" init -q
+	printf 'hello\n' >"$tree/push-src/readme"
+	git -C "$tree/push-src" add -A
+	git -C "$tree/push-src" -c user.email=self-test@example.invalid \
+		-c user.name='self test' -c commit.gpgsign=false commit -qm one
+	rc=0
+	git -C "$tree/push-src" push -q \
+		--receive-pack="$tree/bin/receive-pack-fixture" \
+		"$repo" HEAD:refs/heads/main >"$tree/push.out" 2>&1 || rc=$?
+	check "a push through the member git shell lands" "$rc" 0
+	check "and the pushed commit is the repository's tip" \
+		"$(git --git-dir="$repo" rev-parse refs/heads/main 2>/dev/null)" \
+		"$(git -C "$tree/push-src" rev-parse HEAD)"
 
 	self_test_end
 }
