@@ -173,10 +173,15 @@ the 13-asterisk password sentinel is still accepted). The file
 carries no comments and no blank lines, only `question = answer`, so that nothing about
 parsing is left to chance. This section is where the reasoning lives.
 
-That file is served verbatim at `https://kyriakon.net/install.conf`, since the site's
-document root is a git checkout and the URL has to be short enough to type into a VNC
-console. It must keep the name `install.conf`: the installer reads install-versus-upgrade
-out of the URL's filename, and answering that prompt is one more thing to type.
+That file is installed at `https://kyriakon.net/install.conf` by
+`scripts/deploy-mail.sh`, which copies the tracked file into the landing site's
+document root. The `scripts/install-set.tsv` row is what routes a change to that
+deploy, so the served copy follows the repository rather than a hand edit on the
+box. `scripts/check-hygiene.sh` compares the served bytes with the tracked ones;
+run it before building or refreshing a template. The URL is short because it is
+typed into a VNC console. The name has to stay `install.conf`: the installer
+reads install-versus-upgrade out of the URL's filename, and answering that
+prompt is one more thing to type.
 
 The prompts worth knowing, all read out of the ramdisk: the location prompt re-asks when the
 answer is empty, so a mistyped URL costs a retry rather than a Ctrl-C, and the questions
@@ -255,9 +260,11 @@ back into the same FFS blocks. The signature-verified `bsd.rd` from the release 
 the same kernel under its release name, so it can be used directly instead of extracting from
 the image, if the modified kernel can be written back where the boot loader looks for it.
 
-Until that exists, the URL route is the one to use, and the URL is kept short deliberately:
-`https://kyriakon.net/install.conf`, served from the site's document root, which is a git
-checkout. The canonical copy is in this repo at `openbsd/restore-template/install.conf`.
+Until that exists, the URL route is the one to use, and the URL is kept short:
+`https://kyriakon.net/install.conf`, served from the landing site's document root.
+The canonical copy is in this repo at `openbsd/restore-template/install.conf`, and
+`scripts/deploy-mail.sh` installs it from there. `scripts/check-hygiene.sh` reports
+whether the served copy still matches the tracked file.
 
 The client's config is a trap of its own, found the hard way. `PermitRootLogin` is an
 `sshd_config` directive. In `/etc/ssh/ssh_config`, which is the client's file, ssh refuses

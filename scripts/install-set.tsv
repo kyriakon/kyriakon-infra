@@ -9,10 +9,12 @@
 #
 # Columns, tab-separated:
 #
-#   script         the file in scripts/, or a compiled binary's name
+#   script         the file in scripts/, a path from the repository root when it
+#                  starts with openbsd/, or a compiled binary's name
 #   destination    /root/bin, /usr/local/libexec, /usr/local/sbin for the drain
 #                  binary, drain for the directory the drain's own config names,
-#                  or checkout for a script cron runs from the checkout itself
+#                  checkout for a script cron runs from the checkout itself, or
+#                  a document root under /home/www for a file httpd serves
 #   schedule       the five cron fields, or - when nothing schedules it
 #   args           the arguments the cron line passes, empty when there are none
 #   deploy_route   comma-separated: the deploys a change needs (mail, control,
@@ -46,6 +48,12 @@ self-test-all.sh	checkout	0 5 * * 1		none	-	active
 # Rendered into the capsule by the control deploy, and the finger page written
 # by the mail deploy, both from the checkout rather than installed.
 gen-finger-page.sh	checkout	-		mail	-	active
+# The restore template's installer answers, served from the landing site's
+# document root at https://kyriakon.net/install.conf and fetched at the VNC
+# console. The source is tracked outside scripts/, so the row names its repo
+# path; deploy-mail.sh installs it and check-hygiene.sh compares the served copy
+# with the tracked one.
+openbsd/restore-template/install.conf	/home/www/kyriakon.net/www	-		mail	install.conf	active
 render-docs.sh	checkout	-		control	-	active
 # Operator-run: the plan prints the env step, whether the reason is the script or
 # the values file it writes.

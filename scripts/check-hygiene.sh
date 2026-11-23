@@ -103,6 +103,22 @@ domains_missing_from() {
 	done < "$list"
 }
 
+# served_copy_problem <tracked> <served>
+#
+# One line when the document root's copy is missing or differs from the tracked
+# one, and nothing when the bytes agree. httpd serves the doc-root file directly,
+# so this is the bytes the restore installer fetches at the VNC console: they
+# decide root access and disk encryption for every image built from the template.
+served_copy_problem() {
+	typeset tracked="$1" served="$2"
+	if [ ! -f "$served" ]; then
+		printf '%s: not installed, and the installer fetches it from the web\n' "$served"
+		return 0
+	fi
+	cmp -s "$served" "$tracked" \
+		|| printf '%s differs from %s\n' "$served" "$tracked"
+}
+
 # tool_remedy <tool>... — one line of remedy per tool cron could not find.
 #
 # Takes the absent list rather than reading a loop variable: a caller's `tool`
@@ -701,6 +717,29 @@ EOF
 	*) printf 'FAIL: a missing installed table is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
 	esac
 
+	# The restore response file served from the doc root: the installer trusts
+	# these bytes, so a matching copy passes and a missing or stale one is a
+	# finding.
+	printf 'same\n' > "$dir/tracked-install.conf"
+	printf 'same\n' > "$dir/served-install.conf"
+	out=$(served_copy_problem "$dir/tracked-install.conf" "$dir/served-install.conf")
+	[ -z "$out" ] || {
+		printf 'FAIL: matching served bytes are not a finding; got [%s]\n' "$out" >&2
+		exit 1
+	}
+	printf 'old\n' > "$dir/served-install.conf"
+	out=$(served_copy_problem "$dir/tracked-install.conf" "$dir/served-install.conf")
+	case "$out" in
+	*"$dir/served-install.conf differs"*) ;;
+	*) printf 'FAIL: a stale served copy is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+	rm "$dir/served-install.conf"
+	out=$(served_copy_problem "$dir/tracked-install.conf" "$dir/served-install.conf")
+	case "$out" in
+	*"not installed"*) ;;
+	*) printf 'FAIL: a missing served copy is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+
 	# The member session shell and the renamed login checker are the
 	# /usr/local/libexec rows; a stale copy is a finding for the same reason
 	# /root/bin's is, and the installed name comes from the row.
@@ -1275,6 +1314,30 @@ if [ -n "$stale_vhosts" ]; then
 	status=1
 else
 	printf 'generated vhosts: every one hands its paths to the responder\n'
+fi
+
+# --- 12. the restore response file the installer fetches -------------------
+# The installer at the VNC console fetches https://kyriakon.net/install.conf,
+# and httpd serves it straight from the landing site's document root. The bytes
+# decide the root key, the password policy and disk encryption for every image
+# built from the template, so a copy that differs from the tracked one is a
+# second, unreviewed answer to those questions. deploy-mail.sh installs it from
+# the row in install-set.tsv; this compares what is served with what is tracked.
+tracked_install_conf="$repo_dir/openbsd/restore-template/install.conf"
+served_install_conf=/home/www/kyriakon.net/www/install.conf
+if [ ! -f "$tracked_install_conf" ]; then
+	printf 'restore response file: %s is missing from the checkout, so the served copy was not compared\n' \
+		"$tracked_install_conf"
+	status=1
+else
+	install_conf_problem=$(served_copy_problem "$tracked_install_conf" "$served_install_conf")
+	if [ -n "$install_conf_problem" ]; then
+		printf 'restore response file: %s\n' "$install_conf_problem"
+		printf '  scripts/deploy-mail.sh installs it from the manifest row; rerun it from this checkout\n'
+		status=1
+	else
+		printf 'restore response file: the served copy matches the tracked one\n'
+	fi
 fi
 
 exit "$status"

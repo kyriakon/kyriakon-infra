@@ -171,6 +171,10 @@ classify() {
 	# key-walkthrough.md into the capsule and stamps the release, so a docs change
 	# is that deploy; `*.md` below is the rest of the tree's markdown.
 	docs/*) needs_control=yes ;;
+	# The restore installer's response file is served from the landing site's
+	# document root, which deploy-mail installs it into, so a change is that
+	# deploy. The rest of the template is used at build time and never deployed.
+	openbsd/restore-template/install.conf) needs_mail=yes ;;
 	.github/* | .githooks/* | .omp/* | openbsd/restore-template/*) : ;;
 	*.md) : ;;
 	*) return 1 ;;
@@ -635,6 +639,12 @@ self_test() {
 	classify 'openbsd/etc/kyriakon.env'
 	check 'the env template does not plan a mail deploy' "$needs_mail" no
 	check 'the env template is a manual step' "$manual_env" yes
+	reset_plan
+	classify 'openbsd/restore-template/install.conf'
+	check 'the restore response file plans deploy-mail' "$needs_mail" yes
+	reset_plan
+	classify 'openbsd/restore-template/prepare-disk.sh'
+	check 'the rest of the restore template plans no deploy' "$(plan_order)" ''
 	reset_plan
 	classify 'openbsd/etc/login.conf.d/hello'
 	check 'the portal login class is a manual step' "$manual_sshd_onboard" yes
