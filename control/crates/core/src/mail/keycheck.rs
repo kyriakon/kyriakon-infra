@@ -247,6 +247,38 @@ impl Drop for ScratchHome {
     }
 }
 
+/// Run gpg in `home` with the shared batch options and the caller's argument
+/// tail. `Ok(None)` is gpg exiting non-zero; `Err` is gpg failing to run. The
+/// returned string is gpg's status lines, which the caller reads for the
+/// signature verdict.
+async fn run_gpg<F>(gpg: &str, home: &Path, tail: F) -> Result<Option<String>, Error>
+where
+    F: FnOnce(&mut Command),
+{
+    let mut run = Command::new(gpg);
+    run.args(["--batch", "--no-tty", "--no-options", "--homedir"])
+        .arg(home);
+    tail(&mut run);
+    let out = run
+        .output()
+        .await
+        .map_err(|e| Error::context(format!("cannot run {gpg}"), e))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// The fingerprint in gpg's `[GNUPG:] VALIDSIG <fingerprint> <date> ...` line:
+/// the key that made the signature, or `None` when no line reports one.
+fn valid_sig(status: &str) -> Option<String> {
+    status.lines().find_map(|line| {
+        line.strip_prefix("[GNUPG:] VALIDSIG ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_string)
+    })
+}
+
 /// Verify `payload` with the public key in `key_file`, in a scratch GNUPGHOME
 /// holding only that key, so a good signature is by that key and by nothing
 /// else. `signature` is a detached signature; `None` means `payload` is itself
@@ -264,34 +296,25 @@ pub async fn verify_signature(
     tokio::fs::write(&message, payload)
         .await
         .map_err(|e| Error::context(format!("cannot write {}", message.display()), e))?;
-    let mut verify = Command::new(gpg);
-    verify
-        .args(["--batch", "--no-tty", "--no-options", "--homedir"])
-        .arg(home.path())
-        .args(["--status-fd", "1", "--verify"]);
-    if let Some(signature) = signature {
-        let sig = home.file("signature.asc");
-        tokio::fs::write(&sig, signature)
-            .await
-            .map_err(|e| Error::context(format!("cannot write {}", sig.display()), e))?;
-        verify.arg(sig);
-    }
-    let out = verify
-        .arg(&message)
-        .output()
-        .await
-        .map_err(|e| Error::context(format!("cannot run {gpg}"), e))?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    // gpg's own report names the key that made the signature; the status
-    // line is `VALIDSIG <fingerprint> <date> ...`.
-    let status = String::from_utf8_lossy(&out.stdout);
-    Ok(status.lines().find_map(|line| {
-        line.strip_prefix("[GNUPG:] VALIDSIG ")
-            .and_then(|rest| rest.split_whitespace().next())
-            .map(str::to_string)
-    }))
+    let signature = match signature {
+        Some(signature) => {
+            let sig = home.file("signature.asc");
+            tokio::fs::write(&sig, signature)
+                .await
+                .map_err(|e| Error::context(format!("cannot write {}", sig.display()), e))?;
+            Some(sig)
+        }
+        None => None,
+    };
+    let status = run_gpg(gpg, home.path(), |run| {
+        run.args(["--status-fd", "1", "--verify"]);
+        if let Some(signature) = &signature {
+            run.arg(signature);
+        }
+        run.arg(&message);
+    })
+    .await?;
+    Ok(status.as_deref().and_then(valid_sig))
 }
 
 /// The plaintext GnuPG itself extracted from a clearsigned message, and the
@@ -319,25 +342,14 @@ pub async fn verify_clearsigned(
         .await
         .map_err(|e| Error::context(format!("cannot write {}", message.display()), e))?;
     let output = home.file("plaintext");
-    let out = Command::new(gpg)
-        .args(["--batch", "--no-tty", "--no-options", "--homedir"])
-        .arg(home.path())
-        .args(["--status-fd", "1", "--output"])
-        .arg(&output)
-        .arg("--decrypt")
-        .arg(&message)
-        .output()
-        .await
-        .map_err(|e| Error::context(format!("cannot run {gpg}"), e))?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    let status = String::from_utf8_lossy(&out.stdout);
-    let Some(fingerprint) = status.lines().find_map(|line| {
-        line.strip_prefix("[GNUPG:] VALIDSIG ")
-            .and_then(|rest| rest.split_whitespace().next())
-            .map(str::to_string)
-    }) else {
+    let status = run_gpg(gpg, home.path(), |run| {
+        run.args(["--status-fd", "1", "--output"])
+            .arg(&output)
+            .arg("--decrypt")
+            .arg(&message);
+    })
+    .await?;
+    let Some(fingerprint) = status.as_deref().and_then(valid_sig) else {
         return Ok(None);
     };
     let plaintext = tokio::fs::read(&output)
