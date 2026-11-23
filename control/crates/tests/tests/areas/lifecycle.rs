@@ -4020,6 +4020,68 @@ fn removing_a_mailbox_takes_exactly_its_account_and_entries() {
     assert!(fix.scripts_log().contains("delete-user.sh parish-office"));
 }
 
+/// A failed unpublish is not lost: the pass removed the group member, its
+/// record and its box account before the script failed, so the retry finds the
+/// hold and repeats the close steps instead of settling over a published key.
+#[test]
+fn a_failed_unpublish_is_retried_after_the_account_has_gone() {
+    let fix = Fix::new("group-remove-unpublish-retry");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[
+            ("secretary", "parish-secretary"),
+            ("office", "parish-office"),
+        ],
+        &["parish-secretary", "parish-office"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    let keyring = fix.dir.join("keyring/parish-office.asc");
+    assert!(keyring.exists());
+
+    fix.publish_fails();
+    fix.file_address("parish.example", "remove", "", "parish-office", None, None);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(fix.intents().len(), 1, "the intent waits for the retry");
+    assert!(
+        !fix.passwd_file().contains("parish-office:"),
+        "{}",
+        fix.passwd_file()
+    );
+    assert!(!fix.dir.join("store/accounts/parish-office").exists());
+    assert!(
+        keyring.exists(),
+        "the keyring entry stays while the unpublish has failed"
+    );
+    assert_eq!(fix.names("holds"), vec!["parish-office.json"]);
+
+    // The forge works again. The retry must repeat the cleanup that the first
+    // pass began after the record and the account had already gone.
+    let log = fix.path("scripts.log");
+    fix.script(
+        "publish-mail-key.sh",
+        &format!("#!/bin/sh\necho \"publish-mail-key.sh $*\" >> '{log}'\n"),
+    );
+    fix.age_failures();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.intents().is_empty(), "{:?}", fix.intents());
+    assert!(
+        !keyring.exists(),
+        "the retry settled without removing the keyring entry"
+    );
+    assert_eq!(
+        fix.scripts_log()
+            .matches("publish-mail-key.sh --remove parish-office")
+            .count(),
+        2,
+        "the unpublish was not retried: {}",
+        fix.scripts_log()
+    );
+}
+
 /// A valid signature does not cover a swapped mail key: the material is hashed
 /// into the payload, so changing it while keeping `sig` is refused and nothing
 /// is installed or published.
