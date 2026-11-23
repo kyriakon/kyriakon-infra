@@ -67,6 +67,10 @@ restore-test.sh	-	-		none	-	active
 # The drain binary is compiled, installed by deploy-control.sh into sbin and
 # scheduled every minute: its line is a row like the scripts', not an arm.
 kyriakon-control-drain	/usr/local/sbin	* * * * *		control	kyriakon-control-drain	active
+kyriakon-control	/usr/local/sbin	-		control	kyriakon-control	active
+kyriakon-control-static	/usr/local/sbin	-		control	kyriakon-control-static	active
+kyriakon-admin	/usr/local/sbin	-		control	kyriakon-admin	active
+kyriakon-control-tui	/usr/local/sbin	-		control	kyriakon-control-tui	active
 
 lib.sh	drain	-		control	-	active
 lib/atomic-fs.sh	drain	-		control	-	active
@@ -100,6 +104,14 @@ member-git-shell.sh	drain	-		control	-	active
 
 member-git-shell.sh	/usr/local/libexec	-		mail	-	active
 filter-fromcheck.sh	/usr/local/libexec	-		mail	-	active
+# deploy-control.sh installs lib.sh and its modules beside the login checker,
+# which sources them; their route is what keeps deploy-mail.sh from taking them.
+lib.sh	/usr/local/libexec	-		control	lib.sh	active
+lib/atomic-fs.sh	/usr/local/libexec	-		control	-	active
+lib/tls-acme.sh	/usr/local/libexec	-		control	-	active
+lib/identity.sh	/usr/local/libexec	-		control	-	active
+lib/manifest.sh	/usr/local/libexec	-		control	-	active
+lib/paths.sh	/usr/local/libexec	-		control	-	active
 # The checker runs as root under a doas rule, so it is installed under a name
 # without the .sh suffix; the name is the row's, not a private rename table's.
 kyriakon-authcheck.sh	/usr/local/libexec	-		control	kyriakon-authcheck	active

@@ -471,13 +471,20 @@ STUB
 		printf 'self-test: the env template, setup-env and deploy-control disagree\n' >&2
 		exit 1
 	}
-	for v in POSTAL_ADDRESS KYRIAKON_IPV4 KYRIAKON_IPV6 \
-		STRIPE_PAYMENT_LINK STRIPE_GROUP_PAYMENT_LINK; do
-		case " $KYRIAKON_ENV_KEYS " in
-		*" $v "*) ;;
-		*) printf 'self-test: deploy-control requires %s, which the registry does not name\n' "$v" >&2; exit 1 ;;
-		esac
-	done
+	# A brace-less read is the shape deploy-control uses; the scan has to see it.
+	# shellcheck disable=SC2016 # fixture text, not this script's variable
+	printf 'value=$KYRIAKON_IPV4\n' > "$work/env-scan-known.sh"
+	env_keys_agree "$repo/openbsd/etc/kyriakon.env" "$work/env-scan-known.sh" || {
+		printf 'self-test: a brace-less registry key was not recognised\n' >&2
+		exit 1
+	}
+	unknown_key=NOT_IN_REGISTRY
+	# shellcheck disable=SC2016 # the $ is fixture text, not an expansion
+	printf 'value=$%s\n' "$unknown_key" > "$work/env-scan-unknown.sh"
+	if env_keys_agree "$repo/openbsd/etc/kyriakon.env" "$work/env-scan-unknown.sh" 2>/dev/null; then
+		printf 'self-test: a brace-less unknown key was accepted\n' >&2
+		exit 1
+	fi
 
 	# shellcheck disable=SC2154 # self_test_begin in lib.sh owns the counter
 	[ "$self_test_fails" -eq 0 ] || exit 1

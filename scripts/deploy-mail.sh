@@ -1012,6 +1012,11 @@ EOF
 	check "and names the suffixless login checker's install" \
 		"$(manifest_installed_name "$install_set" kyriakon-authcheck.sh /usr/local/libexec)" \
 		kyriakon-authcheck
+	# The login checker and the modules it sources are the control deploy's, so
+	# this deploy must not install them just because they share its directory.
+	check "the mail libexec set excludes the control rows" \
+		"$(manifest_targets_route "$install_set" /usr/local/libexec mail |
+			grep -cE '^(kyriakon-authcheck\.sh|lib\.sh|lib/)' || true)" 0
 
 	self_test_end
 }
@@ -1615,7 +1620,7 @@ printf 'mail_from: %s entries\n' "$(grep -c . "$mail_from_table" || true)"
 # the command when the filter starts, so a missing one is a filter that never
 # registers). root:wheel 0755, which a member can read and execute and cannot
 # write, and which is not in the PATH a member session is handed.
-libexec_targets=$(manifest_targets "$install_set" /usr/local/libexec) \
+libexec_targets=$(manifest_targets_route "$install_set" /usr/local/libexec mail) \
 	|| { printf 'cannot read %s\n' "$install_set" >&2; exit 1; }
 [ -n "$libexec_targets" ] \
 	|| { printf '%s names no /usr/local/libexec script\n' "$install_set" >&2; exit 1; }
@@ -1855,7 +1860,7 @@ install -d -m 0755 /root/bin/lib
 # line pasted by hand too, which is how the monitor spent a week unscheduled.
 # cron-apply.sh puts the lines in; it can only do that if the files it names are
 # deployed first.
-root_bin=$(manifest_targets "$install_set" /root/bin) \
+root_bin=$(manifest_targets_route "$install_set" /root/bin mail) \
 	|| { printf 'cannot read %s\n' "$install_set" >&2; exit 1; }
 [ -n "$root_bin" ] \
 	|| { printf '%s names no /root/bin script\n' "$install_set" >&2; exit 1; }

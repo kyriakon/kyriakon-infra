@@ -85,6 +85,23 @@ manifest_targets() {
 	}'
 }
 
+# manifest_targets_route <table> <destination> <route>: the same, restricted to
+# rows whose deploy_route names <route>. A destination can hold files from two
+# deploys (the login checker beside the mail filter), and the route is what says
+# which one installs it.
+manifest_targets_route() {
+	typeset rows
+	rows=$(manifest_rows "$1") || return 1
+	[ -n "$rows" ] || return 0
+	printf '%s\n' "$rows" | awk -F'\t' -v d="$2" -v r="$3" '
+		$2 != d { next }
+		route = "," $5 ","
+		if (index(route, "," r ",") == 0) next
+		name = ($6 == "" || $6 == "-" ? $1 : $6)
+		print $1 "\t" name
+	}'
+}
+
 # manifest_retired_names <table> <destination>: installed names the retired
 # rows say must be absent there.
 manifest_retired_names() {

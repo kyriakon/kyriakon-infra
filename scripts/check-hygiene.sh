@@ -638,6 +638,16 @@ EOF
 	*gone*) ;;
 	*) printf 'FAIL: a missing directory is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
 	esac
+	# A retired row is an uninstall: a copy still at its destination is stale
+	# even though no active row names it.
+	printf 'gone.sh\t/root/bin\t-\t\tmail\t-\tretired\n' >>"$dir/table"
+	printf 'old\n' >"$dir/deployed/gone.sh"
+	out=$(deployed_drift "$dir/checkout" "$dir/table" /root/bin "$dir/deployed")
+	case "$out" in
+	*"gone.sh: retired"*) ;;
+	*) printf 'FAIL: a retired installed copy is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+	rm -f "$dir/deployed/gone.sh"
 	# A destination the table does not use takes nothing from it: the rows above
 	# are /root/bin's, so a drain check on a directory holding an identical table
 	# copy and no drain rows has nothing to report.
@@ -1122,8 +1132,8 @@ fi
 
 # --- 9. the scripts the box runs are the scripts the checkout has ---------
 # The deploys install the rows of scripts/install-set.tsv into /root/bin, the
-# drain's directory, and /usr/local/libexec, and nothing reads them again
-# afterwards. A box running
+# drain's directory, /usr/local/libexec and /usr/local/sbin, and nothing reads
+# them again afterwards. A box running
 # copies older than its checkout gives no sign at all: operator mail went out
 # without the subject fix for months, and it surfaced because someone happened to
 # look at a subject line. A row with no installed file is the same finding from

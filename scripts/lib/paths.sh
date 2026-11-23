@@ -1,33 +1,21 @@
 #!/bin/ksh
-# paths.sh: one registry for the paths the box fixes. Sourced by lib.sh.
+# paths.sh: one registry for the box paths the shell scripts share. Sourced by
+# lib.sh. A value only one script reads stays in that script rather than here.
 #
 # openbsd/etc/onboard/drain.toml is the drain's copy of the same values, read by
 # the Rust side. Shell scripts cannot source TOML, so this is the shell copy and
 # paths_match_drain_toml is the check that keeps the two from drifting.
 
 KYRIAKON_STORE_ROOT=/var/db/onboard
-KYRIAKON_RESERVED_FILE=$KYRIAKON_STORE_ROOT/reserved-usernames.txt
-KYRIAKON_DRAIN_SCRIPTS=/usr/local/libexec/kyriakon/scripts
 KYRIAKON_MAIL_DOMAINS=/etc/mail/mail_domains
 KYRIAKON_VIRTUALS=/etc/mail/virtuals
 KYRIAKON_MAIL_FROM=/etc/mail/mail_from
 KYRIAKON_DKIM_DOMAINS=/etc/mail/dkim_domains
 KYRIAKON_SPAMD_ALLOWED=/etc/mail/spamd.alloweddomains
 KYRIAKON_KEYRING_DIR=/etc/kyriakon/keys
-KYRIAKON_ONBOARD_DIR=/etc/kyriakon/onboard
-KYRIAKON_APPROVAL_KEY=$KYRIAKON_ONBOARD_DIR/approval-signing-key
-KYRIAKON_MAIL_DIR=$KYRIAKON_STORE_ROOT/mail/new
-KYRIAKON_BOUNCE_DIR=$KYRIAKON_STORE_ROOT/bounce/new
-KYRIAKON_RATES=$KYRIAKON_STORE_ROOT/rates/xmr-gbp.json
-KYRIAKON_PROOF_DIR=/var/db/kyriakon/logins
-KYRIAKON_PUBLIC_ROOT=/home/www
-KYRIAKON_CHECKOUT=/usr/local/src/kyriakon-infra
-export KYRIAKON_STORE_ROOT KYRIAKON_RESERVED_FILE KYRIAKON_DRAIN_SCRIPTS
-export KYRIAKON_MAIL_DOMAINS KYRIAKON_VIRTUALS KYRIAKON_MAIL_FROM
-export KYRIAKON_DKIM_DOMAINS KYRIAKON_SPAMD_ALLOWED KYRIAKON_KEYRING_DIR
-export KYRIAKON_ONBOARD_DIR KYRIAKON_APPROVAL_KEY KYRIAKON_MAIL_DIR
-export KYRIAKON_BOUNCE_DIR KYRIAKON_RATES KYRIAKON_PROOF_DIR
-export KYRIAKON_PUBLIC_ROOT KYRIAKON_CHECKOUT
+export KYRIAKON_STORE_ROOT KYRIAKON_MAIL_DOMAINS KYRIAKON_VIRTUALS
+export KYRIAKON_MAIL_FROM KYRIAKON_DKIM_DOMAINS KYRIAKON_SPAMD_ALLOWED
+export KYRIAKON_KEYRING_DIR
 
 # The values setup-env.sh exists to fill in. deploy-control.sh requires the
 # subset it reads; env_keys_agree is what keeps the template, this list and
@@ -46,20 +34,12 @@ paths_match_drain_toml() {
 	}
 	for pair in \
 		store_root="$KYRIAKON_STORE_ROOT" \
-		reserved="$KYRIAKON_RESERVED_FILE" \
-		scripts="$KYRIAKON_DRAIN_SCRIPTS" \
 		mail_domains="$KYRIAKON_MAIL_DOMAINS" \
 		virtuals="$KYRIAKON_VIRTUALS" \
 		mail_from="$KYRIAKON_MAIL_FROM" \
 		dkim_domains="$KYRIAKON_DKIM_DOMAINS" \
 		spamd_alloweddomains="$KYRIAKON_SPAMD_ALLOWED" \
-		approval_key="$KYRIAKON_APPROVAL_KEY" \
-		keyring_dir="$KYRIAKON_KEYRING_DIR" \
-		mail_dir="$KYRIAKON_MAIL_DIR" \
-		bounce_dir="$KYRIAKON_BOUNCE_DIR" \
-		rates="$KYRIAKON_RATES" \
-		proof_dir="$KYRIAKON_PROOF_DIR" \
-		public_root="$KYRIAKON_PUBLIC_ROOT"; do
+		keyring_dir="$KYRIAKON_KEYRING_DIR"; do
 		key=${pair%%=*}
 		want=${pair#*=}
 		got=$(sed -n "s/^${key}[[:space:]]*=[[:space:]]*\"\(.*\)\"/\1/p" "$file" | head -1)
@@ -84,10 +64,16 @@ env_keys_agree() {
 		grep -q "^export $v=" "$template" \
 			|| { printf 'paths: %s is not in %s\n' "$v" "$template"; rc=1; }
 	done
+	# Both `$KEY` and `${KEY...}` forms count. The exclusions are script state
+	# and test fixtures, not values the box's env file supplies.
 	# shellcheck disable=SC2016 # both tr sets are literal characters
-	text=$(grep -oE "[$][{][A-Z][A-Z0-9_]+" "$deploy" | tr -d '${}' | sort -u)
+	text=$(grep -oE '[$][A-Z][A-Z0-9_]+' "$deploy" | tr -d '${}' | sort -u)
 	for v in $text; do
-		case "$v" in KYRIAKON_ENV | KYRIAKON_ENV_TEMPLATE | PATH | HOME | TMPDIR) continue ;; esac
+		case "$v" in
+		KYRIAKON_ENV | KYRIAKON_ENV_KEYS | KYRIAKON_ENV_TEMPLATE | PATH | HOME | TMPDIR | PKG_ADD_LOG)
+			continue
+			;;
+		esac
 		case " $KYRIAKON_ENV_KEYS " in
 		*" $v "*) ;;
 		*) printf 'paths: deploy-control reads %s, which the registry does not name\n' "$v"; rc=1 ;;

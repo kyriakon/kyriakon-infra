@@ -104,9 +104,10 @@ install_set="$script_dir/install-set.tsv"
 needed_vars="ALERT_EMAIL HEALTHCHECKS_URL KEYRING_HEALTHCHECKS_URL RESTIC_REPOSITORY RESTIC_PASSWORD_FILE HCLOUD_TOKEN RESTORE_TEST_REPOSITORY RESTORE_TEST_HEALTHCHECKS_URL"
 
 # row_dir <destination> — where the box reads that destination's scripts from at
-# run time. This is the one place the destinations are named: only the two cron
-# runs itself have a directory, because a drain row is installed by
-# scripts/deploy-control.sh into the directory the drain's config names.
+# run time. This is the one place the destinations are named: /root/bin, the
+# checkout cron runs itself, and sbin for the compiled drain binary. A drain
+# script is installed by scripts/deploy-control.sh into the directory the
+# drain's config names and is not scheduled from the table.
 row_dir() {
 	case "$1" in
 	/root/bin) printf '/root/bin' ;;
@@ -125,7 +126,8 @@ row_dir() {
 # once, rather than becoming a line that cannot run.
 scheduled_scripts() {
 	typeset name dest
-	awk -F'\t' '!/^#/ && NF >= 3 && $3 != "-" { print $1 "\t" $2 }' "$1" |
+	manifest_rows "$1" |
+		awk -F'\t' '$3 != "" && $3 != "-" { print $1 "\t" $2 }' |
 		while IFS="$(printf '\t')" read -r name dest; do
 			row_dir "$dest" >/dev/null || {
 				printf 'cron-apply: %s is scheduled for %s, which no cron line can read\n' \
@@ -156,8 +158,8 @@ repo_dir=/usr/local/src/kyriakon-infra
 # its line throws a clean run away and names the script when it fails.
 line_for() {
 	typeset name="$1" row dest sched args dir installed
-	row=$(awk -F'\t' -v n="$name" \
-		'!/^#/ && $1 == n && $3 != "-" { print; exit }' "$install_set")
+	row=$(manifest_rows "$install_set" "$name" |
+		awk -F'\t' '$3 != "" && $3 != "-" { print; exit }')
 	[ -n "$row" ] || return 1
 	dest=$(printf '%s\n' "$row" | cut -f2)
 	sched=$(printf '%s\n' "$row" | cut -f3)
@@ -191,16 +193,17 @@ drop_old_drain_line() {
 	grep -vF '/usr/local/sbin/kyriakon-onboard-drain' || true
 }
 
-# script_path <name> — where the box reads that script from at run time, which is
-# what the install check and the crontab dedupe compare against. A drain row is
-# installed into a directory its own config names, not one this can know, and is
-# not scheduled from the table, so it has no path here.
+# script_path <name> — where the box reads that script from at run time, which
+# is what the install check and the crontab dedupe compare against. The manifest
+# row's installed_name is the name line_for emits, so the two cannot disagree.
 script_path() {
-	typeset row dir
-	row=$(awk -F'\t' -v n="$1" '!/^#/ && $1 == n { print; exit }' "$install_set") || return 1
+	typeset row dir installed
+	row=$(manifest_rows "$install_set" "$1" | awk -F'\t' '{ print; exit }') || return 1
 	[ -n "$row" ] || return 1
 	dir=$(row_dir "$(printf '%s\n' "$row" | cut -f2)") || return 1
-	printf '%s/%s\n' "$dir" "$1"
+	installed=$(printf '%s\n' "$row" | cut -f6)
+	[ -n "$installed" ] && [ "$installed" != "-" ] || installed=$1
+	printf '%s/%s\n' "$dir" "$installed"
 }
 
 die() {
@@ -812,6 +815,19 @@ EOF
 	check "a script with no row has no cron line" "$got" 1
 	check "the scheduled set is the table's rows" \
 		"$(scheduled_scripts "$install_set" | grep -c '^lib\.sh$')" 0
+
+	# A retired row keeps its history, not a crontab line, and a rename is the
+	# installed_name for both the emitted line and the dedupe check.
+	printf 'renamed.sh\t/root/bin\t0 5 * * 1\t\tmail\trenamed\tactive\ngone.sh\t/root/bin\t0 5 * * 1\t\tmail\t-\tretired\n' \
+		> "$tree/routes.tsv"
+	install_set="$tree/routes.tsv"
+	check "a renamed row's line uses its installed name" \
+		"$(line_for renamed.sh | grep -c '/root/bin/renamed$')" 1
+	check "and script_path agrees with it" \
+		"$(script_path renamed.sh)" '/root/bin/renamed'
+	check "a retired scheduled row is not scheduled" \
+		"$(scheduled_scripts "$tree/routes.tsv")" 'renamed.sh'
+	install_set="$script_dir/install-set.tsv"
 
 	# The table and the two lanes. A missing table has to fail the crontab pass
 	# and name the file; the web pass must run without it, which is what keeps the

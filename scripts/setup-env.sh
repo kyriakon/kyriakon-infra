@@ -299,7 +299,7 @@ usage: doas ksh setup-env.sh [--ipv4 A --ipv6 B --tsig-secret C
   what it had, comments and the PATH block included. This is how a box that is
   already deployed is given a value it did not have.
 
-  All thirteen arguments, no file: write it from them, mode 0600. All or nothing
+  All fifteen arguments, no file: write it from them, mode 0600. All or nothing
   when creating one, and each value is checked before anything is written.
 
     doas ksh scripts/setup-env.sh \
