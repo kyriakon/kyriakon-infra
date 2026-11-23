@@ -1,10 +1,11 @@
-# Snapshots have a description, not a name - select by label and always take
-# the newest matching snapshot, so a re-snapshot after a patch cycle is picked
-# up without editing this file.
+# The provisioning image is pinned by numeric ID, never by a label selector: a
+# label is mutable, so anyone holding HCLOUD_TOKEN could give a snapshot of the
+# live box the provisioning label and have the next create boot it, disk and
+# all. The ID and its description are recorded in the pinned-image table in
+# docs/runbook.md, which is the review surface, and the preconditions on the
+# server below refuse a plan whose pair disagrees.
 data "hcloud_image" "openbsd" {
-  with_selector     = var.snapshot_selector
-  most_recent       = true
-  with_architecture = "x86"
+  id = var.image_id
 }
 
 resource "hcloud_server" "mail" {
@@ -14,13 +15,12 @@ resource "hcloud_server" "mail" {
   image       = data.hcloud_image.openbsd.id
 
   lifecycle {
-    # `image` is ForceNew in the provider, so a change to the data source is not
-    # an in-place update: it is destroy and recreate, and the server it would
+    # `image` is ForceNew in the provider, so a change to the variable is not an
+    # in-place update: it is destroy and recreate, and the server it would
     # destroy is the only copy of the mail. The live box must never be rebuilt
-    # from whatever the selector currently resolves to. The selector moves on
-    # its own as snapshots are taken and relabelled, and the existing server's
-    # image is a historical fact about when it was built, not a setting to keep
-    # in sync.
+    # by an apply. The existing server's image is a historical fact about when
+    # it was built, not a setting to keep in sync, so a newer reviewed image is
+    # picked up by a deliberate rebuild, not by a variable edit here.
     #
     # `server_type` is ignored for the same console reason as `public_net`
     # below: the provider's update path for a type change powers the server
@@ -28,6 +28,23 @@ resource "hcloud_server" "mail" {
     # the box off at the softraid passphrase prompt. A resize is a hand step in
     # the Hetzner console (docs/runbook.md, "How much the box carries"), and
     # `terraform plan` should show no diff after one.
+    #
+    # Preconditions, not a `check` block: a check assertion only warns and the
+    # plan still exits 0, while these fail it. They are evaluated on every plan
+    # that includes this resource, not only when it is being replaced, because
+    # they defend the image a state-loss rebuild would boot more than they
+    # defend a diff. The second guards an ID that resolves somewhere
+    # unintended, retyped, reused, or a live-box snapshot.
+    precondition {
+      condition     = data.hcloud_image.openbsd.description == var.image_description
+      error_message = "Image ${var.image_id} is described \"${data.hcloud_image.openbsd.description}\", not \"${var.image_description}\". Set both variables from `hcloud image list` and record them together in docs/runbook.md."
+    }
+
+    precondition {
+      condition     = data.hcloud_image.openbsd.architecture == "x86"
+      error_message = "Image ${var.image_id} is ${data.hcloud_image.openbsd.architecture}, not x86; the server types this stack uses are x86."
+    }
+
     ignore_changes = [image, server_type]
 
     # Terraform is refused the chance to plan this server's removal at all, replacement

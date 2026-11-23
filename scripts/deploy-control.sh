@@ -47,6 +47,17 @@ install_set="$script_dir/install-set.tsv"
 # shellcheck disable=SC1091 # resolves at runtime from this script's directory
 . "$script_dir/lib.sh"
 
+# titan_listening <port>: true when stdin is a sockstat -ln listing with a row
+# naming the handler on that port. sockstat prints the kernel process name, the
+# binary's basename truncated to fifteen characters, not the rc.d unit name
+# (kyriakon_control). A self-test feeds a synthetic row, which is the only way
+# to exercise this without a running box.
+titan_listening() {
+	awk -v p=":$1" '
+		($2 == "kyriakon-control" || $2 == "kyriakon-contro") && $6 ~ (p "$") { found = 1 }
+		END { exit !found }'
+}
+
 # --- self-test ---------------------------------------------------------------
 
 # The script names the drain's Rust invokes with `run_script(cfg, "…")` and its
@@ -431,6 +442,51 @@ STUB
 	else
 		printf 'self-test: stat -f is absent, so the install -d re-mode check is skipped\n'
 	fi
+	# The Titan listener's sockstat row names the binary, not the rc.d unit. The
+	# kernel truncates kyriakon-control to fifteen characters, and the check must
+	# accept both; the unit spelling it used to demand never appears there.
+	printf '_onboard kyriakon-control 1234 3 tcp 127.0.0.1:7081 *:*\n' |
+		titan_listening 7081 ||
+		{ printf 'self-test: the full process name did not match the titan port\n' >&2; exit 1; }
+	printf '_onboard kyriakon-contro 1234 3 tcp 127.0.0.1:7081 *:*\n' |
+		titan_listening 7081 ||
+		{ printf 'self-test: the truncated process name did not match the titan port\n' >&2; exit 1; }
+	if printf '_onboard kyriakon_control 1234 3 tcp 127.0.0.1:7081 *:*\n' |
+		titan_listening 7081; then
+		printf 'self-test: the rc.d unit name was accepted as the process\n' >&2
+		exit 1
+	fi
+	if printf '_onboard kyriakon-control 1234 3 tcp 127.0.0.1:7080 *:*\n' |
+		titan_listening 7081; then
+		printf 'self-test: another port was accepted as the titan listener\n' >&2
+		exit 1
+	fi
+
+	# The shell path registry and the drain's TOML are one value set; a drift
+	# here is a drain reading a different store than the scripts write.
+	paths_match_drain_toml "$repo/openbsd/etc/onboard/drain.toml" || {
+		printf 'self-test: the shell path registry and drain.toml disagree\n' >&2
+		exit 1
+	}
+	env_keys_agree "$repo/openbsd/etc/kyriakon.env" "$script_dir/deploy-control.sh" || {
+		printf 'self-test: the env template, setup-env and deploy-control disagree\n' >&2
+		exit 1
+	}
+	# A brace-less read is the shape deploy-control uses; the scan has to see it.
+	# shellcheck disable=SC2016 # fixture text, not this script's variable
+	printf 'value=$KYRIAKON_IPV4\n' > "$work/env-scan-known.sh"
+	env_keys_agree "$repo/openbsd/etc/kyriakon.env" "$work/env-scan-known.sh" || {
+		printf 'self-test: a brace-less registry key was not recognised\n' >&2
+		exit 1
+	}
+	unknown_key=NOT_IN_REGISTRY
+	# shellcheck disable=SC2016 # the $ is fixture text, not an expansion
+	printf 'value=$%s\n' "$unknown_key" > "$work/env-scan-unknown.sh"
+	if env_keys_agree "$repo/openbsd/etc/kyriakon.env" "$work/env-scan-unknown.sh" 2>/dev/null; then
+		printf 'self-test: a brace-less unknown key was accepted\n' >&2
+		exit 1
+	fi
+
 	# shellcheck disable=SC2154 # self_test_begin in lib.sh owns the counter
 	[ "$self_test_fails" -eq 0 ] || exit 1
 
@@ -616,16 +672,24 @@ install -d -m 0755 -o root -g wheel /usr/local/libexec
 # run: the rule still names only /usr/local/libexec/kyriakon-authcheck.
 install_staged "$repo_dir/scripts/lib.sh" /usr/local/libexec/lib.sh -m 0644
 install -d -m 0755 /usr/local/libexec/lib
-for lib_module in atomic-fs tls-acme identity; do
+for lib_module in atomic-fs tls-acme identity manifest paths; do
 	install_staged "$repo_dir/scripts/lib/$lib_module.sh" \
 		"/usr/local/libexec/lib/$lib_module.sh" -m 0644
 done
-install_staged "$repo_dir/scripts/kyriakon-authcheck.sh" /usr/local/libexec/kyriakon-authcheck -m 0755
+# The suffixless login checker's name is the manifest row's, not a table here.
+authcheck_name=$(manifest_installed_name "$install_set" kyriakon-authcheck.sh /usr/local/libexec) \
+	|| die "cannot read $install_set"
+[ -n "$authcheck_name" ] || die "$install_set names no kyriakon-authcheck.sh for /usr/local/libexec"
+install_staged "$repo_dir/scripts/kyriakon-authcheck.sh" "/usr/local/libexec/$authcheck_name" -m 0755
 # The From-header filter openbsd/etc/smtpd.conf names as `proc-exec`. It is a
-# compiled program now, built from control/crates/fromcheck and installed under
-# the path the filter line gives. deploy-mail.sh refuses the mail configuration
-# when this is missing, so the control deploy runs first.
-install -m 0755 "$repo_dir/control/target/release/kyriakon-fromcheck" /usr/local/libexec/filter-fromcheck
+# compiled binary row in the manifest, built from control/crates/fromcheck and
+# installed under the name the row gives. deploy-mail.sh refuses the mail
+# configuration when it is missing, so the control deploy runs first.
+fromcheck_name=$(manifest_installed_name "$install_set" kyriakon-fromcheck /usr/local/libexec) \
+	|| die "cannot read $install_set"
+[ -n "$fromcheck_name" ] || die "$install_set names no kyriakon-fromcheck for /usr/local/libexec"
+install -m 0755 "$repo_dir/control/target/release/kyriakon-fromcheck" \
+	"/usr/local/libexec/$fromcheck_name"
 
 # The login proofs: one file per admitted login, named by a random token, written
 # by the checker as root and read back by the drain. Root-owned 0700 is the whole
@@ -911,6 +975,13 @@ install -d -m 0755 "$scripts_dir/lib"
 for s in $drain_scripts; do
 	install_staged "$repo_dir/scripts/$s" "$scripts_dir/$s" -m 0755
 done
+# A retired row is an uninstall: the drain's directory must not keep a script
+# the manifest has retired, because the drain would still run it.
+for s in $(manifest_retired_names "$install_set" drain); do
+	[ -e "$scripts_dir/$s" ] || continue
+	rm -f "$scripts_dir/$s"
+	printf 'removed the retired drain script %s\n' "$scripts_dir/$s"
+done
 # cron-apply.sh, installed above, reads this table to build the crontab, and it
 # reads it from its own directory. Installing it here is what makes the deployed
 # copy work; the checkout's copy is the one this run installs from.
@@ -1022,8 +1093,8 @@ family=-4
 case "${titan_listener%:*}" in
 *:*) family=-6 ;;
 esac
-sockstat "$family" -ln | awk -v p=":$titan_port" '$2 == "kyriakon_control" && $6 ~ (p "$") { found = 1 } END { exit !found }' \
-	|| die "kyriakon_control is not listening on titan_listener $titan_listener"
+sockstat "$family" -ln | titan_listening "$titan_port" \
+	|| die "kyriakon-control is not listening on titan_listener $titan_listener"
 printf 'titan: %s\n' "$titan_listener"
 
 printf '\ninstalled. the responders answer %s, %s, %s, %s and %s, and no other local user may connect.\n' \

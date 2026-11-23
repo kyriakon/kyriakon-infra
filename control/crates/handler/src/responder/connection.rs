@@ -155,9 +155,28 @@ pub(super) fn fields(raw: &str) -> BTreeMap<String, String> {
             Some((name, value)) => (name, value),
             None => (pair, ""),
         };
-        out.insert(percent_decode(name, true), percent_decode(value, true));
+        out.insert(
+            percent_decode(name, true),
+            line_endings(percent_decode(value, true)),
+        );
     }
     out
+}
+
+/// Normalise a form value's line breaks to LF, the one form the terminal, the
+/// store and the mail body use.
+///
+/// A browser submits a textarea's line breaks as CRLF: HTML's form submission
+/// algorithm normalises them before encoding, so the LF the applicant typed
+/// arrives as `%0D%0A`. Every form field crosses this decoder, so this is the
+/// one place that has to know; a value that still holds a lone carriage return
+/// is normalised too, because the same algorithm turns one into CRLF before
+/// sending it.
+fn line_endings(value: String) -> String {
+    if !value.contains('\r') {
+        return value;
+    }
+    value.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Whether a POST declares the encoding its body is read as. A browser always

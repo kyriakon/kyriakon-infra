@@ -25,7 +25,7 @@ export PATH
 # a helper that silently does not exist.
 lib_sh_dir=${0%/*}
 [ "$lib_sh_dir" = "$0" ] && lib_sh_dir=.
-for lib_module in atomic-fs tls-acme identity; do
+for lib_module in atomic-fs tls-acme identity manifest paths; do
 	if [ ! -f "$lib_sh_dir/lib/$lib_module.sh" ]; then
 		printf '%s: lib/%s.sh is missing; install lib.sh with its lib/ directory\n' \
 			"$0" "$lib_module" >&2
@@ -78,6 +78,13 @@ BACKUP_PATHS='/home
 /etc/ssh/authorized_keys'
 export BACKUP_PATHS
 
+# The httpd logs that newsyslog bounds and that the deploy and checks hold at
+# root:wheel 600. Both carry client addresses and request paths, and the access
+# log also carries capability URLs, so the list is single-sourced here rather
+# than typed per script: a third log added to newsyslog.conf must not leave a
+# checker or the deploy blind to it. Names are relative to /home/www/logs.
+export HTTPD_LOGS='access.log error.log'
+
 # Per-box values, so nothing has to be retyped or passed on a command line:
 # /root/.kyriakon-env, mode 0600, one 'export VAR=value' per line. The tracked
 # template is openbsd/etc/kyriakon.env in the repo, which deploy-mail.sh installs.
@@ -91,18 +98,18 @@ if [ -r "$KYRIAKON_ENV" ]; then
 fi
 
 
-# install_rows <table> <destination>: the scripts the install-set table gives one
-# destination, one per line. scripts/install-set.tsv names the destination every
-# installed script lands in, and this is the one query its readers used to run
-# over their own copy of the list. A table that cannot be read is an error rather
-# than an empty set, so a caller cannot install nothing and call it success.
+# install_rows <table> <destination>: the active scripts the install-set table
+# gives one destination, one per line. manifest.sh holds the other queries; a
+# retired row is an uninstall, not something a deploy installs. A table that
+# cannot be read is an error rather than an empty set, so a caller cannot
+# install nothing and call it success.
 install_rows() {
 	typeset rows_table="$1" rows_destination="$2"
 	if [ ! -f "$rows_table" ]; then
 		printf 'install_rows: no table at %s\n' "$rows_table" >&2
 		return 1
 	fi
-	awk -F'\t' -v d="$rows_destination" '!/^#/ && $2 == d { print $1 }' "$rows_table"
+	manifest_active_names "$rows_table" "$rows_destination"
 }
 
 

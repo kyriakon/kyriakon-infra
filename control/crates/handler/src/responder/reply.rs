@@ -43,6 +43,17 @@ pub(super) fn too_many(front_end: FrontEnd, which: Which) -> Reply {
     }
 }
 
+/// The draft map is full of sources at their cap. That is a service-wide limit
+/// and not one this caller spent, so it answers a temporary failure rather than
+/// the per-address message.
+pub(super) fn unavailable(front_end: FrontEnd) -> Reply {
+    const MESSAGE: &str = "The application form is temporarily unavailable. Try again in a moment.";
+    match front_end {
+        FrontEnd::Gemini => Reply::gemini(40, TEMP_FAILURE, String::new()),
+        FrontEnd::Httpd => Reply::html(503, page_html(&notice("Temporarily unavailable", MESSAGE))),
+    }
+}
+
 /// A refusal of a request that is well formed and simply asks for something the
 /// handler does not do. Not a field-level error: those go back into the form.
 pub(super) fn refused(message: &str) -> Reply {
@@ -155,5 +166,21 @@ mod tests {
             .code(),
             59
         );
+    }
+
+    /// A full draft map is a service-wide limit, so the web page must not tell
+    /// the reader that this address has spent a day it never started.
+    #[test]
+    fn an_unavailable_draft_map_is_not_the_per_address_message() {
+        let web = unavailable(FrontEnd::Httpd);
+        assert_eq!(web.code(), 503);
+        let body = String::from_utf8_lossy(web.body());
+        assert!(body.contains("temporarily unavailable"), "{body}");
+        assert!(!body.contains("Too many applications"), "{body}");
+
+        let capsule = unavailable(FrontEnd::Gemini);
+        assert_eq!(capsule.code(), 40);
+        let head = String::from_utf8_lossy(&capsule.head_block()).into_owned();
+        assert!(head.starts_with("40 Temporary failure"), "{head}");
     }
 }

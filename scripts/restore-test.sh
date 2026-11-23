@@ -70,6 +70,13 @@ maildir_ciphertext_ok() {
 	return 0
 }
 
+# count_nodes <root>: every node under root, directories included, one per NUL
+# byte. A member-uploaded filename may contain a newline, which `find | wc -l`
+# split into two and made the snapshot comparison fail by one.
+count_nodes() {
+	find "$1" -mindepth 1 -print0 | tr -cd '\0' | wc -c | tr -d ' '
+}
+
 # check_maildir_ciphertext <target-root>: every message in every mailbox, the
 # hidden folders included (admin@ delivers to Maildir/.Admin), must be the
 # envelope. Passes vacuously when there is no mail yet. A subfolder was the hole
@@ -141,6 +148,12 @@ self_test() {
 	code=0
 	( check_maildir_ciphertext "$tree" ) >/dev/null 2>&1 || code=$?
 	check "a plaintext message in a hidden folder fails" "$code" 1
+	# A filename may contain a newline. The old line count split one node into
+	# two and failed every weekly check while the file sat in the snapshot.
+	mkdir -p "$tree/nodes/sub"
+	: > "$tree/nodes/sub/$(printf 'name\nwith-a-newline')"
+	check "a newline in a filename counts as one node" \
+		"$(count_nodes "$tree/nodes")" 2
 	self_test_end
 }
 
@@ -280,7 +293,11 @@ check_maildir_ciphertext "$target"
 repo_count=0
 for repo in "$target"/home/*/repos/*.git; do
 	[ -d "$repo" ] || continue
-	git --git-dir="$repo" fsck >/dev/null || die "git fsck failed: $repo"
+	# restic restores the member's uid and gid, so the drill runs as root on a
+	# repository owned by someone else; git refuses that as dubious ownership
+	# unless the path is named. The restored repository is the snapshot's, not
+	# a checkout, so the exception is this command only.
+	git -c safe.directory="$repo" --git-dir="$repo" fsck >/dev/null || die "git fsck failed: $repo"
 	repo_count=$(( repo_count + 1 ))
 done
 if [ "$repo_count" -eq 0 ]; then
@@ -296,7 +313,7 @@ fi
 # is not a snapshot node. The first real run caught this: a files-only count
 # reported 61 against a snapshot of 87, which is 61 files plus 26 directories.
 snapshot_nodes=$(restic stats latest --json --no-lock | jq -r '.total_file_count')
-restored_nodes=$(find "$target" -mindepth 1 | wc -l | tr -d ' ')
+restored_nodes=$(count_nodes "$target")
 if [ "$(( restored_nodes - snapshot_nodes ))" -ne 0 ]; then
 	die "node count mismatch: snapshot=$snapshot_nodes restored=$restored_nodes"
 fi

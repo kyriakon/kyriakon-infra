@@ -48,7 +48,7 @@ use kyriakon_control_core::flow::catalogue::{self, Action, Protocol, Row, Servic
 use kyriakon_control_core::flow::questions::{Kind, Question, Rule};
 use kyriakon_control_core::ipc::Answer as StatusAnswer;
 use kyriakon_control_core::store;
-use kyriakon_control_core::{mail::keycheck, store::draft};
+use kyriakon_control_core::{mail::keycheck, store::draft, util};
 
 /// Where a session reads an application's stage. The portal cannot read the
 /// store, so the answer comes from the handler over its own socket; a test drives
@@ -573,15 +573,19 @@ impl<R: Read> Reader<R> {
     }
 
     /// One line, or `None` when the connection closed.
+    ///
+    /// A connection that closes part-way through a line has not submitted it:
+    /// the rest of the answer may still have been coming, so the partial line is
+    /// dropped and the reader gets `None` rather than a value it did not finish
+    /// writing. That is what keeps a dropped connection from confirming an
+    /// application the applicant never completed.
     pub fn word(&mut self) -> Result<Option<Word>, Error> {
         let mut line: Vec<u8> = Vec::new();
         let mut over = false;
-        let mut read_any = false;
         loop {
             if !self.hold()? {
-                break;
+                return Ok(None);
             }
-            read_any = true;
             let (end, ended) = {
                 let rest = &self.held[self.held_at..self.held_len];
                 let end = rest.iter().position(|b| *b == b'\n').unwrap_or(rest.len());
@@ -602,9 +606,6 @@ impl<R: Read> Reader<R> {
             if ended {
                 break;
             }
-        }
-        if !read_any {
-            return Ok(None);
         }
         if over {
             return Ok(Some(Word::TooLong));
@@ -1115,7 +1116,7 @@ fn answer_limit(page: &Page) -> usize {
 /// the connection, which is what the page would have done without the cap; the
 /// bytes are dropped as they arrive, so the process stays at its bound.
 fn drain_answer(page: &Page, input: &mut dyn Input) {
-    let multiline = matches!(page.q.kind, Kind::Multiline | Kind::Addresses);
+    let multiline = page.q.kind.is_list();
     let key = page.q.kind == Kind::Key && page.q.rule != Rule::UploadKey;
     if !multiline && !key {
         return;
@@ -1160,7 +1161,7 @@ fn drain_answer(page: &Page, input: &mut dyn Input) {
 /// rest of that paste is dropped before this returns, so the retry starts clean.
 fn read_answer(page: &Page, input: &mut dyn Input) -> Result<Entered, Error> {
     let key = page.q.kind == Kind::Key;
-    let multiline = matches!(page.q.kind, Kind::Multiline | Kind::Addresses);
+    let multiline = page.q.kind.is_list();
     let limit = answer_limit(page);
     let mut lines: Vec<String> = Vec::new();
     let mut kept = 0;
@@ -1317,7 +1318,7 @@ fn confirmation(questions: &[Question], draft: &draft::Draft) -> String {
                     .find(|k| k.mailbox == mailbox.name)
                     .map(|k| k.fingerprint.clone())
                     .unwrap_or_else(|| "no key".to_string());
-                out.push_str(&format!("{}: {shown}\n", mailbox.address));
+                out.push_str(&format!("{}: {shown}\n", util::clean(&mailbox.address)));
             }
             None => {
                 let value = draft.answers.get(&q.id).cloned().unwrap_or_default();
@@ -1329,7 +1330,10 @@ fn confirmation(questions: &[Question], draft: &draft::Draft) -> String {
                         .or_else(|| keycheck::pgp_fingerprint(&value))
                         .unwrap_or_else(|| "a key".to_string())
                 } else {
-                    value
+                    // The answer is the applicant's to write: a carriage return
+                    // or an escape would repaint this screen and let a paste
+                    // show values other than the ones that will be filed.
+                    util::clean(&value)
                 };
                 out.push_str(&format!("{}: {shown}\n", q.prompt));
             }
@@ -2379,6 +2383,7 @@ mod tests {
     struct Flood {
         left: usize,
         seen: usize,
+        ended: bool,
     }
 
     impl std::io::Read for Flood {
@@ -2388,6 +2393,15 @@ mod tests {
                 "the read loop asked for a {}-byte buffer",
                 buf.len()
             );
+            if self.left == 0 {
+                // One newline ends the flood, then the stream closes.
+                if self.ended {
+                    return Ok(0);
+                }
+                self.ended = true;
+                buf[0] = b'\n';
+                return Ok(1);
+            }
             let n = buf.len().min(self.left);
             buf[..n].fill(b'A');
             self.left -= n;
@@ -2405,6 +2419,7 @@ mod tests {
         let mut reader = Reader::new(Flood {
             left: 64 * 1024 * 1024,
             seen: 0,
+            ended: false,
         });
         assert_eq!(reader.word().unwrap(), Some(Word::TooLong));
         assert_eq!(
@@ -2412,6 +2427,20 @@ mod tests {
             64 * 1024 * 1024,
             "the reader stopped mid-line"
         );
+        assert_eq!(reader.word().unwrap(), None);
+    }
+
+    /// A connection that closes part-way through a line has not submitted an
+    /// answer, so the partial line is cancelled rather than read: a dropped
+    /// connection must never file or confirm what the applicant had typed so far.
+    #[test]
+    fn a_stream_that_ends_mid_line_is_a_cancelled_answer() {
+        let mut reader = Reader::new(std::io::Cursor::new(b"theophilus".to_vec()));
+        assert_eq!(reader.word().unwrap(), None);
+
+        // A complete line still reads; the partial one after it does not.
+        let mut reader = Reader::new(std::io::Cursor::new(b"yes\nyes".to_vec()));
+        assert_eq!(reader.word().unwrap(), Some(Word::Line("yes".to_string())));
         assert_eq!(reader.word().unwrap(), None);
     }
 
@@ -2832,6 +2861,56 @@ mod tests {
         assert!(full.spent(), "the drawing session stopped early");
         assert_eq!(plain_files.forms.len(), 1);
         assert_eq!(full_files.forms, plain_files.forms);
+    }
+
+    /// The confirm screen sanitises what it paints: a carriage return, an escape
+    /// sequence or a bidi formatter in an answer cannot repaint the screen or
+    /// forge another answer's line, and the drawing mode paints the same screen
+    /// the line mode does.
+    #[test]
+    fn the_confirm_paints_answers_sanitised_in_both_modes() {
+        let question = note_question();
+        let questions = [question];
+        let mut draft = draft::Draft::new(String::new());
+        draft.answers.insert(
+            "note".to_string(),
+            "Parish\rUsername: someoneelse\u{1b}[2Jali\u{202e}ce".to_string(),
+        );
+        let painted = confirmation(&questions, &draft);
+        assert!(
+            painted.contains("Note: Parish?Username: someoneelse?[2Jali?ce"),
+            "{painted}"
+        );
+        for raw in ['\r', '\x1b', '\u{202e}'] {
+            assert!(!painted.contains(raw), "the answer kept {raw:?}: {painted}");
+        }
+
+        // The same answer on the same question, painted by each mode's own
+        // session: the confirm block is identical.
+        let reserved = reserved_names();
+        let flow = Flow {
+            questions: &questions,
+            reserved: &reserved,
+        };
+        let mut blocks = Vec::new();
+        for mode in [Mode::Plain, Mode::Full] {
+            let mut script = Script::owned(vec![
+                "Parish of Example".to_string(),
+                ".".to_string(),
+                "yes".into(),
+            ]);
+            let mut files = Files::default();
+            let mut out = Vec::new();
+            let left = application(&flow, mode, &mut script, &mut files, &mut out).unwrap();
+            assert_eq!(left, Departure::Quit);
+            assert!(script.spent(), "{mode:?} stopped at the confirm");
+            let seen = String::from_utf8(out).unwrap();
+            let at = seen
+                .find("Check your answers.")
+                .unwrap_or_else(|| panic!("{mode:?} painted no confirm: {seen}"));
+            blocks.push(seen[at..].to_string());
+        }
+        assert_eq!(blocks[0], blocks[1], "the modes painted different confirms");
     }
 
     /// A member's session carries their own addresses, and an anonymous one shows

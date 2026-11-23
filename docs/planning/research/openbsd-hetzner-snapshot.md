@@ -1,11 +1,11 @@
-# OpenBSD 7.x on Hetzner VPS — rescue-mode install & snapshot
+# OpenBSD 8.0 on Hetzner VPS: rescue-mode install and snapshot
 
-Ticket: install OpenBSD 7.x on a Hetzner Cloud VPS via rescue mode, snapshot it through the Hetzner API, and use that snapshot as the Terraform `hcloud` image source (proposal §6.1, snapshot-first). Answers four questions: manual install steps, exact snapshot API/CLI calls, what Terraform `hcloud_server` needs, and the §6.10 package-patch-cadence caveat.
+Ticket: install OpenBSD 8.0 on a Hetzner Cloud VPS via rescue mode, snapshot it through the Hetzner API, and use that snapshot as the Terraform `hcloud` image source (proposal §6.1, snapshot-first). Answers four questions: manual install steps, exact snapshot API/CLI calls, what Terraform `hcloud_server` needs, and the §6.10 package-patch-cadence caveat.
 
 ## Recommended shape (short answer)
 
 1. Provision one throwaway Hetzner Cloud VPS (any Linux type, e.g. `cx22`/`cx32`).
-2. Boot it into the Hetzner **rescue system** (`linux64`), download the OpenBSD `install7X.img`/`miniroot7X.img`, `dd` it onto the primary disk, reboot.
+2. Boot it into the Hetzner **rescue system** (`linux64`), download the OpenBSD `install80.img`/`miniroot80.img`, `dd` it onto the primary disk, reboot.
 3. Run the **interactive** installer over the VNC console (no autoinstall response file — §6.1 deferred that spike). Choose full-disk `softraid` encryption when prompted.
 4. Post-install: `syspatch`, `pkg_add` Dovecot/rspamd, configure mail/git/web. Then **shut down cleanly**.
 5. Snapshot: `hcloud server create-image --type snapshot --description "kyriakon-openbsd-<rev>" <server>`.
@@ -35,19 +35,19 @@ Facts from primary sources:
 
 ### 1.2 Write the OpenBSD ramdisk image to disk
 
-In the rescue shell (SSH in as `root`):
+In the rescue shell (SSH in as `root`), write the image to disk and reboot. Verify the release first, as 1.4 describes; the rescue shell has no `signify` and no release key.
 
 ```sh
-wget https://cdn.openbsd.org/pub/OpenBSD/7.9/amd64/miniroot79.img
+wget https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/miniroot80.img
 # verify first (see 1.4)
-dd if=miniroot79.img of=/dev/sda bs=4M
+dd if=miniroot80.img of=/dev/sda bs=4M
 sync
 reboot
 ```
 
 This is the exact method Frederic Cambus (OpenBSD developer) documents for Hetzner Cloud: "provision a Linux instance to fetch the installation media and write it to the root disk," then "the installer will start after reboot, allowing us to perform an interactive installation using the console" ([Cambus, "OpenBSD/arm64 on Hetzner Cloud"](https://www.cambus.net/openbsd-arm64-on-hetzner-cloud/)). The same `dd`-the-ramdisk-to-disk pattern is the core of the OpenBSD installer's own design — `bsd.rd`/the install image boots into a live in-memory environment ([OpenBSD FAQ 4, "Overview of the Installation Procedure"](https://www.openbsd.org/faq/faq4.html)).
 
-- Image choice: `install7X.img` **includes the file sets**; `miniroot7X.img` is smaller and pulls sets over the network ([OpenBSD FAQ 4, "Downloading OpenBSD"](https://www.openbsd.org/faq/faq4.html)). Either works; `install7X.img` removes a network dependency during set install but is ~10× larger. Version suffix tracks the release (`…79.img` for 7.9; the FAQ I cite is at 7.9, so substitute the current 7.x number).
+- Image choice: `install80.img` **includes the file sets**; `miniroot80.img` is smaller and pulls sets over the network ([OpenBSD FAQ 4, "Downloading OpenBSD"](https://www.openbsd.org/faq/faq4.html)). Either works; `install80.img` removes a network dependency during set install but is ~10× larger. The suffix tracks the release (`80` for 8.0).
 - Hetzner Cloud primary disk is `/dev/sda` in the rescue system (confirmed by Cambus's `of=/dev/sda`).
 
 ### 1.3 Run the interactive installer
@@ -60,7 +60,16 @@ Networking: Hetzner Cloud uses virtio NICs, so the installed system gets `vio0`/
 
 ### 1.4 Verify the image before trusting it
 
-The FAQ requires cryptographic verification, not just checksums: `signify -Cp /etc/signify/openbsd-7X-base.pub -x SHA256.sig miniroot*.img` (SHA256 only catches accidental corruption; `signify` catches tampering) ([OpenBSD FAQ 4, "Downloading OpenBSD"](https://www.openbsd.org/faq/faq4.html)). This matters here because the snapshot later becomes the source of every real user's mail and keys — a substituted install image is a compromised platform from the first boot.
+OpenBSD FAQ 4, "Downloading OpenBSD", requires cryptographic verification, not just checksums. Run this on an OpenBSD 8.0 host you already trust, because the Debian rescue shell has neither `signify` nor the keyring. Download the image, the checksum list, and its signature into one directory:
+
+```sh
+ftp https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/miniroot80.img
+ftp https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/SHA256
+ftp https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/SHA256.sig
+signify -Cp /etc/signify/openbsd-80-base.pub -x SHA256.sig miniroot80.img
+```
+
+The command needs `SHA256.sig` beside the image. A checksum catches accidental corruption, while `signify` catches tampering. A good run prints `Signature Verified` and `miniroot80.img: OK` ([OpenBSD FAQ 4](https://www.openbsd.org/faq/faq4.html)). This matters here because the snapshot later becomes the source of every real user's mail and keys, and a substituted install image compromises the platform from the first boot.
 
 ### 1.5 Post-install before snapshotting
 
@@ -90,7 +99,7 @@ Then snapshot (§2), and optionally keep the throwaway box or delete it.
 
 ```sh
 hcloud server create-image --type snapshot \
-  --description "kyriakon-openbsd-79-<YYYYMMDD>" \
+  --description "kyriakon-openbsd-80-<YYYYMMDD>" \
   --label os=openbsd --label rev=<n> \
   <server>
 ```
