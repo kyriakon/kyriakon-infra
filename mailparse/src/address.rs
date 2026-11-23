@@ -422,7 +422,9 @@ impl<'a> Parser<'a> {
 
     fn skip_bare_local(&mut self) -> Result<Option<Mailbox>, Malformed> {
         let start = self.pos;
-        if !self.skip_local_part()? {
+        // A bare localpart is a dot-atom, as cron writes `root`. A quoted string
+        // with no `@` is a display name, not a mailbox, and must not pass as one.
+        if !self.skip_dot_atom()? {
             self.pos = start;
             return Ok(None);
         }
@@ -665,6 +667,7 @@ mod tests {
             b"alice@example.invalid <bob@example.invalid>",
             b"Group: alice@example.invalid, bob@example.invalid;",
             b"alice@example.invalid,",
+            b"\"a quoted display name\"",
         ] {
             assert!(parse_address_list(value).is_err(), "{value:?}");
         }
