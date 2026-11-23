@@ -17,8 +17,10 @@ Hetzner has no native OpenBSD image, so install once by hand and snapshot it:
 
 1. Provision a throwaway Cloud VPS (any Linux type, e.g. `cx22`/`cx32`). Its disk
    **must be <= the production `server_type` disk**, or the snapshot won't fit.
-2. On an OpenBSD 8.0 host, such as the mail box, download the release files and
-   verify the image with `signify` before trusting it. A substituted image is a
+2. On an OpenBSD 8.0 host you already trust, download the release files and
+   verify the image with `signify` before trusting it. The first build uses a
+   local OpenBSD 8.0 VM, because the snapshot built here is what provisions the
+   mail box; a rebuild can use the mail box instead. A substituted image is a
    compromised platform from first boot. The rescue shell cannot do this check.
    It is Debian, with no `signify` and no `/etc/signify`, and the invocation
    fails there. The runbook's "Verify an OpenBSD release image" gives the
@@ -29,10 +31,14 @@ Hetzner has no native OpenBSD image, so install once by hand and snapshot it:
    hcloud server enable-rescue --type linux64 <server>
    hcloud server reset <server>
    ```
-4. In the rescue shell (SSH as root), write the verified image to the disk and
-   extend its OpenBSD partition:
+4. From the operator's checkout, copy the disk script to the rescue host:
    ```sh
-   bash openbsd/restore-template/prepare-disk.sh <sha256>
+   scp openbsd/restore-template/prepare-disk.sh root@<rescue-ip>:/root/
+   ```
+   Then in the rescue shell (SSH as root), write the verified image to the disk
+   and extend its OpenBSD partition:
+   ```sh
+   bash /root/prepare-disk.sh <sha256>
    ```
    The argument is the hash recorded in step 2. With no argument, the script uses
    the hash it pins, which is the same value for 8.0. It fetches the image,

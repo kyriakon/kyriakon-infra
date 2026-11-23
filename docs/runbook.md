@@ -1076,7 +1076,7 @@ The record published today carries no `t=` flag, so adding `t=s` is part of the 
 
 The release directory holds the image, `SHA256`, and `SHA256.sig`. `SHA256` catches a corrupted download. `SHA256.sig` is the release checksum list signed with the release key, and checking it catches a substituted image. That signature is what makes the hash in `openbsd/restore-template/prepare-disk.sh` a trust anchor.
 
-`signify` and its keyring are part of the OpenBSD base system. The Hetzner rescue shell is Debian and has neither, so run this on an OpenBSD 8.0 host, such as the mail box. On 8.0 the release key is `/etc/signify/openbsd-80-base.pub`. The release root also publishes the same key as `openbsd-80-base.pub`. Use that copy only after comparing it with the copy on a trusted OpenBSD system.
+`signify` and its keyring are part of the OpenBSD base system. The Hetzner rescue shell is Debian and has neither, so run this on an OpenBSD 8.0 host you already trust. The first build uses a local OpenBSD 8.0 VM, because the mail box is provisioned from the snapshot built here; a rebuild can use the mail box instead. On 8.0 the release key is `/etc/signify/openbsd-80-base.pub`. The release root also publishes the same key as `openbsd-80-base.pub`. Use that copy only after comparing it with the copy on a trusted OpenBSD system.
 
 Download the three files into one directory and verify the image:
 
