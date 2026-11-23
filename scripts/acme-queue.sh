@@ -630,7 +630,16 @@ run() {
 	1) return 0 ;;
 	*) die "$lock_message" ;;
 	esac
-	trap 'unlock_dir "$lock"' EXIT
+	# The body runs in its own function and the wrapper releases the lock on
+	# every normal return: pdksh scopes a trap set inside a function to that
+	# function, so an EXIT trap here would never run.
+	run_rc=0
+	run_locked || run_rc=$?
+	unlock_dir "$lock"
+	return "$run_rc"
+}
+
+run_locked() {
 
 	now=$(date +%s)
 	# Each lane has its own window, and only the lanes decide whether this pass has
