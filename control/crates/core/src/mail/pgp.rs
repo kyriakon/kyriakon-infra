@@ -291,34 +291,33 @@ pub fn inspect_single_cert(armour: &str) -> Result<Cert, Error> {
 /// more than one trips. `inspected` separates a finding from the advisory that
 /// the parser could not read the block.
 pub fn public_key(value: &str) -> Result<Checked, Error> {
-    let cert = inspect_single_cert(value)?;
-    match keygen_spike::check_public_key(&cert.material, now_secs()) {
-        Ok(findings) => Ok(Checked {
-            verdict: if findings.is_empty() {
-                "works".to_string()
-            } else {
-                findings.join("; ")
-            },
-            inspected: true,
-        }),
-        // A parser that cannot read a well-framed block is a gap in this check,
-        // not a verdict on the key: the advisory proceeds and names a reader.
-        Err(_) => Ok(Checked {
-            verdict: UNINSPECTED.to_string(),
-            inspected: false,
-        }),
-    }
+    let (findings, inspected) = inspected_findings(value)?;
+    Ok(Checked {
+        verdict: if findings.is_empty() {
+            "works".to_string()
+        } else {
+            findings.join("; ")
+        },
+        inspected,
+    })
 }
 
 /// The three-condition inspection, from the crate the page builds to WASM, with
 /// the framing check that decides whether the material is a public key block at
 /// all. The conditions themselves are not repeated here.
 pub fn findings(value: &str) -> Result<Vec<String>, Error> {
+    inspected_findings(value).map(|(findings, _)| findings)
+}
+
+/// The crate's findings, and whether it read the block at all. A parser that
+/// cannot read a well-framed block is a gap in this check, not a verdict on the
+/// key: the advisory proceeds and names a reader.
+fn inspected_findings(value: &str) -> Result<(Vec<String>, bool), Error> {
     let cert = inspect_single_cert(value)?;
     Ok(
         match keygen_spike::check_public_key(&cert.material, now_secs()) {
-            Ok(findings) => findings,
-            Err(_) => vec![UNINSPECTED.to_string()],
+            Ok(findings) => (findings, true),
+            Err(_) => (vec![UNINSPECTED.to_string()], false),
         },
     )
 }
@@ -616,6 +615,30 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Standard base64 without padding, which is the form OpenSSH prints a
+/// fingerprint in.
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(A[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(A[n as usize & 63] as char);
+        }
+    }
+    out
+}
+
 /// Verify `payload` with the public key in `key_file`, requiring gpg's
 /// `VALIDSIG` fingerprint to equal `expected_fpr`. A valid signature by a key
 /// hidden in the same block is not a signature by the key in use (#918).
@@ -671,11 +694,15 @@ pub async fn verify_clearsigned(
                 .to_string(),
         ));
     }
-    let fingerprint = valid_sigs(&out.stderr).into_iter().next().ok_or_else(|| {
-        Error::Failed(
-            "gpg verified the clearsigned message but reported no signing fingerprint".to_string(),
-        )
-    })?;
+    let fingerprint = valid_primary_fingerprints(&out.stderr)
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            Error::Failed(
+                "gpg verified the clearsigned message but reported no signing fingerprint"
+                    .to_string(),
+            )
+        })?;
     let plaintext = String::from_utf8(out.stdout).map_err(|_| {
         Error::Failed("the clearsigned message's verified plaintext is not UTF-8".to_string())
     })?;
@@ -713,15 +740,6 @@ pub async fn encrypt_to_cert(
         )));
     }
     Ok(out.stdout)
-}
-
-/// The one anchored clearsigned block in `message`, or `None` when the message
-/// is not clearsigned. A marker inside a header line, request text before the
-/// block, or a second marker before the end is refused rather than skipped:
-/// gpg would verify the real block while an operator read text it never covered
-/// (#924).
-pub fn clearsigned_block(message: &[u8]) -> Result<Option<&[u8]>, Error> {
-    clearsigned_span(message).map(|span| span.map(|span| &message[span]))
 }
 
 /// The headers outside a clearsigned block, or a message's own headers when it
@@ -906,6 +924,13 @@ fn trim_bytes(mut bytes: &[u8]) -> &[u8] {
 /// The address in one header block's `From:`, with RFC 5322 continuation lines
 /// unfolded first. `None` when the block carries no `From:`.
 pub fn header_from(block: &[u8]) -> Result<Option<String>, Error> {
+    // Only the header block is a source for `From:`. A body that quotes mail
+    // can carry one too, and reading it would let quoted text name the sender.
+    // A block the split cannot read has no header block to trust.
+    let block = match kyriakon_mailparse::split_message(block) {
+        Ok(message) => message.headers,
+        Err(_) => return Ok(None),
+    };
     let mut values = Vec::new();
     for header in kyriakon_mailparse::headers(block) {
         if header.is("from") {
@@ -933,12 +958,14 @@ pub fn header_from(block: &[u8]) -> Result<Option<String>, Error> {
     Ok(Some(address.trim().to_string()))
 }
 
-/// The fingerprint in gpg's `[GNUPG:] VALIDSIG <fingerprint> ...` lines.
-fn valid_sigs(status: &[u8]) -> Vec<String> {
+/// The primary-key fingerprint in each `[GNUPG:] VALIDSIG ...` line. gpg puts
+/// the signing key first, which is a subkey when one signed, and the primary
+/// key last, which is the fingerprint the platform records.
+fn valid_primary_fingerprints(status: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(status)
         .lines()
         .filter_map(|line| line.strip_prefix("[GNUPG:] VALIDSIG "))
-        .filter_map(|rest| rest.split_whitespace().next())
+        .filter_map(|rest| rest.split_whitespace().last())
         .map(str::to_string)
         .collect()
 }
@@ -955,7 +982,7 @@ fn reports_expected(status: &[u8], expected: &str) -> bool {
         return false;
     }
     let expected = normalize_fingerprint(expected);
-    let found = valid_sigs(status);
+    let found = valid_primary_fingerprints(status);
     !found.is_empty()
         && !expected.is_empty()
         && found
@@ -1113,6 +1140,24 @@ mod tests {
         );
     }
 
+    /// A signed request can quote mail, so the body may carry a `From:` line.
+    /// Only the header block before the blank line decides the sender.
+    #[test]
+    fn header_from_does_not_read_the_body() {
+        let quoted =
+            b"From: alice@kyriakon.net\nSubject: my data\n\n> From: quoted@example.invalid\n";
+        assert_eq!(
+            header_from(quoted).unwrap(),
+            Some("alice@kyriakon.net".to_string())
+        );
+        let body_only = b"Subject: my data\n\nFrom: attacker@example.invalid\n";
+        assert_eq!(header_from(body_only).unwrap(), None);
+        // A block with content that is not a header has no header block to
+        // trust, so a later From: is not read out of it.
+        let no_separator = b"Hello\nFrom: attacker@example.invalid\n";
+        assert_eq!(header_from(no_separator).unwrap(), None);
+    }
+
     /// Unsigned request text between the headers and the armour is refused: gpg
     /// would verify the armour and the operator would record the text above it.
     #[test]
@@ -1204,26 +1249,8 @@ mod tests {
         format!("{BEGIN}\n\n{}\n{END}\n", base64_encode(&raw))
     }
 
-    fn base64_encode(bytes: &[u8]) -> String {
-        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::new();
-        for chunk in bytes.chunks(3) {
-            let b = [
-                chunk[0],
-                *chunk.get(1).unwrap_or(&0),
-                *chunk.get(2).unwrap_or(&0),
-            ];
-            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-            out.push(A[(n >> 18) as usize & 63] as char);
-            out.push(A[(n >> 12) as usize & 63] as char);
-            if chunk.len() > 1 {
-                out.push(A[(n >> 6) as usize & 63] as char);
-            }
-            if chunk.len() > 2 {
-                out.push(A[n as usize & 63] as char);
-            }
-        }
-        out
+    fn clearsigned_block(message: &[u8]) -> Result<Option<&[u8]>, Error> {
+        clearsigned_span(message).map(|span| span.map(|span| &message[span]))
     }
 
     struct Home(PathBuf);
@@ -1287,6 +1314,43 @@ mod tests {
             Key {
                 public: String::from_utf8(export.stdout).unwrap(),
                 fingerprint,
+            }
+        }
+
+        /// A certify-only primary with a signing subkey, the ordinary shape of
+        /// a mail certificate. gpg reports the subkey first in VALIDSIG and the
+        /// primary last, which is the fingerprint the platform records.
+        fn key_with_signing_subkey(&self) -> Key {
+            let primary = self.key("cert");
+            let added = self.run(&[
+                "--batch",
+                "--no-tty",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--quick-add-key",
+                &primary.fingerprint,
+                "rsa2048",
+                "sign",
+                "0",
+            ]);
+            assert!(
+                added.status.success(),
+                "signing subkey generation failed: {}",
+                String::from_utf8_lossy(&added.stderr)
+            );
+            let export = self.run(&[
+                "--batch",
+                "--no-tty",
+                "--armor",
+                "--export",
+                &primary.fingerprint,
+            ]);
+            assert!(export.status.success(), "the key could not be exported");
+            Key {
+                public: String::from_utf8(export.stdout).unwrap(),
+                fingerprint: primary.fingerprint,
             }
         }
 
@@ -1439,7 +1503,33 @@ mod tests {
         .unwrap());
     }
 
-    /// #924 and #960: only gpg's verified plaintext is returned, and a forged
+    /// A certificate commonly signs with a subkey. VALIDSIG names the signing
+    /// subkey first and the primary last, and the platform records the primary,
+    /// so verification must compare the last field.
+    #[tokio::test]
+    async fn a_signature_by_a_signing_subkey_matches_the_primary_fingerprint() {
+        let home = Home::new();
+        let signer = home.key_with_signing_subkey();
+        let cert = home.cert(&signer.public);
+        let payload = b"the pending key's fingerprint\n";
+
+        let signature = home.sign(&signer, payload);
+        assert!(
+            verify_detached("gpg", &cert, &signer.fingerprint, payload, &signature)
+                .await
+                .unwrap()
+        );
+
+        let signed = home.clearsign(&signer, payload);
+        let verified = verify_clearsigned("gpg", &cert, &signer.fingerprint, &signed)
+            .await
+            .unwrap()
+            .expect("the clearsigned message verifies");
+        assert_eq!(verified.plaintext.as_bytes(), payload);
+        assert_eq!(verified.fingerprint, signer.fingerprint);
+    }
+
+    /// #918 and #960: only gpg's verified plaintext is returned, and a forged
     /// marker that gpg would skip past is refused before it runs.
     #[tokio::test]
     async fn verify_clearsigned_returns_only_gpg_plaintext_for_the_expected_key() {

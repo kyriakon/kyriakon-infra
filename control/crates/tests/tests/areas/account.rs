@@ -832,6 +832,38 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
     assert!(fix.journal().contains("\"outcome\":\"refused\""));
 }
 
+/// An account record written before the `mail_key` field existed has no
+/// fingerprint. The keyring entry is then the expected signer, so a signed
+/// replacement still applies at once instead of waiting out the window.
+#[test]
+fn a_signed_replacement_reads_the_expected_key_from_the_keyring() {
+    let fix = Fix::new("account-rotation-signed-no-record");
+    let key = replacement_key();
+    let fingerprint = kyriakon_control_core::mail::pgp::fingerprint(&key).unwrap();
+    let (_, public, signature, _) = signing_key(&fingerprint);
+    fix.page_account("alice", json!({"mail_key": null}));
+    fix.mail_key("alice", &public);
+
+    fix.file_page_action(
+        "mail-key",
+        "alice",
+        json!({"action": "replace", "material": key, "signature": signature}),
+    );
+    assert!(fix.drain().status.success());
+    let account = fix.account("alice");
+    assert_eq!(
+        account["mail_key"],
+        json!(fingerprint),
+        "intents: {:?}\njournal: {}",
+        fix.intents(),
+        fix.journal()
+    );
+    assert!(
+        account.get("rotation").is_none_or(Value::is_null),
+        "the keyring's fingerprint let the signature skip the window: {account}"
+    );
+}
+
 /// A replacement carrying a verdict other than "works" is refused, so a key
 /// that would stop delivery cannot enter the keyring from `/account`. The key
 /// in use and the keyring file stay as they were. A block the parser could not

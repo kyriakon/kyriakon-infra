@@ -129,31 +129,10 @@ fn record(mailbox: String, address: &str, material: &str, kind: Kind) -> KeyReco
 pub fn openssh_fingerprint(value: &str) -> Option<String> {
     let blob = value.split_whitespace().nth(1)?;
     let raw = pgp::base64_decode(blob)?;
-    Some(format!("SHA256:{}", base64_encode(&Sha256::digest(&raw))))
-}
-
-/// Standard base64 without padding, which is the form OpenSSH prints a
-/// fingerprint in.
-fn base64_encode(bytes: &[u8]) -> String {
-    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(A[(n >> 18) as usize & 63] as char);
-        out.push(A[(n >> 12) as usize & 63] as char);
-        if chunk.len() > 1 {
-            out.push(A[(n >> 6) as usize & 63] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(A[n as usize & 63] as char);
-        }
-    }
-    out
+    Some(format!(
+        "SHA256:{}",
+        pgp::base64_encode(&Sha256::digest(&raw))
+    ))
 }
 
 /// The prototype's four key fixtures, shared by every test that needs a key of

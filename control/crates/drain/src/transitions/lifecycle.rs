@@ -2905,21 +2905,24 @@ pub async fn mail_key(
                         "the box holds no current key to verify a signature against",
                     ));
                 }
-                let expected =
-                    match account.mail_key.as_deref() {
-                        Some(fingerprint) if !fingerprint.is_empty() => fingerprint.to_string(),
-                        _ => {
-                            let material = std::fs::read_to_string(&key_file).map_err(|e| {
-                                Error::context(format!("cannot read {}", key_file.display()), e)
-                            })?;
-                            match kyriakon_control_core::mail::pgp::inspect_single_cert(&material) {
-                                Ok(cert) => cert.fingerprint,
-                                Err(_) => return Ok(Settlement::refused(
-                                    "the box holds no current key to verify a signature against",
-                                )),
+                let expected = match account.mail_key.as_deref() {
+                    Some(fingerprint) if !fingerprint.is_empty() => fingerprint.to_string(),
+                    _ => {
+                        let material = std::fs::read_to_string(&key_file).map_err(|e| {
+                            Error::context(format!("cannot read {}", key_file.display()), e)
+                        })?;
+                        match kyriakon_control_core::mail::pgp::inspect_single_cert(&material) {
+                            Ok(cert) => cert.fingerprint,
+                            Err(why) => {
+                                return Ok(Settlement::refused(format!(
+                                    "the box's key for {} cannot be read, so the signature \
+                                         cannot be checked: {why}",
+                                    account.username
+                                )))
                             }
                         }
-                    };
+                    }
+                };
                 match signed_by_current_key(
                     cfg,
                     &key_file,
