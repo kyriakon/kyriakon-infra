@@ -35,24 +35,14 @@ pub(super) async fn webhook(app: &App, request: &Request) -> Reply {
         return Reply::html(413, String::new());
     }
     let id = ulid::Ulid::new().to_string();
-    let received = OffsetDateTime::now_utc().unix_timestamp().to_string();
-    // The signature and the arrival are written before the body. The drain
-    // iterates `.body` files, so the other order leaves a body with no
-    // signature or no receipt for a window, which it would refuse and delete: a
-    // delivery Stripe will not send again.
-    let placed = async {
-        app.store.ensure_dir("webhooks").await?;
-        app.store
-            .write_record("webhooks", &format!("{id}.sig"), signature.as_bytes())
-            .await?;
-        app.store
-            .write_record("webhooks", &format!("{id}.at"), received.as_bytes())
-            .await?;
-        app.store
-            .write_record("webhooks", &format!("{id}.body"), &request.body)
-            .await
-    }
-    .await;
+    let received = OffsetDateTime::now_utc().unix_timestamp();
+    // The store writes the signature and the arrival before the body: the drain
+    // iterates `.body` files, and the other order leaves a body with no
+    // signature or no receipt for a window, which it would refuse and delete.
+    let placed = app
+        .store
+        .write_webhook(&id, signature, received, &request.body)
+        .await;
     match placed {
         Ok(()) => Reply::html(200, String::new()),
         Err(e) => {

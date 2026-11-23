@@ -30,7 +30,7 @@ use kyriakon_control_core::config::HOST;
 use kyriakon_control_core::mail::bounce;
 use kyriakon_control_core::mail::keycheck;
 use kyriakon_control_core::mail::notice;
-use kyriakon_control_core::store::draft::{self, Draft};
+use kyriakon_control_core::store::draft::Draft;
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{NoticeStop, Store};
 
@@ -117,113 +117,166 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
     let Some(token) = token_in_subject(&message.subject) else {
         return Ok(());
     };
-    let lock = store.lock("drafts/.lock").await?;
-    let Some(mut draft) = draft::load(store, &token).await? else {
-        drop(lock);
-        return Ok(());
-    };
-    // The only address a reply may go to: the one this live draft recorded.
-    // smtpd authenticates neither an inbound envelope sender nor the From
-    // header, so a stranger can write any address there and a reply to it would
-    // make the address a backscatter source. A draft that recorded none gets no
-    // reply; the status page carries the outcome.
-    let recorded = draft
-        .answers
-        .get("address_outside")
-        .filter(|address| !address.is_empty())
-        .cloned();
-    // A draft that recorded an address outside the platform takes a mailed key
-    // only from that address. Anyone who learns the token could otherwise
-    // replace the key, and the approval would encrypt the account's future mail
-    // to the attacker. A draft with no such address keeps the old rule: the
-    // portal's applicant has no address to compare against.
-    if let Some(outside) = recorded.as_deref() {
-        let same = message
-            .reply_address()
-            .is_some_and(|from| from.eq_ignore_ascii_case(outside));
-        if !same {
-            drop(lock);
-            return reply_or_drop(cfg, store, recorded.as_deref(), &sender_mismatch_body()).await;
-        }
-    }
-    let keys = match assign(&blocks, &draft) {
-        Ok(keys) => keys,
-        Err(missing) => {
-            drop(lock);
-            return reply_or_drop(cfg, store, recorded.as_deref(), &missing_body(&missing.0)).await;
-        }
-    };
-    // A mailed key takes the same refusal as the typed form: approval would
-    // otherwise write the keyring and provision the account before the publish
-    // gate refused, leaving the member half-created.
-    for (mailbox, material) in &keys {
-        if let Some(why) = kyriakon_control_core::flow::applicant::key_error(material) {
-            drop(lock);
-            let body = format!("The key for {mailbox} cannot be used:\n{why}\n");
-            return reply_or_drop(cfg, store, recorded.as_deref(), &body).await;
-        }
-    }
-    // A draft holds one key per mailbox, and a person's key is filed under no
-    // mailbox, so it takes the account's name - the same localpart a mailed key
-    // lands on. A second key for a mailbox that already holds one is refused
-    // rather than replacing it: smtpd cannot authenticate the sender, so the
-    // refusal is the control, as it is on the Titan route. A replacement for a
-    // live mailbox goes through the account's rotation instead. One collision
-    // does not take the message's other blocks with it.
-    let username = draft
-        .answers
-        .get("username")
-        .map(String::as_str)
-        .unwrap_or_default();
-    fn localpart<'a>(username: &'a str, mailbox: &'a str) -> &'a str {
-        if mailbox.is_empty() {
-            username
-        } else {
-            mailbox
-        }
-    }
-    let (refused, fresh): (Vec<_>, Vec<_>) = keys.into_iter().partition(|(mailbox, _)| {
-        draft
-            .mail_keys
-            .iter()
-            .any(|k| localpart(username, &k.mailbox) == localpart(username, mailbox))
-    });
-    let body = draft.answers.get("whose").map(String::as_str) == Some("body");
-    let domain = draft
-        .answers
-        .get("body_domain")
-        .cloned()
-        .unwrap_or_default();
-    for (mailbox, material) in fresh {
-        let address = if body {
-            if domain.is_empty() {
-                mailbox.clone()
-            } else {
-                format!("{mailbox}@{domain}")
+    // The read, the checks and the save are one step under the draft lock: the
+    // capsule advances the same record, and two unsynchronised writers would
+    // lose one of the two.
+    let mailed = match store
+        .update_draft::<Mailed, kyriakon_control_core::store::Error>(&token, move |draft| {
+            // The only address a reply may go to: the one this live draft
+            // recorded. smtpd authenticates neither an inbound envelope sender
+            // nor the From header, so a stranger can write any address there and
+            // a reply to it would make the address a backscatter source.
+            let recorded = draft
+                .answers
+                .get("address_outside")
+                .filter(|address| !address.is_empty())
+                .cloned();
+            // A draft that recorded an address outside the platform takes a
+            // mailed key only from that address. Anyone who learns the token
+            // could otherwise replace the key.
+            if let Some(outside) = recorded.as_deref() {
+                let same = message
+                    .reply_address()
+                    .is_some_and(|from| from.eq_ignore_ascii_case(outside));
+                if !same {
+                    return Ok((
+                        Mailed {
+                            recorded,
+                            outcome: MailedOutcome::Mismatch,
+                        },
+                        false,
+                    ));
+                }
             }
-        } else {
-            format!("{mailbox}@kyriakon.net")
-        };
-        draft
-            .mail_keys
-            .push(keycheck::mail_key(mailbox.clone(), &address, &material));
+            let keys = match assign(&blocks, draft) {
+                Ok(keys) => keys,
+                Err(missing) => {
+                    return Ok((
+                        Mailed {
+                            recorded,
+                            outcome: MailedOutcome::Missing(missing_body(&missing.0)),
+                        },
+                        false,
+                    ))
+                }
+            };
+            // A mailed key takes the same refusal as the typed form: approval
+            // would otherwise write the keyring and provision the account before
+            // the publish gate refused, leaving the member half-created.
+            for (mailbox, material) in &keys {
+                if let Some(why) = kyriakon_control_core::flow::applicant::key_error(material) {
+                    return Ok((
+                        Mailed {
+                            recorded,
+                            outcome: MailedOutcome::Bad(format!(
+                                "The key for {mailbox} cannot be used:\n{why}\n"
+                            )),
+                        },
+                        false,
+                    ));
+                }
+            }
+            // A draft holds one key per mailbox, and a person's key is filed
+            // under no mailbox, so it takes the account's name - the same
+            // localpart a mailed key lands on. A second key for a mailbox that
+            // already holds one is refused rather than replacing it: smtpd
+            // cannot authenticate the sender, so the refusal is the control, as
+            // it is on the Titan route. A replacement for a live mailbox goes
+            // through the account's rotation instead.
+            let username = draft
+                .answers
+                .get("username")
+                .map(String::as_str)
+                .unwrap_or_default();
+            fn localpart<'a>(username: &'a str, mailbox: &'a str) -> &'a str {
+                if mailbox.is_empty() {
+                    username
+                } else {
+                    mailbox
+                }
+            }
+            let (refused, fresh): (Vec<_>, Vec<_>) = keys.into_iter().partition(|(mailbox, _)| {
+                draft
+                    .mail_keys
+                    .iter()
+                    .any(|k| localpart(username, &k.mailbox) == localpart(username, mailbox))
+            });
+            let body = draft.answers.get("whose").map(String::as_str) == Some("body");
+            let domain = draft
+                .answers
+                .get("body_domain")
+                .cloned()
+                .unwrap_or_default();
+            for (mailbox, material) in fresh {
+                let address = if body {
+                    if domain.is_empty() {
+                        mailbox.clone()
+                    } else {
+                        format!("{mailbox}@{domain}")
+                    }
+                } else {
+                    format!("{mailbox}@kyriakon.net")
+                };
+                draft
+                    .mail_keys
+                    .push(keycheck::mail_key(mailbox.clone(), &address, &material));
+            }
+            let refused = refused.into_iter().map(|(mailbox, _)| mailbox).collect();
+            Ok((
+                Mailed {
+                    recorded,
+                    outcome: MailedOutcome::Filed(refused),
+                },
+                true,
+            ))
+        })
+        .await
+    {
+        Ok(Some(mailed)) => mailed,
+        // The token names no live draft: no address to answer.
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(Error::from(e)),
+    };
+    match mailed.outcome {
+        MailedOutcome::Mismatch => {
+            reply_or_drop(
+                cfg,
+                store,
+                mailed.recorded.as_deref(),
+                &sender_mismatch_body(),
+            )
+            .await
+        }
+        MailedOutcome::Missing(body) => {
+            reply_or_drop(cfg, store, mailed.recorded.as_deref(), &body).await
+        }
+        MailedOutcome::Bad(body) => {
+            reply_or_drop(cfg, store, mailed.recorded.as_deref(), &body).await
+        }
+        MailedOutcome::Filed(refused) if !refused.is_empty() => {
+            let body = format!(
+                "A key for {} is already filed against this application. \
+                 The approval mail names who to contact if it is wrong.\n",
+                refused.join(", ")
+            );
+            reply_or_drop(cfg, store, mailed.recorded.as_deref(), &body).await
+        }
+        MailedOutcome::Filed(_) => Ok(()),
     }
-    let saved = draft::save(store, &mut draft).await;
-    drop(lock);
-    saved.map_err(Error::from)?;
-    if !refused.is_empty() {
-        let names: Vec<&str> = refused
-            .iter()
-            .map(|(mailbox, _)| mailbox.as_str())
-            .collect();
-        let body = format!(
-            "A key for {} is already filed against this application. \
-             The approval mail names who to contact if it is wrong.\n",
-            names.join(", ")
-        );
-        return reply_or_drop(cfg, store, recorded.as_deref(), &body).await;
-    }
-    Ok(())
+}
+
+/// What one mailed key did. The draft is out of the closure by the time the
+/// reply is sent, because a reply is not something to hold the draft lock for.
+struct Mailed {
+    recorded: Option<String>,
+    outcome: MailedOutcome,
+}
+
+enum MailedOutcome {
+    Mismatch,
+    Missing(String),
+    Bad(String),
+    Filed(Vec<String>),
 }
 
 /// Send a reply only to the address the live draft recorded. There is nothing
@@ -446,11 +499,10 @@ fn name_in_label(label: &str, name: &str, domain: &str) -> bool {
 async fn reply(cfg: &DrainConfig, store: &Store, sender: &str, body: &str) -> Result<(), Error> {
     let path = store.path("mail/replies.json");
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    let mut sent: BTreeMap<String, i64> = store
-        .read_record("mail", "replies.json")
-        .await
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
+    let mut sent: BTreeMap<String, i64> = match store.mail_replies_text().await? {
+        Some(text) => serde_json::from_str(&text).unwrap_or_default(),
+        None => BTreeMap::new(),
+    };
     sent.retain(|_, at| now.saturating_sub(*at) < REPLY_INTERVAL_SECONDS);
     if sent.contains_key(sender) {
         return Ok(());
@@ -460,9 +512,8 @@ async fn reply(cfg: &DrainConfig, store: &Store, sender: &str, body: &str) -> Re
         context: "encode the reply log",
         source,
     })?;
-    let owner = store.dir_owner("mail");
     store
-        .write_record_owned("mail", "replies.json", &bytes, owner)
+        .write_mail_replies(&bytes)
         .await
         .map_err(|e| Error::context(format!("cannot write {}", path.display()), e))?;
     notice::enqueue(cfg, sender, REPLY_SUBJECT, body)
@@ -781,19 +832,22 @@ async fn stop_clock(
     if !bounce::every_address_failed(store, username).await? {
         return Ok(());
     }
-    let Some(mut account) = store.account(username).await? else {
-        return Ok(());
-    };
-    account.notice_stopped = Some(NoticeStop {
+    let stop = NoticeStop {
         address: report.recipient.clone(),
         status: report.status.clone(),
         at: kyriakon_control_core::util::filed_at(),
-    });
-    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
-    crate::transitions::groups::write_account_record(store, username, &bytes).await?;
+    };
+    // The latch is set under the account's own lock: the console's own account
+    // writes are a separate process, and a read-modify-write without the lock
+    // could drop one of the two.
+    store
+        .update_account(username, move |current| {
+            if let Some(account) = current {
+                account.notice_stopped = Some(stop);
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
     crate::transitions::report_failure(
         cfg,
         store,

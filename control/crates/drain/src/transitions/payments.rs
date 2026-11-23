@@ -6,7 +6,7 @@
 //! leaves the line, the after-line work and the remove to the seam.
 
 use super::boxrun::{cancel_stripe_if_active, run_script};
-use super::groups::{group_record, write_account_record, write_group_record};
+use super::groups::group_record;
 use super::lifecycle::dns_contact;
 use super::Error;
 use super::{AfterLine, Settlement};
@@ -27,7 +27,6 @@ use kyriakon_control_core::store::{
 };
 use kyriakon_control_core::util;
 use serde_json::json;
-use serde_json::Value;
 use time::OffsetDateTime;
 
 /// The note a credit's applied line carries: the override's reason when the
@@ -253,7 +252,7 @@ async fn apply_payment(
     let PaymentApplication {
         intent,
         username,
-        mut account,
+        account,
         mut payment,
         amount,
         received,
@@ -289,7 +288,7 @@ async fn apply_payment(
         }
         // A crash between the account write and its copies leaves the status
         // page behind; the account is the truth now, so rewrite them from it.
-        write_payment_copy(store, username, &payment).await?;
+        store.write_payment_copy(username, &payment).await?;
         return Ok(Settlement::applied(
             ApplicationRef::account(username.to_string()),
             override_note(intent.override_reason.as_deref()),
@@ -426,22 +425,26 @@ async fn apply_payment(
         if let Some(window) = payment.window.as_mut() {
             window.state = "paid".to_string();
         }
-        // Only a lapsed account is restored. A closing or suspended account
-        // keeps its state: the payment is recorded, and the decision that put
-        // it there is not the payment sweep's to overturn.
-        if account.state == "lapsed" || account.state == "active" {
-            account.state = "active".to_string();
-            account.grace_until = None;
-            account.notice_stopped = None;
-        }
     }
-    account.payment = Some(payment.clone());
-    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
-    write_account_record(store, username, &bytes).await?;
-    write_payment_copy(store, username, &payment).await?;
+    // Only a lapsed account is restored under the lock. A closing or suspended
+    // account keeps its state: the payment is recorded, and the decision that
+    // put it there is not the payment sweep's to overturn.
+    let paid = applied.paid;
+    let payment_for_record = payment.clone();
+    store
+        .update_account(username, |current| {
+            if let Some(account) = current.as_mut() {
+                account.payment = Some(payment_for_record.clone());
+                if paid && matches!(account.state.as_str(), "lapsed" | "active") {
+                    account.state = "active".to_string();
+                    account.grace_until = None;
+                    account.notice_stopped = None;
+                }
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
+    store.write_payment_copy(username, &payment).await?;
     append_credit_ledger(
         cfg,
         store,
@@ -671,7 +674,15 @@ async fn group_credit(
     if let Some(window) = group.payment.window.as_mut() {
         window.state = "paid".to_string();
     }
-    write_group_record(store, &group).await?;
+    let payment = group.payment.clone();
+    store
+        .update_group(&group.domain, |current| {
+            if let Some(group) = current.as_mut() {
+                group.payment = payment.clone();
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
     append_credit_ledger(
         cfg,
         store,
@@ -722,21 +733,25 @@ pub(super) async fn restore_group_mailboxes(
     group: &GroupRecord,
 ) -> Result<(), Error> {
     for mailbox in &group.accounts {
-        let Some(mut account) = store.account(mailbox).await? else {
+        let Some(account) = store.account(mailbox).await? else {
             continue;
         };
         if account.state != "lapsed" {
             continue;
         }
         run_script(cfg, "lapse-user.sh", &["--restore", mailbox]).await?;
-        account.state = "active".to_string();
-        account.grace_until = None;
-        account.notice_stopped = None;
-        let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-            context: "encode the account",
-            source,
-        })?;
-        write_account_record(store, mailbox, &bytes).await?;
+        store
+            .update_account(mailbox, |current| {
+                if let Some(account) = current.as_mut() {
+                    if account.state == "lapsed" {
+                        account.state = "active".to_string();
+                        account.grace_until = None;
+                        account.notice_stopped = None;
+                    }
+                }
+                Ok::<(), Error>(())
+            })
+            .await?;
     }
     Ok(())
 }
@@ -966,7 +981,7 @@ pub async fn refund(
         )
         .await;
     }
-    let (username, mut account, mut payment) = match resolve_payment(store, &intent.token).await {
+    let (username, account, mut payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
         Err(problem) => return Ok(Settlement::refused(&problem)),
     };
@@ -1014,19 +1029,28 @@ pub async fn refund(
             if cancel_stripe_if_active(cfg, &payment.stripe).await? {
                 payment.stripe.cancel_at_period_end = true;
             }
-            account.state = "closing".to_string();
-            account.closing_until = Some(closing_until);
         }
         if intent.excess {
             let left = (balance - amount).max(0);
             payment.balance_gbp = (left > 0).then(|| util::gbp(left));
         }
-        account.payment = Some(payment.clone());
-        let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-            context: "encode the account",
-            source,
-        })?;
-        write_account_record(store, &username, &bytes).await?;
+        let close = intent.close;
+        let closing_until = closing_until.clone();
+        let payment_for_record = payment.clone();
+        store
+            .update_account(&username, |current| {
+                if let Some(account) = current.as_mut() {
+                    if close {
+                        account.state = "closing".to_string();
+                        account.closing_until = Some(closing_until.clone());
+                    }
+                    // A close stops the card and the excess refund changes the
+                    // balance, so the block is written for either.
+                    account.payment = Some(payment_for_record.clone());
+                }
+                Ok::<(), Error>(())
+            })
+            .await?;
     }
 
     let seq = append_refund_ledger(
@@ -1706,63 +1730,6 @@ async fn ledger_txid(store: &Store, txid: &str) -> Result<Option<(u64, String)>,
                 .unwrap_or_else(|| "an earlier date".to_string()),
         )
     }))
-}
-
-/// Rewrite the payment block on the application copy the handler reads, so a
-/// status page that has the application still shows the credit rather than the
-/// token. The account's copy is rewritten too; the applications copy only when
-/// it still exists, because recreating a purged application would undo the
-/// purge's own promise.
-pub async fn write_payment_copy(
-    store: &Store,
-    username: &str,
-    payment: &Payment,
-) -> Result<(), Error> {
-    let Some(text) = store.account_application_text(username).await? else {
-        return Ok(());
-    };
-    let mut copy: Value = serde_json::from_str(&text)
-        .map_err(|e| Error::context("the application copy does not parse", e))?;
-    copy["payment"] = serde_json::to_value(payment).map_err(|source| Error::Json {
-        context: "encode the payment block",
-        source,
-    })?;
-    let bytes = serde_json::to_vec_pretty(&copy).map_err(|source| Error::Json {
-        context: "encode the application copy",
-        source,
-    })?;
-    store
-        .write_record(&format!("accounts/{username}"), "application.json", &bytes)
-        .await?;
-    if let Some(token) = copy.get("status_token").and_then(Value::as_str) {
-        // `status_token` comes from a copy the unprivileged handler owns. A
-        // planted value must never become a path under `applications/`, so a
-        // token that is not the generated shape leaves nothing to rewrite.
-        if !store::is_status_token(token) {
-            return Ok(());
-        }
-        if let Some(filed) = store.filed_application_text(token).await? {
-            // The account copy is written before the decision stamp and can be
-            // stale. Merge only the block into the shared record, so its stage,
-            // its decision and its purged answers are not replaced by the
-            // mailbox's copy.
-            let mut record: Value = serde_json::from_str(&filed)
-                .map_err(|e| Error::context("the application record does not parse", e))?;
-            record["payment"] = serde_json::to_value(payment).map_err(|source| Error::Json {
-                context: "encode the payment block",
-                source,
-            })?;
-            let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
-                context: "encode the application record",
-                source,
-            })?;
-            let owner = store.dir_owner("applications");
-            store
-                .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
-                .await?;
-        }
-    }
-    Ok(())
 }
 
 /// The window quote a payment row may carry. A renewal's account block still

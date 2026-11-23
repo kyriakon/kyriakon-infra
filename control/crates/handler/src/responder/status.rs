@@ -74,17 +74,10 @@ pub(super) fn card_link(app: &App, application: Option<&str>, group: bool) -> Op
 /// record that is gone would take a payment nothing can settle.
 pub(super) async fn live_application(app: &App, application: Option<&str>) -> Option<String> {
     let application = application?;
-    if !kyriakon_control_core::store::is_status_token(application) {
-        return None;
-    }
-    match app.store.application(application).await {
-        Ok(Some(_)) => Some(application.to_string()),
-        Ok(None) => None,
-        Err(e) => {
-            e.report("the application a card link names");
-            None
-        }
-    }
+    app.store
+        .read_optional_oracle(application)
+        .await
+        .map(|_| application.to_string())
 }
 
 /// The page one token's record renders, or the one notice that covers a token
@@ -128,22 +121,9 @@ pub fn status_page(
 /// spent. A token is a path component, so it is checked against the alphabet
 /// before it is used as one: a probe cannot walk the directory with "..".
 pub(super) async fn record_for(app: &App, token: &str) -> Option<Record> {
-    let well_formed = token.len() == 26
-        && token
-            .bytes()
-            .all(|b| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&b));
-    if !well_formed {
-        return None;
-    }
-    match app.store.application(token).await {
-        Ok(record) => record,
-        // The status path is not a token oracle: a damaged record answers the
-        // same as an unknown token, and the operator gets the reason on stderr.
-        Err(e) => {
-            e.report("the status page");
-            None
-        }
-    }
+    // The status path is not a token oracle: a damaged record answers the same
+    // as an unknown one, and the operator gets the reason on stderr.
+    app.store.read_optional_oracle(token).await
 }
 
 #[cfg(test)]

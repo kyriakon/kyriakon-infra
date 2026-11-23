@@ -20,30 +20,7 @@ use kyriakon_control_core::{flow::questions, flow::validate, mail::keycheck, uti
 /// disk. One writer for the web form and the capsule, so the order cannot drift
 /// between them.
 pub(super) async fn file_application(app: &App, record: &Record) -> Result<(), Error> {
-    let id = ulid::Ulid::new().to_string();
-    let name = format!("{}.json", record.status_token);
-    // Both encodings first: an encoding failure must leave no record either.
-    let bytes = serde_json::to_vec_pretty(record)
-        .map_err(|e| Error::context("cannot encode the application", e))?;
-    let intent = serde_json::to_vec_pretty(&record.intent(&id))
-        .map_err(|e| Error::context("cannot encode the intent", e))?;
-    app.store
-        .write_record("applications", &name, &bytes)
-        .await?;
-    if let Err(e) = app
-        .store
-        .write_record("intents", &format!("{id}.json"), &intent)
-        .await
-    {
-        // A record whose intent was never written is never reviewed and never
-        // purged, and the applicant retries under a fresh token. Remove it so
-        // the retry starts clean; a failure to remove is reported beside the
-        // original error rather than replacing it.
-        if let Err(remove) = app.store.remove("applications", &name).await {
-            remove.report(&format!("the orphaned application record {name} stays"));
-        }
-        return Err(e.into());
-    }
+    app.store.file_application(record).await?;
     Ok(())
 }
 

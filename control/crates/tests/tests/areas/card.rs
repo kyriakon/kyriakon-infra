@@ -521,6 +521,34 @@ fn a_deferred_event_survives_past_the_timestamp_window() {
     );
 }
 
+/// A signature file that exists but cannot be read is a transient fault: the
+/// pass reports it and keeps the delivery, rather than deleting the one copy
+/// Stripe will not send again.
+#[test]
+fn an_unreadable_signature_keeps_the_delivery() {
+    let fix = Fix::new("webhook-unreadable-sig");
+    fix.card_account("secretary", None);
+    fix.webhook(
+        "evt_unreadable_sig",
+        "invoice.paid",
+        invoice("in_unreadable_sig"),
+    );
+    let sig = fix.dir.join("store/webhooks/evt_unreadable_sig.sig");
+    std::fs::remove_file(&sig).unwrap();
+    std::fs::create_dir(&sig).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.webhooks()
+            .iter()
+            .any(|n| n.starts_with("evt_unreadable_sig.body")),
+        "the unreadable signature deleted the delivery: {:?}",
+        fix.webhooks()
+    );
+    assert!(sig.is_dir(), "the unreadable signature file was replaced");
+}
+
 /// A check that fails after the delivery was proven once leaves the pair for
 /// the retry rather than deleting a money-bearing event.
 #[test]

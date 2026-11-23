@@ -4,9 +4,9 @@
 //! mail and the renewal note carry live in `payments::rails`.
 
 use super::boxrun::{run_script, script_error, spawn_script};
-use super::groups::{group_record, write_account_record, write_group_record};
+use super::groups::group_record;
 use super::lifecycle::{dns_contact, report_record};
-use super::payments::{restore_group_mailboxes, token_join, write_payment_copy};
+use super::payments::{restore_group_mailboxes, token_join};
 use super::report_failure;
 use super::Error;
 use kyriakon_control_core::account::sign;
@@ -96,20 +96,21 @@ pub async fn stripe_webhooks(
             let Some(id) = name.strip_suffix(".body") else {
                 continue;
             };
-            let body = match tokio::fs::read(store.path(&format!("webhooks/{name}"))).await {
-                Ok(body) => body,
+            let pair = match store.read_webhook_pair(id).await {
+                Ok(Some(pair)) => pair,
                 // A pair another iteration of this pass already settled.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(None) => continue,
                 Err(e) => {
-                    Error::Failed(format!("is unreadable: {e}")).report(&format!("webhook {id}"));
-                    remove_webhook(store, id).await?;
+                    // An unreadable body or signature is transient (EMFILE,
+                    // EIO, EACCES). The delivery stays for the next pass: it is
+                    // money, and a genuine pair is not ours to delete.
+                    Error::from(e).report(&format!("webhook {id}"));
                     continue;
                 }
             };
-            let sig = store
-                .read_record("webhooks", &format!("{id}.sig"))
-                .await
-                .unwrap_or_default();
+            let received = pair.received;
+            let body = pair.body;
+            let sig = pair.signature;
             // The body is parsed first, because the event id in it decides
             // whether this is the first sight of the delivery. A body that is
             // not JSON is refused whatever the id would have said.
@@ -121,7 +122,7 @@ pub async fn stripe_webhooks(
                         source: e,
                     }
                     .report(&format!("webhook {id}"));
-                    remove_webhook(store, id).await?;
+                    store.remove_webhook(id).await?;
                     continue;
                 }
             };
@@ -133,7 +134,7 @@ pub async fn stripe_webhooks(
             if !event_id_shape(event_id) || kind.is_empty() {
                 Error::Failed("names no event id or type".to_string())
                     .report(&format!("webhook {id}"));
-                remove_webhook(store, id).await?;
+                store.remove_webhook(id).await?;
                 continue;
             }
             // A delivery proven on an earlier pass is not judged against this
@@ -157,9 +158,8 @@ pub async fn stripe_webhooks(
                     // into a replay. A pair queued before the handler wrote the
                     // stamp falls back to its body's mtime, which is when it was
                     // stored.
-                    let arrived = webhook_received(store, id)
-                        .await
-                        .unwrap_or_else(|| OffsetDateTime::now_utc().unix_timestamp());
+                    let arrived =
+                        received.unwrap_or_else(|| OffsetDateTime::now_utc().unix_timestamp());
                     verify_webhook(&secret, &sig, &body, arrived)
                 }
             };
@@ -176,7 +176,7 @@ pub async fn stripe_webhooks(
                     .and_then(|value| value.get("pair").and_then(Value::as_str))
                     .is_some_and(|pair| pair == id);
                 if !proven_pair {
-                    remove_webhook(store, id).await?;
+                    store.remove_webhook(id).await?;
                 }
                 continue;
             }
@@ -208,13 +208,13 @@ pub async fn stripe_webhooks(
                 continue;
             }
             if seen.contains(&format!("event:{event_id}")) {
-                remove_webhook(store, id).await?;
+                store.remove_webhook(id).await?;
                 forget_verified(store, event_id).await?;
                 continue;
             }
             if let Some(pair) = invoice_pair(kind, object_id) {
                 if seen.contains(&pair) {
-                    remove_webhook(store, id).await?;
+                    store.remove_webhook(id).await?;
                     forget_verified(store, event_id).await?;
                     continue;
                 }
@@ -244,13 +244,13 @@ pub async fn stripe_webhooks(
                     if let Some(pair) = invoice_pair(kind, object_id) {
                         seen.insert(pair);
                     }
-                    remove_webhook(store, id).await?;
+                    store.remove_webhook(id).await?;
                     forget_verified(store, event_id).await?;
                 }
                 // A valid event with nothing of ours in it settles nothing and
                 // writes nothing; the pair is still removed so it is not retried.
                 Ok(Settled::Ignored) => {
-                    remove_webhook(store, id).await?;
+                    store.remove_webhook(id).await?;
                     forget_verified(store, event_id).await?;
                 }
                 // The account this names is not known yet, which a checkout
@@ -357,34 +357,6 @@ pub fn event_id_shape(id: &str) -> bool {
     })
 }
 
-async fn remove_webhook(store: &Store, id: &str) -> Result<(), Error> {
-    store.remove("webhooks", &format!("{id}.body")).await?;
-    store.remove("webhooks", &format!("{id}.sig")).await?;
-    store
-        .remove("webhooks", &format!("{id}.at"))
-        .await
-        .map_err(Error::from)
-}
-
-/// When the handler accepted this delivery, as a unix timestamp. It writes
-/// `webhooks/<id>.at` before the body, so a body's presence means the stamp is
-/// there. A pair queued by an older handler has no stamp, so the body's mtime —
-/// the instant it was written — stands in for it; `None` only when neither can
-/// be read, and the caller keeps its old comparison against now.
-async fn webhook_received(store: &Store, id: &str) -> Option<i64> {
-    if let Some(stamp) = store.read_record("webhooks", &format!("{id}.at")).await {
-        if let Ok(at) = stamp.trim().parse::<i64>() {
-            return Some(at);
-        }
-    }
-    let modified = tokio::fs::metadata(store.path(&format!("webhooks/{id}.body")))
-        .await
-        .ok()?
-        .modified()
-        .ok()?;
-    Some(OffsetDateTime::from(modified).unix_timestamp())
-}
-
 /// Whether a delivery still queued arrived on or after `day`. A grace sweep
 /// uses this to defer one account rather than every account when a payment
 /// event for it may still be waiting. An arrival that cannot be read is
@@ -394,7 +366,14 @@ pub async fn queued_on_or_after(store: &Store, day: Date) -> Result<bool, Error>
         let Some(id) = name.strip_suffix(".body") else {
             continue;
         };
-        let Some(received) = webhook_received(store, id).await else {
+        let received = match store.read_webhook_pair(id).await {
+            Ok(Some(pair)) => pair.received,
+            // Unreadable is recent: hold the deletion rather than guess it old.
+            Err(_) => return Ok(true),
+            // A pair another iteration already settled.
+            Ok(None) => continue,
+        };
+        let Some(received) = received else {
             return Ok(true);
         };
         let arrived = match OffsetDateTime::from_unix_timestamp(received) {
@@ -555,13 +534,41 @@ impl BillingTarget {
     async fn save(&self, store: &Store) -> Result<(), Error> {
         match self {
             BillingTarget::Account(a) => {
-                let bytes = serde_json::to_vec_pretty(a).map_err(|source| Error::Json {
-                    context: "encode the account",
-                    source,
-                })?;
-                write_account_record(store, &a.username, &bytes).await
+                let username = a.username.clone();
+                let payment = a.payment.clone();
+                store
+                    .update_account(&username, move |current| {
+                        if let Some(account) = current.as_mut() {
+                            // Only the payment block is this pass's to change.
+                            // A concurrent console suspension or closure keeps
+                            // its own state; a lapsed account is restored as the
+                            // prepaid credit path does.
+                            if let Some(payment) = payment.clone() {
+                                account.payment = Some(payment);
+                            }
+                            if account.state == "lapsed" {
+                                account.state = "active".to_string();
+                                account.grace_until = None;
+                                account.notice_stopped = None;
+                            }
+                        }
+                        Ok::<(), Error>(())
+                    })
+                    .await
             }
-            BillingTarget::Group(g) => write_group_record(store, g).await,
+            BillingTarget::Group(g) => {
+                let domain = g.domain.clone();
+                let payment = g.payment.clone();
+                store
+                    .update_group(&domain, move |current| {
+                        if let Some(group) = current.as_mut() {
+                            group.payment = payment.clone();
+                            group.grace_until = None;
+                        }
+                        Ok::<(), Error>(())
+                    })
+                    .await
+            }
         }
     }
 
@@ -1034,7 +1041,7 @@ async fn invoice_paid(
     billing.save(store).await?;
     if let BillingTarget::Account(account) = &billing {
         if let Some(payment) = &account.payment {
-            write_payment_copy(store, &account.username, payment).await?;
+            store.write_payment_copy(&account.username, payment).await?;
         }
     }
     append_invoice_ledger(

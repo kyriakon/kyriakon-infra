@@ -71,13 +71,12 @@ pub async fn load(store: &Store, token: &str) -> Result<Option<Draft>, Error> {
     if !valid_token(token) {
         return Ok(None);
     }
-    let Some(text) = store.read_record("drafts", &format!("{token}.json")).await else {
+    let Some(draft) = store
+        .typed_record::<Draft>(&format!("drafts/{token}.json"))
+        .await?
+    else {
         return Ok(None);
     };
-    let draft: Draft = serde_json::from_str(&text).map_err(|source| Error::Parse {
-        path: format!("drafts/{token}.json").into(),
-        source,
-    })?;
     if draft.token != token {
         return Ok(None);
     }
@@ -90,10 +89,18 @@ pub async fn load(store: &Store, token: &str) -> Result<Option<Draft>, Error> {
 /// too, as root: a root-owned 0600 draft would read as missing to the
 /// unprivileged handler that is walking it.
 ///
-/// A caller that reads and then writes must hold `Store::lock("drafts/.lock")`
-/// across both: the handler advances a draft while the drain files a mailed key
-/// into it, and one of the two saves would otherwise overwrite the other.
+/// A caller that reads and then writes takes the draft lock across both through
+/// [`Store::update_draft`]: the handler advances a draft while the drain files a
+/// mailed key into it, and one of the two saves would otherwise overwrite the
+/// other.
 pub async fn save(store: &Store, draft: &mut Draft) -> Result<(), Error> {
+    let _lock = store.lock("drafts/.lock").await?;
+    save_locked(store, draft).await
+}
+
+/// The write half of [`save`], for a caller that already holds the draft lock:
+/// [`Store::update_draft`] and [`Store::purge_drafts`].
+pub(crate) async fn save_locked(store: &Store, draft: &mut Draft) -> Result<(), Error> {
     draft.updated_at = util::filed_at();
     store.ensure_dir("drafts").await?;
     let bytes = serde_json::to_vec_pretty(draft).map_err(|source| Error::Encode {
@@ -106,8 +113,15 @@ pub async fn save(store: &Store, draft: &mut Draft) -> Result<(), Error> {
         .await
 }
 
-/// Remove a draft once it has become an application.
+/// Remove a draft once it has become an application, under the draft lock so
+/// the sweep and a save cannot unlink each other's work.
 pub async fn remove(store: &Store, token: &str) -> Result<(), Error> {
+    let _lock = store.lock("drafts/.lock").await?;
+    remove_locked(store, token).await
+}
+
+/// The unlink half of [`remove`], for a caller that holds the draft lock.
+pub(crate) async fn remove_locked(store: &Store, token: &str) -> Result<(), Error> {
     store.remove("drafts", &format!("{token}.json")).await
 }
 

@@ -43,6 +43,11 @@ one named API, `Store::rewrite_log` or `Store::rewrite_log_mode`. Appends take
 the same lock, and the code says why: a rewrite without it can drop a line
 another process appended between the read and the rename.
 
+A crash fragment is the one recovery exception. The next append may complete a
+full JSON line whose newline was lost, or quarantine the fragment to
+`<path>.bad`, before it writes. It recovers an unreported write rather than
+completing a recorded one.
+
 ## Errors and outcomes
 
 An outcome a caller branches on is an enum whose variants are the outcomes:

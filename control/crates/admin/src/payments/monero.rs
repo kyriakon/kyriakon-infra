@@ -23,42 +23,47 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> 
     if let Some(why) = monero_address_shape(address) {
         return Err(Error::Failed(format!("the address {address:?} {why}")));
     }
-    let mut account = store
-        .account(username)
-        .await?
-        .ok_or_else(|| Error::Failed(format!("no account for {username}")))?;
-    let Some(mut payment) = account.payment_state() else {
-        return Err(Error::Failed(format!(
-            "{username} was approved without charge, so it has no Monero rail"
-        )));
+    // The read and the write are one step under the account's own lock: the
+    // drain writes the same record from another process, and an interleaved
+    // write would drop one of the two changes.
+    let payment = store
+        .update_account(username, |current| {
+            let Some(account) = current.as_mut() else {
+                return Err(Error::Failed(format!("no account for {username}")));
+            };
+            let Some(mut payment) = account.payment_state() else {
+                return Err(Error::Failed(format!(
+                    "{username} was approved without charge, so it has no Monero rail"
+                )));
+            };
+            if account.rail != "monero" {
+                return Err(Error::Failed(format!(
+                    "{username} chose the {} rail, so it has no Monero subaddress to record",
+                    account.rail
+                )));
+            }
+            let block = payment.monero.get_or_insert_with(Default::default);
+            match block.address.as_deref() {
+                Some(existing) if existing == address => return Ok(None),
+                Some(existing) => {
+                    return Err(Error::Failed(format!(
+                        "{username}'s Monero subaddress is already {existing}; a subaddress is never rotated or reused"
+                    )))
+                }
+                None => block.address = Some(address.to_string()),
+            }
+            account.payment = Some(payment.clone());
+            Ok(Some(payment))
+        })
+        .await?;
+    let Some(payment) = payment else {
+        println!(
+            "{username}'s Monero subaddress is already {}",
+            safe(address)
+        );
+        return Ok(());
     };
-    if account.rail != "monero" {
-        return Err(Error::Failed(format!(
-            "{username} chose the {} rail, so it has no Monero subaddress to record",
-            account.rail
-        )));
-    }
-    let block = payment.monero.get_or_insert_with(Default::default);
-    match block.address.as_deref() {
-        Some(existing) if existing == address => {
-            println!("{username}'s Monero subaddress is already {}", safe(address));
-            return Ok(());
-        }
-        Some(existing) => {
-            return Err(Error::Failed(format!(
-                "{username}'s Monero subaddress is already {existing}; a subaddress is never rotated or reused"
-            )))
-        }
-        None => block.address = Some(address.to_string()),
-    }
-    account.payment = Some(payment.clone());
-    let bytes = serde_json::to_vec_pretty(&account)
-        .map_err(|e| Error::context("cannot encode the account", e))?;
-    // The same writer the drain uses: the handler reads this record as
-    // `_onboard`, so a 0600 root file would leave the page without a payment
-    // block.
-    transitions::groups::write_account_record(store, username, &bytes).await?;
-    transitions::payments::write_payment_copy(store, username, &payment).await?;
+    store.write_payment_copy(username, &payment).await?;
     println!(
         "recorded Monero subaddress for {username}: {}",
         safe(address)
