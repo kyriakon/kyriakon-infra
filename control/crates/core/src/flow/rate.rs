@@ -5,10 +5,12 @@
 //! The counters are process state, so a restart clears them. That is the
 //! accepted ceiling: a restart is rare and the gate does not depend on them.
 //!
-//! Both maps are bounded. When a map is at `MAX_KEYS` a batch of its oldest
-//! entries is evicted, so an attacker cannot grow memory without bound and the
-//! scan that finds the batch happens once per batch of new addresses rather than
-//! on every request.
+//! Both maps are bounded. The request map drops a batch of its oldest entries at
+//! `MAX_KEYS`, so an attacker cannot grow memory without bound and the scan that
+//! finds the batch happens once per batch of new addresses rather than on every
+//! request. The draft map holds a day and refuses a source it has not seen rather
+//! than evict a live entry: eviction would hand a source that rotates addresses a
+//! fresh daily cap.
 //!
 //! A std mutex, not parking_lot: the release's dependency list is frozen and a
 //! counter held for a few instructions does not earn a new crate. The lock is
@@ -30,6 +32,10 @@ const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The most keys either map holds before a batch is evicted.
 const MAX_KEYS: usize = 4096;
+/// The bits of an IPv6 address a bucket keeps: one site delegation. A /56 or /48
+/// holder can rotate the /64s inside it, so a /64 bucket would mint a fresh cap
+/// per address it owns.
+const V6_PREFIX_MASK: u64 = 0xffff_ffff_ffff_0000;
 /// How many of the oldest to drop when the cap is reached. Draining a batch
 /// leaves the next `EVICT_BATCH` new addresses free of eviction work, which is
 /// what makes the cost amortised rather than a scan per request.
@@ -40,8 +46,9 @@ const EVICT_BATCH: usize = MAX_KEYS / 8;
 pub enum Key {
     /// An IPv4 address, whole.
     V4(Ipv4Addr),
-    /// An IPv6 address's /64 prefix, as its top 64 bits. One delegated prefix
-    /// otherwise mints unlimited buckets.
+    /// An IPv6 address's /48 prefix, as the top 64 bits with the bits below the
+    /// prefix zeroed. A smaller prefix lets a delegated /56 or /48 mint a bucket
+    /// per /64 inside it.
     V6(u64),
     /// An `X-Forwarded-For` that is present but does not parse. It gets its own
     /// single key rather than collapsing onto the peer, which would let a caller
@@ -80,25 +87,30 @@ pub fn key(forwarded: Option<&str>, peer: Option<&str>) -> Key {
 }
 
 fn bucket(ip: IpAddr) -> Key {
-    match ip {
+    // `to_canonical` turns `::ffff:a.b.c.d` into the IPv4 address, so a
+    // dual-stack front-end that reports the mapped form counts against the same
+    // bucket as the plain one instead of collapsing every client onto `::`.
+    match ip.to_canonical() {
         IpAddr::V4(v4) => Key::V4(v4),
         IpAddr::V6(v6) => {
             let o = v6.octets();
-            Key::V6(u64::from_be_bytes([
-                o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7],
-            ]))
+            Key::V6(
+                u64::from_be_bytes([o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]])
+                    & V6_PREFIX_MASK,
+            )
         }
     }
 }
 
 /// The key as one field: what the login checker's failed-attempt record keys on,
-/// so a source is the same address in both counters. A `Key::V6` is the /64 as a
-/// prefix, because a delegated prefix otherwise mints unlimited sources.
+/// so a source is the same address in both counters. A `Key::V6` is the /48 as a
+/// prefix, because a delegated prefix of that size or smaller otherwise rotates
+/// /64s to mint unlimited sources and unlimited guesses.
 impl fmt::Display for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Key::V4(addr) => write!(f, "{addr}"),
-            Key::V6(prefix) => write!(f, "{}/64", Ipv6Addr::from(u128::from(*prefix) << 64)),
+            Key::V6(prefix) => write!(f, "{}/48", Ipv6Addr::from(u128::from(*prefix) << 64)),
             Key::UnknownForward => f.write_str("-"),
         }
     }
@@ -130,12 +142,24 @@ impl Counter {
     /// Count one request. `false` once the key has made sixty in the last
     /// minute, so the sixty-first is the one refused.
     pub fn allow_request(&self, key: Key) -> bool {
-        allow(&mut self.lock().requests, key, MINUTE, REQUESTS_PER_MINUTE)
+        allow(
+            &mut self.lock().requests,
+            key,
+            MINUTE,
+            REQUESTS_PER_MINUTE,
+            Full::EvictOldest,
+        )
     }
 
     /// Count one draft. `false` once the key has started five in the last day.
     pub fn allow_draft(&self, key: Key) -> bool {
-        allow(&mut self.lock().drafts, key, DAY, DRAFTS_PER_DAY)
+        allow(
+            &mut self.lock().drafts,
+            key,
+            DAY,
+            DRAFTS_PER_DAY,
+            Full::Refuse,
+        )
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -143,10 +167,32 @@ impl Counter {
     }
 }
 
-fn allow(map: &mut HashMap<Key, Vec<Instant>>, key: Key, window: Duration, limit: usize) -> bool {
+/// What a full map does with a source it has not seen. The request map drops its
+/// oldest batch, because a minute's windows are spent by the time a flood fills
+/// 4096 buckets. The draft map holds a day, so dropping a live entry would give a
+/// rotating source the fresh cap eviction is meant to deny it.
+#[derive(Clone, Copy)]
+enum Full {
+    EvictOldest,
+    Refuse,
+}
+
+fn allow(
+    map: &mut HashMap<Key, Vec<Instant>>,
+    key: Key,
+    window: Duration,
+    limit: usize,
+    full: Full,
+) -> bool {
     let now = Instant::now();
     if map.len() >= MAX_KEYS && !map.contains_key(&key) {
         evict(map, now, window);
+        if map.len() >= MAX_KEYS {
+            match full {
+                Full::EvictOldest => drop_oldest(map, now),
+                Full::Refuse => return false,
+            }
+        }
     }
     let times = map.entry(key).or_default();
     times.retain(|t| now.duration_since(*t) < window);
@@ -157,17 +203,19 @@ fn allow(map: &mut HashMap<Key, Vec<Instant>>, key: Key, window: Duration, limit
     true
 }
 
-/// Empty the windows that have run out, and if the map is still at the cap drop
-/// the oldest batch. This is the only scan in the module, so it runs once per
-/// batch of new keys rather than on every request.
+/// Empty the windows that have run out. This is the only scan in the module, so
+/// it runs once per batch of new keys rather than on every request.
 fn evict(map: &mut HashMap<Key, Vec<Instant>>, now: Instant, window: Duration) {
     map.retain(|_, times| {
         times.retain(|t| now.duration_since(*t) < window);
         !times.is_empty()
     });
-    if map.len() < MAX_KEYS {
-        return;
-    }
+}
+
+/// Drop the oldest batch when `evict` left the map at its cap. The oldest entry
+/// is the one seen least recently, so a flood loses the buckets it filled first
+/// rather than the ones still counting.
+fn drop_oldest(map: &mut HashMap<Key, Vec<Instant>>, now: Instant) {
     let mut ages: Vec<(Instant, Key)> = map
         .iter()
         .map(|(k, times)| (times.last().copied().unwrap_or(now), *k))
@@ -218,12 +266,84 @@ mod tests {
     }
 
     #[test]
-    fn an_ipv6_prefix_is_one_bucket_and_two_prefixes_are_two() {
+    fn an_ipv6_delegation_is_one_bucket_and_two_delegations_are_two() {
+        // The /64s inside one /48 are what a /56 or /48 holder rotates, so they
+        // must count as one bucket.
         let a: Ipv6Addr = "2001:db8:1:2::1".parse().unwrap();
-        let b: Ipv6Addr = "2001:db8:1:2::ffff".parse().unwrap();
-        let c: Ipv6Addr = "2001:db8:1:3::1".parse().unwrap();
+        let b: Ipv6Addr = "2001:db8:1:99::ffff".parse().unwrap();
+        let c: Ipv6Addr = "2001:db8:2::1".parse().unwrap();
         assert_eq!(bucket(IpAddr::V6(a)), bucket(IpAddr::V6(b)));
         assert_ne!(bucket(IpAddr::V6(a)), bucket(IpAddr::V6(c)));
+    }
+
+    #[test]
+    fn a_mapped_ipv4_address_buckets_with_its_ipv4_client() {
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        let plain: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(bucket(mapped), bucket(plain));
+        assert_eq!(bucket(mapped), Key::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert_ne!(
+            bucket(mapped),
+            bucket("::ffff:198.51.100.1".parse().unwrap())
+        );
+        // The login checker keys its failed attempts on `Display`, so the mapped
+        // and plain forms must print the same source too.
+        assert_eq!(bucket(mapped).to_string(), plain.to_string());
+    }
+
+    #[test]
+    fn a_56_rotation_does_not_reset_the_draft_cap() {
+        let c = Counter::new();
+        let fourth = |n: u16| format!("2001:db8:aa:{:x}::1", 0xbb00 | n);
+        // Every /64 in the one /56 is a different address for the front-end and
+        // the same source for the cap.
+        for i in 0..DRAFTS_PER_DAY {
+            let addr = fourth(0);
+            assert!(c.allow_draft(key(None, Some(addr.as_str()))), "draft {i}");
+        }
+        for n in 1..=255u16 {
+            let addr = fourth(n);
+            assert!(
+                !c.allow_draft(key(None, Some(addr.as_str()))),
+                "{addr} inside the /56 reset the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn a_draft_flood_cannot_evict_a_live_cap() {
+        let c = Counter::new();
+        let offender = key(None, Some("198.51.100.7"));
+        for _ in 0..DRAFTS_PER_DAY {
+            assert!(c.allow_draft(offender));
+        }
+        for i in 0..MAX_KEYS + EVICT_BATCH {
+            let a = (i >> 8) as u8;
+            let b = (i & 0xff) as u8;
+            c.allow_draft(key(None, Some(&format!("10.2.{a}.{b}"))));
+        }
+        assert!(c.lock().drafts.len() <= MAX_KEYS);
+        assert!(
+            !c.allow_draft(offender),
+            "the flood evicted the bucket that was already capped"
+        );
+    }
+
+    #[test]
+    fn a_request_flood_evicts_the_oldest_and_stays_bounded() {
+        let c = Counter::new();
+        let first = key(None, Some("10.0.0.1"));
+        assert!(c.allow_request(first));
+        for i in 0..MAX_KEYS + EVICT_BATCH {
+            let a = (i >> 8) as u8;
+            let b = (i & 0xff) as u8;
+            assert!(c.allow_request(key(None, Some(&format!("10.1.{a}.{b}")))));
+        }
+        assert!(c.lock().requests.len() <= MAX_KEYS);
+        assert!(
+            !c.lock().requests.contains_key(&first),
+            "the oldest bucket survived the eviction batch"
+        );
     }
 
     #[test]
@@ -256,16 +376,5 @@ mod tests {
         // read as whatever the environment put there.
         assert_eq!(key(None, Some("UNKNOWN")), Key::UnknownForward);
         assert_eq!(key(None, None), Key::UnknownForward);
-    }
-
-    #[test]
-    fn the_map_is_bounded() {
-        let c = Counter::new();
-        for i in 0..MAX_KEYS + EVICT_BATCH {
-            let n = (i & 0xff) as u8;
-            let last = (i >> 8) as u8;
-            c.allow_request(Key::V4(Ipv4Addr::new(10, last, 0, n)));
-        }
-        assert!(c.lock().requests.len() <= MAX_KEYS);
     }
 }
