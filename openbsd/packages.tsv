@@ -6,9 +6,10 @@
 # or the whole table on the box.
 #
 # `box` is the checkout itself: git updates it, and no deploy owns that. The CI
-# column is not "the box has it", it is "the CI VM installs it", so dovecot stays
-# out because the self-tests do not start the mail daemons, and the DKIM filter
-# stays out until a CI step checks the config that needs it. gmid is in because
+# column is not "the box has it", it is "the CI VM installs it": dovecot is in
+# because the self-tests job compiles the save-path plugin against its headers,
+# though the job still starts no mail daemons; the DKIM filter stays out until a
+# CI step checks the config that needs it. gmid is in because
 # scripts/verify-hosting.sh starts it against a fixture chroot, alongside httpd
 # from base, and rust is in because that check builds the member content
 # responder it hands requests to.
@@ -18,7 +19,7 @@
 # gmid provides the Gemini server and the _gmid account the capsule sockets use.
 
 curl	deploy-mail.sh,deploy-control.sh	yes
-dovecot	deploy-mail.sh	no
+dovecot	deploy-mail.sh	yes
 git	box	yes
 gmid	deploy-mail.sh,deploy-control.sh	yes
 gnupg	deploy-mail.sh	yes
