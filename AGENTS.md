@@ -1,6 +1,6 @@
 # AGENTS.md
 
-kyriakon-infra is the public infrastructure repo for kyriakon.net — a low-extraction,
+kyriakon-infra is the public infrastructure repo for kyriakon.net, a low-extraction,
 no-shell hosting platform (mail, static/gemini sites, `pass`-compatible git repos) for
 the Orthodox Christian community, running on OpenBSD via Hetzner + Terraform.
 
@@ -11,7 +11,7 @@ project proposal and cross-cutting shared vocabulary live in the meta repo, not 
 read `../kyriakon/docs/decisions/kyriakon-net-project-proposal.md` and
 `../kyriakon/docs/CONTEXT.md` first for anything beyond a small, well-scoped change.
 If `../kyriakon` isn't present alongside this repo, say so rather than proceeding
-without that context — don't guess at proposal content from memory.
+without that context. Don't guess at proposal content from memory.
 
 Any research/spec working docs specific to this repo live under `docs/planning/`. Read
 `docs/planning/README.md` for infra-repo-local planning context.
@@ -25,14 +25,14 @@ written down. This repo has no decisions directory of its own.
 Pointers, so a search starts where the thing is.
 
 - `control/`: the control plane, a Cargo workspace under `crates/`. `crates/core/`
-  holds the store, configuration, intent contract, IPC request, the shared flow and
-  the FastCGI wire; `crates/handler/` serves the web form and renders the HTML and
-  gemtext pages; `crates/tui/` is the terminal library and binary; `crates/drain/` is
-  the root-side intent loop and transition verbs; `crates/admin/` is the operator
-  console; `crates/tests/` is the acceptance suite; `crates/static/` serves a member's
-  published tree, opening each path component without following a link, because the
-  daemons' chroot holds every member's tree at once. `templates/*.html` live under
-  `crates/handler/`. The five binaries are `kyriakon-control`,
+  holds the store, configuration, intent contract, IPC request, the shared flow, the
+  socket server and the FastCGI wire; `crates/handler/` serves the web form and renders
+  the HTML and gemtext pages; `crates/tui/` is the terminal library and binary;
+  `crates/drain/` is the root-side intent loop and transition verbs; `crates/admin/` is
+  the operator console; `crates/tests/` is the acceptance suite; `crates/static/` serves
+  a member's published tree, opening each path component without following a link,
+  because the daemons' chroot holds every member's tree at once. `templates/*.html` live
+  under `crates/handler/`. The five binaries are `kyriakon-control`,
   `kyriakon-control-static`, `kyriakon-control-drain`, `kyriakon-control-tui` and
   `kyriakon-admin`. The deployed state paths keep their old names (`/var/db/onboard`,
   `/etc/onboard`, `/etc/kyriakon/onboard`), the service account is still `_onboard`,
@@ -40,6 +40,10 @@ Pointers, so a search starts where the thing is.
   holds only its crate root, binary roots, and (in core) `config.rs`, `util.rs` and
   `intent.rs`; a new module goes in its section directory, or a new directory with a
   `mod.rs` that names its job.
+- `mailparse/`: the zero-dependency RFC 5322 and MIME parser, package
+  `kyriakon-mailparse`. It sits outside the `control` workspace so each build root keeps
+  its own lockfile and the encryptor keeps no third-party dependency. The encryptor uses
+  it today; the control crates adopt it as #945, #947, #908 and #919 land.
 - `kyriakon-encrypt/`: the CLI the save path runs to encrypt each message; `src/lib.rs`
   builds the PGP/MIME wrapper.
 - `dovecot-plugin/`: the C plugin that forks the encryptor for each save and turns its
@@ -47,10 +51,11 @@ Pointers, so a search starts where the thing is.
 - `keys/`: the published public keys, one `<localpart>.asc` per member: the audit
   surface. `scripts/publish-mail-key.sh` writes one, `scripts/rekey-mail-key.sh`
   rewrites one without the AEAD advert.
-- `scripts/`: every deploy and operator script, each with a `--self-test`; `lib.sh`
-  holds the shared helpers (staged installs, the mail-table lock, the self-test
-  harness); `install-set.tsv` is the one table naming what each destination gets; and
-  `install-packages.sh` installs from `openbsd/packages.tsv`.
+- `scripts/`: every deploy and operator script, each with a `--self-test`. `lib.sh`
+  sources the three modules under `scripts/lib/`: atomic writes and directory locks,
+  TLS and ACME paths, and the identity predicates. `install-set.tsv` is the one table
+  naming what each destination gets, and `install-packages.sh` installs from
+  `openbsd/packages.tsv`.
 - `openbsd/`: what the box runs: `etc/` (smtpd, httpd, relayd, gmid, unbound, nsd,
   spamd, sshd, `login.conf.d/`, `rc.d/`, `kyriakon.env`, and the control plane's four
   configs (`catalogue.toml`, `drain.toml`, `onboard.toml`, `static.toml`) under
@@ -62,10 +67,10 @@ Pointers, so a search starts where the thing is.
   the automation depends on), `operations/`, `threat-model.md`, `terms.md`,
   `privacy.md`, `aup.md`, `transparency.md`, `refusals.md`, `planning/` (specs,
   research, prototypes), `agents/` (issue tracker, triage labels, domain docs).
-- `.github/workflows/`: `checks.yml` (the five CI jobs, including the OpenBSD 7.9
-  self-test VM), `fuzz.yml` (the five libFuzzer targets, weekly), and
-  `auto-merge-key.yml` (a green key publication merges itself, as the machine
-  account).
+- `.github/workflows/`: `checks.yml` (the seven CI jobs: control, encrypt plugin,
+  shared mail parser, shell scripts, script self-tests on the OpenBSD 8.0 VM, terraform,
+  and the dependency advisories), `fuzz.yml` (the six libFuzzer targets, weekly), and
+  `auto-merge-key.yml` (a green key publication merges itself, as the machine account).
 - `.githooks/`: commit shape, pre-commit, pre-push.
 - Root: `reserved-usernames.txt` (the held-back names), `CONTEXT.md` (repo vocabulary),
   `CODING_STANDARDS.md` (what a review enforces), `README.md`.
@@ -76,39 +81,43 @@ Cross-cutting glossary: `../kyriakon/docs/CONTEXT.md` (shell-less user, pricing 
 dogfooding, audit us). Repo-local terms specific to infra work: `CONTEXT.md` at this
 repo's own root. Two terms most likely to matter while working in this repo:
 
-- **Shell-less user**: the standard account tier. No interactive shell — mail via
+- **Shell-less user**: the standard account tier. No interactive shell: mail via
   IMAP/SMTP, static/gemini hosting via `sftp` upload, `pass` repos via `git-shell`.
   This is the whole platform's core safety property; don't propose or scaffold
   anything that grants a standard-tier user an interactive shell.
 - **Propose-only change**: any change that touches `pf.conf`, `sshd_config`, or would
   run `terraform apply`/`terraform destroy` against the live box. These are drafted as
-  a PR diff with the actual live-affecting command left as a documented manual step —
+  a PR diff with the actual live-affecting command left as a documented manual step,
   never run by an agent, even inside an otherwise-trusted session.
 
 ## Build & test
 
-- Terraform: `terraform fmt -check -recursive` / `terraform validate` — run from
+- Terraform: `terraform fmt -check -recursive` / `terraform validate`, run from
   `terraform/`. **`terraform plan` is fine to run; `terraform apply` and
   `terraform destroy` are never run by an agent** (see "Never" below).
 - Rust: `cargo test --manifest-path control/Cargo.toml` and
   `cargo clippy --manifest-path control/Cargo.toml --all-targets -- -D warnings`; the
-  same for `kyriakon-encrypt/`. There is no workspace root, so a command without
-  `--manifest-path`, run from the repository root, does not find `Cargo.toml` at all.
-  `cargo fmt --check` runs in CI.
+  same for `kyriakon-encrypt/` and `mailparse/`. There is no top-level Cargo workspace,
+  so a command without `--manifest-path`, run from the repository root, does not find a
+  `Cargo.toml` at all. `cargo fmt --check` runs in CI.
 - Fast loop while iterating: `cargo test --manifest-path control/Cargo.toml --lib`, and
   `--test drain -- <area>` for one area; the area map is `control/crates/tests/tests/README.md`.
   Run the full crate suite once before pushing, or let CI run it.
-- Fuzz targets: `kyriakon-encrypt/fuzz/` and `control/fuzz/` hold one per parser: the
-  encryptor's message and envelope, the FastCGI reader and form decoder, and the
-  member path resolver, which asserts that a served file is always one inside the
-  member's own root. Run one with `cargo +nightly fuzz run <target>` from either
-  directory. Fuzzing is not in the merge gate; a crash found by the weekly `fuzz` job
-  becomes a test in the crate it came from. See `docs/runbook.md` "Fuzz the parsers".
+- Dependency audit: the `deps` job in `.github/workflows/checks.yml` runs `cargo audit`
+  over every committed lockfile and `cargo deny` over the three shipping trees. A new
+  lockfile needs adding there in the same change.
+- Fuzz targets: `kyriakon-encrypt/fuzz/`, `control/fuzz/` and `mailparse/fuzz/` hold one
+  per parser: the encryptor's message and envelope, the shared mail parser's headers,
+  addresses and MIME walk, the FastCGI reader and form decoder, and the member path
+  resolver, which asserts that a served file is always one inside the member's own root.
+  Run one with `cargo +nightly fuzz run <target>` from the matching directory. Fuzzing is
+  not in the merge gate; a crash found by the weekly `fuzz` job becomes a test in the
+  crate it came from. See `docs/runbook.md` "Fuzz the parsers".
 - Shell scripts (`scripts/`): `shellcheck scripts/*.sh`, and
   `ksh scripts/self-test-all.sh` runs every script's `--self-test` with the arguments
   each one needs. On the box, `ksh scripts/check-hygiene.sh` reports its live state.
 - **OpenBSD has a test VM in CI.** The `script self-tests` job in
-  `.github/workflows/checks.yml` boots OpenBSD 7.9 through `vmactions/openbsd-vm`,
+  `.github/workflows/checks.yml` boots OpenBSD 8.0 through `vmactions/openbsd-vm`,
   installs the `ci=yes` rows of `openbsd/packages.tsv`, then runs
   `install-packages.sh --check` and `scripts/self-test-all.sh`. It is the
   authoritative shell and userland; local macOS `/bin/ksh` is ksh93 and proves
@@ -118,7 +127,7 @@ repo's own root. Two terms most likely to matter while working in this repo:
   another tool adds a row to `openbsd/packages.tsv`. The VM is not the live box: it
   holds no deployed config or credentials, and `terraform apply`/`destroy` remain
   human-only. See `docs/runbook.md` "Test on the OpenBSD VM".
-- No build step for `docs/` — markdown only.
+- No build step for `docs/`: markdown only.
 
 ## Code style
 
@@ -129,14 +138,14 @@ repo's own root. Two terms most likely to matter while working in this repo:
 - Shell scripts: `set -euo pipefail` at the top of every script; `shellcheck`-clean is
   the bar, not a suggestion.
 - Config files (`openbsd/etc/*`, Dovecot, `gmid.conf`): every non-obvious setting gets
-  a comment explaining *why*, not just what — this repo is public specifically so
+  a comment explaining *why*, not just what, because this repo is public specifically so
   people can audit it, and an unexplained setting defeats that purpose.
-- **No secrets, ever, in any tracked file** — not real, not as a "realistic example."
+- **No secrets, ever, in any tracked file**: not real, not as a "realistic example."
   Use obviously-fake placeholders (`REPLACE_ME`, `example.invalid`) if a sample value
   is needed for illustration.
 - Push anything host-specific (real hostnames, real IPs, real domain-validation
   tokens) behind a Terraform variable rather than hardcoding it, even though this
-  repo currently serves one box — it costs nothing now and avoids a leak later.
+  repo currently serves one box. It costs nothing now and avoids a leak later.
 
 ## Tickets
 
@@ -157,7 +166,7 @@ gh issue create --title "..." --body-file <path> --label <label>   # only when a
 ```
 
 Issues generated from a spec include a `Spec:` line pointing to the corresponding file
-in `docs/planning/specs/`. Read that file before starting non-trivial ticket work — the
+in `docs/planning/specs/`. Read that file before starting non-trivial ticket work; the
 issue body alone is a summary, not the full context.
 
 ## Git
@@ -181,13 +190,13 @@ issue body alone is a summary, not the full context.
 
 - **Never run `terraform apply` or `terraform destroy` against the live workspace.**
   These are human-run steps, executed only as the final approved step of an
-  already-reviewed PR — see "Propose-only change" above.
-- **Never write real secrets, key material, or user data into any tracked file** —
+  already-reviewed PR, see "Propose-only change" above.
+- **Never write real secrets, key material, or user data into any tracked file**:
   DKIM private keys, TLS keys, API tokens, real user mailboxes/paths. This applies
   even to files meant to stay gitignored; don't write real values there either.
 - **Never modify `pf.conf` or `sshd_config` directly.** Propose a diff in a PR; the
   human reviews it line-by-line and deploys it manually. These files are also
-  blocked at the tool level via the `guardrails` extension — if a block fires here,
+  blocked at the tool level via the `guardrails` extension. If a block fires here,
   that's working as intended, not a bug to route around.
 - **Never `scp`, `rsync`, or otherwise push a config file to the live box.** All
   deployment to the live host is a manual, human-run step.
