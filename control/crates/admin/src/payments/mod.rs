@@ -55,7 +55,7 @@ pub(crate) async fn payment_block(
         .token_ref
         .clone()
         .ok_or_else(|| Error::Failed(format!("the group {domain} has no payment token")))?;
-    Ok((token, group_payment(&group.payment)))
+    Ok((token, group.payment.as_payment()))
 }
 
 /// The token a `credit` or `refund` acts on: `--token` itself, or the block a
@@ -78,24 +78,6 @@ pub(crate) async fn payment_token(
             "give either --token or --username, not both".to_string(),
         )),
         (None, None) => Err(Error::Failed("give --token or --username".to_string())),
-    }
-}
-
-/// A group's payment block read as an account's, so both print through one
-/// printer. Every field is named: a group has no token-issue date, no held
-/// balance and no Monero quote, and a field added to `Payment` fails here until
-/// someone decides what a group's value is.
-pub(crate) fn group_payment(payment: &store::GroupPayment) -> store::Payment {
-    store::Payment {
-        token_ref: payment.token_ref.clone(),
-        token_issued_at: None,
-        application_ref: None,
-        paid_until: payment.paid_until.clone(),
-        window: payment.window.clone(),
-        rail: Some(payment.rail.clone()),
-        balance_gbp: None,
-        stripe: payment.stripe.clone(),
-        monero: None,
     }
 }
 

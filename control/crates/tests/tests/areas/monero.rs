@@ -18,7 +18,7 @@ fn view(fix: &Fix, username: &str) -> page::PaymentView {
     let account = stored_account(fix, username);
     let block = account.payment_state().expect("a paid approval's block");
     page::payment(
-        &account.state,
+        account.state.word(),
         &account.rail,
         &block,
         "20.00",
@@ -410,4 +410,48 @@ fn a_part_payment_requotes_the_xmr_for_what_is_still_owed() {
         instructions.contains(&format!("Send {remaining} XMR for GBP 5.00")),
         "{instructions}"
     );
+}
+
+/// A group mailbox carries no payment block of its own, so the subaddress is
+/// recorded on the group's one block. Before #905 the console refused the only
+/// mailbox that could name the payer (#905).
+#[test]
+fn a_group_mailbox_records_its_subaddress_on_the_groups_payment() {
+    let fix = Fix::new("monero-group-address");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        None,
+    );
+    assert!(fix.drain().status.success());
+    let path = fix.dir.join("store/groups/parish.example/group.json");
+    let mut group: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    group["payment"]["rail"] = json!("monero");
+    std::fs::write(&path, serde_json::to_vec_pretty(&group).unwrap()).unwrap();
+
+    let address = subaddress(7);
+    let out = fix.ctl(&["monero", "address", "parish-secretary", &address]);
+    assert!(out.status.success(), "{}", body(&out));
+
+    let group: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        group["payment"]["monero"]["address"],
+        json!(address),
+        "{group}"
+    );
+    let account = fix.account("parish-secretary");
+    assert!(
+        account.get("payment").is_none(),
+        "the mailbox gained a payment block of its own: {account}"
+    );
+
+    // The same address is a replay; a different one is refused rather than
+    // rotated, because the first may already have been sent money.
+    let out = fix.ctl(&["monero", "address", "parish-secretary", &address]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.ctl(&["monero", "address", "parish-secretary", &subaddress(9)]);
+    assert!(!out.status.success(), "{}", body(&out));
+    assert!(body(&out).contains("never rotated"), "{}", body(&out));
 }

@@ -702,6 +702,8 @@ fn a_settlement_rewrites_only_settled_on_and_a_second_finds_none() {
         "secretary",
         "--settled",
         "2026-11-05",
+        "--seq",
+        &before["seq"].as_u64().unwrap().to_string(),
     ]);
     assert!(out.status.success(), "{}", body(&out));
     let out = fix.drain();
@@ -714,7 +716,12 @@ fn a_settlement_rewrites_only_settled_on_and_a_second_finds_none() {
         "the settlement appended a line: {refunds:?}"
     );
     assert_eq!(ledger_lines(&fix).len(), lines_before, "a line was added");
-    assert_eq!(refunds[0]["settled_on"], json!("2026-11-05"));
+    assert_eq!(
+        refunds[0]["settled_on"],
+        json!("2026-11-05"),
+        "journal: {}",
+        fix.journal()
+    );
     for field in [
         "seq",
         "token",
@@ -745,6 +752,8 @@ fn a_settlement_rewrites_only_settled_on_and_a_second_finds_none() {
         "secretary",
         "--settled",
         "2026-11-06",
+        "--seq",
+        &before["seq"].as_u64().unwrap().to_string(),
     ]);
     assert!(out.status.success(), "{}", body(&out));
     let out = fix.drain();
@@ -755,7 +764,10 @@ fn a_settlement_rewrites_only_settled_on_and_a_second_finds_none() {
         "a refused settlement moved the date"
     );
     let journal = fix.journal();
-    assert!(journal.contains("no unsettled refund"), "{journal}");
+    assert!(
+        journal.contains("was already settled on 2026-11-05"),
+        "{journal}"
+    );
 }
 
 /// A paid card invoice opens a `kind:"payment"`, `rail:"card"` ledger line, so a
@@ -1196,4 +1208,186 @@ fn a_credit_and_a_full_refund_net_to_zero() {
         })
         .sum();
     assert_eq!(total, 0, "the ledger does not net to zero");
+}
+
+/// A closure a refund paid out cannot be cancelled: the money and the year both
+/// went back, so the member cannot restore them by cancelling the closure
+/// (#871). The record carries the refusal even when the intent is filed by hand.
+#[test]
+fn a_refunded_closure_cannot_be_cancelled() {
+    let fix = Fix::new("refund-close-cancel");
+    let token = approved_paid(&fix, "secretary", "cash");
+    cash_credit(&fix, &token);
+    let out = fix.ctl(&[
+        "refund",
+        "--username",
+        "secretary",
+        "--amount",
+        "20.00",
+        "--rail",
+        "cash",
+        "--reason",
+        "cancelled inside 14 days",
+        "--close",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("closing"), "{account}");
+    assert_eq!(account["closing_refunded"], json!(true), "{account}");
+
+    fix.file_page_action("cancel-close", "secretary", json!({}));
+    assert!(fix.drain().status.success());
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["state"],
+        json!("closing"),
+        "a refunded closure was cancelled: {account}"
+    );
+    assert!(
+        fix.journal()
+            .contains("paid out by a refund, so it cannot be cancelled"),
+        "{}",
+        fix.journal()
+    );
+}
+
+/// An excess refund writes the balance before the ledger line. A failed append
+/// keeps the intent for the retry, and the retry reads the journal's recorded
+/// balance instead of subtracting the amount a second time (#872).
+#[test]
+fn an_excess_refund_whose_append_fails_does_not_deduct_twice() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fix = Fix::new("refund-excess-retry");
+    let token = approved_paid(&fix, "secretary", "cash");
+    cash_overpayment(&fix, &token);
+    let ledger = fix.dir.join("store/ledger/payments.jsonl");
+    let mode = std::fs::metadata(&ledger).unwrap().permissions().mode();
+    std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let out = fix.ctl(&[
+        "refund", "--token", &token, "--amount", "4.00", "--rail", "cash", "--reason", "overpaid",
+        "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.failed_note().contains("payments"),
+        "the failed append was not reported: {}",
+        fix.failed_note()
+    );
+    assert_eq!(
+        fix.account("secretary")["payment"]["balance_gbp"],
+        json!("1.00"),
+        "the first pass did not write the reduced balance"
+    );
+    assert_eq!(refund_lines(&fix).len(), 0, "the append succeeded");
+    assert_eq!(fix.intents().len(), 1, "the failed intent did not stay");
+
+    std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(mode)).unwrap();
+    fix.age_failures();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert_eq!(
+        fix.account("secretary")["payment"]["balance_gbp"],
+        json!("1.00"),
+        "the retry deducted the refund a second time"
+    );
+    let refunds = refund_lines(&fix);
+    assert_eq!(refunds.len(), 1, "{refunds:?}");
+    assert_eq!(refunds[0]["amount_gbp"], json!("-4.00"), "{refunds:?}");
+}
+
+/// A partial Monero refund returns the same fraction of the recorded coin that
+/// it returns in sterling, and its basis says the figure was scaled (#873).
+#[test]
+fn a_partial_monero_refund_scales_the_recorded_xmr() {
+    let fix = Fix::new("refund-monero-partial");
+    let token = approved_paid(&fix, "secretary", "monero");
+    let out = fix.ctl(&[
+        "credit",
+        "--token",
+        &token,
+        "--rail",
+        "monero",
+        "--amount",
+        "20.50",
+        "--received",
+        "2026-10-04",
+        "--txid",
+        TXID,
+        "--xmr",
+        "0.050000",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    let out = fix.ctl(&[
+        "refund", "--token", &token, "--amount", "0.50", "--rail", "monero", "--reason",
+        "overpaid", "--excess",
+    ]);
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.drain().status.success());
+
+    let refunds = refund_lines(&fix);
+    assert_eq!(refunds.len(), 1, "{refunds:?}");
+    assert_eq!(refunds[0]["amount_gbp"], json!("-0.50"), "{refunds:?}");
+    // 0.050000 XMR of a 20.50 payment is 0.001219 XMR for 0.50, rounded down at
+    // the six decimals the wallet prints.
+    assert_eq!(refunds[0]["amount_xmr"], json!("0.001219"), "{refunds:?}");
+    assert_eq!(
+        refunds[0]["refund_basis"],
+        json!("recorded_xmr_partial"),
+        "{refunds:?}"
+    );
+}
+
+/// A settlement names the refund's ledger sequence. Settling the newer refund
+/// and running the same command again finds that line already settled instead
+/// of walking back onto an older one (#880).
+#[test]
+fn a_repeated_settlement_does_not_settle_an_older_refund() {
+    let fix = Fix::new("refund-settle-two");
+    let token = approved_paid(&fix, "secretary", "cash");
+    cash_overpayment(&fix, &token);
+    for amount in ["3.00", "2.00"] {
+        let out = fix.ctl(&[
+            "refund", "--token", &token, "--amount", amount, "--rail", "cash", "--reason",
+            "overpaid", "--excess",
+        ]);
+        assert!(out.status.success(), "{}", body(&out));
+        assert!(fix.drain().status.success());
+    }
+    let refunds = refund_lines(&fix);
+    assert_eq!(refunds.len(), 2, "{refunds:?}");
+    let newest = refunds[1]["seq"].as_u64().unwrap().to_string();
+
+    for date in ["2026-11-05", "2026-11-05"] {
+        let out = fix.ctl(&[
+            "refund",
+            "--token",
+            &token,
+            "--settled",
+            date,
+            "--seq",
+            &newest,
+        ]);
+        assert!(out.status.success(), "{}", body(&out));
+        assert!(fix.drain().status.success());
+    }
+
+    let refunds = refund_lines(&fix);
+    assert_eq!(refunds[1]["settled_on"], json!("2026-11-05"), "{refunds:?}");
+    assert!(
+        refunds[0]["settled_on"].is_null(),
+        "the repeated settlement stamped the older refund: {refunds:?}"
+    );
+    assert!(
+        fix.journal().contains("was already settled on 2026-11-05"),
+        "{}",
+        fix.journal()
+    );
 }

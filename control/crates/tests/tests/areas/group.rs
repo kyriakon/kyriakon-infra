@@ -2764,6 +2764,76 @@ fn a_second_address_on_an_existing_mailbox_still_counts() {
     );
 }
 
+/// Adding a second address to a mailbox that already exists changes the group's
+/// table and leaves the mailbox's record alone: a suspension, a closure, the
+/// pinned certificates and the upload keys all survive (#898).
+#[test]
+fn a_second_address_leaves_the_existing_mailboxs_state_alone() {
+    let fix = Fix::new("group-second-address-state");
+    fix.file_group(
+        "parish.example",
+        "parish-secretary",
+        &[("secretary", "parish-secretary")],
+        &["parish-secretary"],
+        Some(UPLOAD_KEY),
+    );
+    assert!(fix.drain().status.success());
+    fix.amend_account("parish-secretary", |account| {
+        account["certificates"] = json!([{
+            "hash": "SHA256:aa",
+            "subject": "a device",
+            "issuer": "a device",
+            "not_before": "2026-01-01",
+            "not_after": "2027-01-01"
+        }]);
+    });
+    let reason = "Published material is outside the acceptable use policy.";
+    let out = fix.ctl(&["suspend", "parish-secretary", "--reason", reason]);
+    assert!(out.status.success(), "{}", body(&out));
+    let before = fix.account("parish-secretary");
+    assert_eq!(before["state"], json!("suspended"), "{before}");
+
+    fix.file_address(
+        "parish.example",
+        "add-mailbox",
+        "office",
+        "parish-secretary",
+        Some(GOOD_KEY),
+        None,
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.table("virtuals")
+            .contains("office@parish.example: parish-secretary"),
+        "{}",
+        fix.table("virtuals")
+    );
+
+    let after = fix.account("parish-secretary");
+    assert_eq!(
+        after["state"],
+        json!("suspended"),
+        "the second address rewrote the mailbox's state: {after}"
+    );
+    assert_eq!(
+        after["certificates"], before["certificates"],
+        "the second address dropped the certificate pins: {after}"
+    );
+    assert_eq!(
+        after["upload_keys"], before["upload_keys"],
+        "the second address dropped the upload keys: {after}"
+    );
+    assert_eq!(
+        after["grace_until"], before["grace_until"],
+        "the second address moved the deletion clock: {after}"
+    );
+    assert_eq!(
+        after["password_link"], before["password_link"],
+        "the second address replaced the password link: {after}"
+    );
+}
+
 /// The group's payment state: one rail, one token, one window and one date on
 /// the group, and nothing of the sort on a mailbox in it.
 #[test]

@@ -878,6 +878,7 @@ mod tests {
             note: Some(note.to_string()),
             review: None,
             credit: None,
+            refund: None,
         })
         .unwrap()
     }

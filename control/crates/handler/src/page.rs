@@ -160,7 +160,9 @@ impl GroupView {
             "free"
         } else if payment.paid_until.is_some() {
             "active"
-        } else if window.is_some_and(|w| w.state == "closed") {
+        } else if window
+            .is_some_and(|w| w.state == kyriakon_control_core::account::state::WindowState::Closed)
+        {
             "lapsed"
         } else {
             "payment due"
@@ -177,7 +179,9 @@ impl GroupView {
             state: state.to_string(),
             token: payment.token_ref.clone().filter(|_| unpaid),
             window_closes: window
-                .filter(|w| unpaid && w.state == "open")
+                .filter(|w| {
+                    unpaid && w.state == kyriakon_control_core::account::state::WindowState::Open
+                })
                 .map(|w| w.closes_at[..10.min(w.closes_at.len())].to_string()),
             accounts: group.accounts.clone(),
             space_used: group.space_used.map(space),
@@ -422,10 +426,9 @@ pub fn member_page(
             })
             .collect(),
         group,
-        suspended: account
-            .suspension_reason
-            .clone()
-            .filter(|_| account.state == "suspended"),
+        suspended: account.suspension_reason.clone().filter(|_| {
+            account.state == kyriakon_control_core::account::state::Standing::Suspended
+        }),
         closing_until: account.closing_until.clone(),
         can_close: true,
         dns,
@@ -472,7 +475,7 @@ pub fn payment(
     // swept yet, and the member reads the same `Lapsed` the sweep will write:
     // the date, not the sweep's own progress, is what the page is about.
     let running = window.is_some_and(|w| {
-        w.state == "open"
+        w.state == kyriakon_control_core::account::state::WindowState::Open
             && kyriakon_control_core::util::days_left(&w.closes_at, now)
                 .is_some_and(|days| days > 0)
     });
@@ -1043,7 +1046,7 @@ mod tests {
             window: Some(Window {
                 opened_at: "2026-10-20T09:00:00Z".into(),
                 closes_at: "2026-11-03T09:00:00Z".into(),
-                state: "open".into(),
+                state: kyriakon_control_core::account::state::WindowState::Open,
                 extensions: 0,
             }),
             ..Payment::default()
@@ -1080,7 +1083,8 @@ mod tests {
 
         // The same window, a day after it closed: the sweep may not have run,
         // and the page still reads Lapsed.
-        block.window.as_mut().unwrap().state = "closed".into();
+        block.window.as_mut().unwrap().state =
+            kyriakon_control_core::account::state::WindowState::Closed;
         let lapsed = payment(
             "lapsed",
             "cash",
@@ -1167,7 +1171,8 @@ mod tests {
         assert_eq!(view.state, "payment due");
         assert_eq!(view.window_closes.as_deref(), Some("2026-11-03"));
 
-        group.payment.window.as_mut().unwrap().state = "closed".into();
+        group.payment.window.as_mut().unwrap().state =
+            kyriakon_control_core::account::state::WindowState::Closed;
         let view = GroupView::from_record(&group);
         assert_eq!(view.state, "lapsed");
         assert!(view.window_closes.is_none());

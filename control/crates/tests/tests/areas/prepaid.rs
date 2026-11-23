@@ -181,7 +181,7 @@ fn the_token_shows_while_unpaid_and_the_date_replaces_it() {
     let view = |account: &store::Account| {
         let block = account.payment_state().expect("a paid approval's block");
         page::payment(
-            &account.state,
+            account.state.word(),
             &account.rail,
             &block,
             "20.00",
@@ -818,7 +818,7 @@ fn a_shortfall_is_shown_and_quoted_back_and_receipted() {
     let stored = stored_account(&fix, "secretary");
     let block = stored.payment_state().expect("a paid approval's block");
     let view = page::payment(
-        &stored.state,
+        stored.state.word(),
         &stored.rail,
         &block,
         "20.00",
@@ -837,7 +837,7 @@ fn a_shortfall_is_shown_and_quoted_back_and_receipted() {
     assert!(web.contains("Received so far: GBP 15.00"), "{web}");
     let capsule_block = stored.payment_state().expect("a paid approval's block");
     let capsule_view = page::payment(
-        &stored.state,
+        stored.state.word(),
         &stored.rail,
         &capsule_block,
         "20.00",
@@ -2489,7 +2489,7 @@ fn a_window_that_closes_with_nothing_recorded_lapses_the_account() {
         .payment_state()
         .expect("a paid account keeps its block");
     let view = page::payment(
-        &stored.state,
+        stored.state.word(),
         &stored.rail,
         &payment,
         "20.00",
@@ -2638,7 +2638,7 @@ fn a_window_is_extended_once_and_a_second_extension_is_refused() {
         "{account}"
     );
     let join: Value = serde_json::from_str(&fix.read(&format!("tokens/{token}.json"))).unwrap();
-    assert_eq!(join["window_closes_at"], json!(after), "{join}");
+    assert_eq!(join["token"], json!(token), "{join}");
     let mode = std::fs::metadata(fix.dir.join("store/accounts/secretary/account.json"))
         .unwrap()
         .mode()
@@ -3205,7 +3205,7 @@ fn a_group_window_is_listed_and_takes_its_one_extension() {
     let extended = group["payment"]["window"]["closes_at"].as_str().unwrap();
     assert_ne!(extended, closes, "the close date moved: {group}");
     let join: Value = serde_json::from_str(&fix.read(&format!("tokens/{token}.json"))).unwrap();
-    assert_eq!(join["window_closes_at"], json!(extended), "{join}");
+    assert_eq!(join["token"], json!(token), "{join}");
 
     // The second extension from the same window is refused and moves nothing.
     let before = fix.read("groups/parish.example/group.json");

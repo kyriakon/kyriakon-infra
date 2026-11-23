@@ -319,7 +319,7 @@ pub fn group_provision_payload(intent: &crate::store::GroupIntent) -> String {
                 "{}={}={}={}",
                 free_text(&w.opened_at),
                 free_text(&w.closes_at),
-                free_text(&w.state),
+                free_text(w.state.word()),
                 w.extensions
             )
         })
@@ -436,8 +436,10 @@ pub fn reconcile_return_payload(item: &str, note: &str) -> String {
 /// writes the ledger and can close an account, and `intents/` belongs to the
 /// unprivileged half, so the token, the amount, the rail, the
 /// `--close`/`--excess` choice, the rate and the settlement date are all
-/// covered. The reason is free text and comes last, so no earlier field can be
-/// shifted into it by a colon.
+/// covered, and a settlement's line `seq` too. The reason is free text and
+/// comes last, so no earlier field can be shifted into it by a colon. A
+/// settlement's payload carries the sequence; a refund that writes a line has
+/// none and keeps the shape an earlier release signed.
 #[allow(clippy::too_many_arguments)]
 pub fn refund_payload(
     token: &str,
@@ -447,9 +449,17 @@ pub fn refund_payload(
     excess: bool,
     rate: &str,
     settled_on: &str,
+    seq: Option<u64>,
     reason: &str,
 ) -> String {
-    format!("refund:{token}:{amount_gbp}:{rail}:{close}:{excess}:{rate}:{settled_on}:{reason}")
+    match seq {
+        Some(seq) => format!(
+            "refund:{token}:{amount_gbp}:{rail}:{close}:{excess}:{rate}:{settled_on}:{seq}:{reason}"
+        ),
+        None => format!(
+            "refund:{token}:{amount_gbp}:{rail}:{close}:{excess}:{rate}:{settled_on}:{reason}"
+        ),
+    }
 }
 
 /// One decision link, pointing at the handler's click-through path.

@@ -467,6 +467,7 @@ pub async fn verify(
                 intent.excess,
                 intent.rate.as_deref().unwrap_or(""),
                 intent.settled_on.as_deref().unwrap_or(""),
+                intent.seq,
                 intent.reason.as_deref().unwrap_or(""),
             );
             if sign::verify(key, &payload, &intent.sig) {
@@ -582,7 +583,9 @@ pub async fn apply(
             Intent::ReconcileReturn(intent) => {
                 transitions::payments::reconcile_return(store, intent).await
             }
-            Intent::Refund(intent) => transitions::payments::refund(cfg, store, intent).await,
+            Intent::Refund(intent) => {
+                transitions::payments::refund(cfg, store, journal, intent).await
+            }
             Intent::Export(intent) => {
                 transitions::lifecycle::export_account(cfg, store, intent, file).await
             }
