@@ -80,8 +80,6 @@ set -euo pipefail
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
 export PATH
 
-[ "$(id -u)" -eq 0 ] || { printf 'run as root (doas ksh %s)\n' "$0" >&2; exit 1; }
-
 script_dir="$(dirname "$0")"
 if [ ! -f "$script_dir/lib.sh" ]; then
 	printf '%s: lib.sh is not in %s. Install the two files together, as lib.sh describes.\n' \
@@ -98,29 +96,92 @@ fi
 acme_conf="${ACME_CONF:-/etc/acme-client.conf}"
 expiry_warn_days="${EXPIRY_WARN_DAYS:-14}"
 
-# --- one run at a time ------------------------------------------------------
-# mkdir is the atomic test-and-set available in base: this box has no shlock(1)
-# and no flock(1), only the flock(2) syscall, which has no shell wrapper. Two
-# acme-client processes on one name write the same key and certificate files, and
-# a run stalled on the CA would otherwise overlap the next night's job. A lock
-# left behind by a killed run is taken over once its pid is gone, so a reboot or a
-# kill cannot wedge renewal.
-lock=/var/run/renew-acme.lock
-if ! mkdir -m 0700 "$lock" 2>/dev/null; then
-	holder=$(cat "$lock/pid" 2>/dev/null || true)
-	if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-		# Not a failure. The run holding the lock is doing today's work and
-		# reports for itself, so this one says nothing and cron mails once.
-		exit 0
-	fi
-	rm -f "$lock/pid"
-	rmdir "$lock" 2>/dev/null || true
-	if ! mkdir -m 0700 "$lock" 2>/dev/null; then
-		printf '%s: could not take %s, and no live process holds it\n' "$0" "$lock" >&2
-		exit 1
-	fi
+# One "<handle> <full chain path>" line per domain block. A block starts at
+# column 0 and its settings are indented, so the two patterns cannot collide.
+# Comment lines are skipped: a comment reading '("duplicate challengedir" is an
+# error within one block)' was parsed as a challenge directory called
+# "duplicate", which stopped the run before a single certificate was asked for.
+domain_blocks() {
+	awk '
+		/^[ \t]*#/ { next }
+		/^domain[ \t]/ { handle = $2; next }
+		handle != "" && /domain full chain certificate/ {
+			path = $5
+			gsub(/"/, "", path)
+			print handle, path
+			handle = ""
+		}
+	' "$@"
+}
+
+# renewable_member_blocks <conf-dir>: the "<handle> <fullchain>" lines whose
+# certificate is already on disk. A block written by provisioning before first
+# issuance has no certificate and is the queue's, not this lane's.
+renewable_member_blocks() {
+	set -- "$1"/*.conf
+	[ -e "$1" ] || return 0
+	domain_blocks "$@" | while read -r renew_handle renew_cert; do
+		[ -s "$renew_cert" ] || continue
+		printf '%s %s\n' "$renew_handle" "$renew_cert"
+	done
+}
+
+# A generated block whose certificate is not on disk belongs to acme-queue.sh's
+# first-issue lane (#928). The self-test proves the skip without touching the
+# live config or running acme-client.
+self_test() {
+	self_test_begin
+	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
+	tree=$self_test_work
+	mkdir -p "$tree/acme" "$tree/ssl"
+	cert="$tree/ssl/alice.kyriakon.net.fullchain.pem"
+	cat > "$tree/acme/alice.conf" <<EOF
+domain alice.kyriakon.net {
+	domain key "$tree/ssl/alice.kyriakon.net.key"
+	domain full chain certificate "$cert"
+}
+EOF
+	cat > "$tree/acme/bob.conf" <<EOF
+domain bob.kyriakon.net {
+	domain key "$tree/ssl/bob.kyriakon.net.key"
+	domain full chain certificate "$tree/ssl/bob.kyriakon.net.fullchain.pem"
+}
+EOF
+	check "a queued block with no certificate is skipped" \
+		"$(renewable_member_blocks "$tree/acme"; printf x)" x
+	printf 'certificate\n' > "$cert"
+	check "an issued block is renewed" \
+		"$(renewable_member_blocks "$tree/acme")" "alice.kyriakon.net $cert"
+	check "and the unissued one is not in the list" \
+		"$(renewable_member_blocks "$tree/acme" | grep -c bob.kyriakon.net || true)" 0
+	check "a generated name is served by the relay" \
+		"$(cert_services alice.kyriakon.net "$tree/acme")" relayd
+	self_test_end
+}
+
+if [ "${1:-}" = --self-test ]; then
+	[ "$#" -eq 1 ] || exit 2
+	self_test
 fi
-printf '%s\n' "$$" > "$lock/pid"
+
+[ "$(id -u)" -eq 0 ] || { printf 'run as root (doas ksh %s)\n' "$0" >&2; exit 1; }
+
+# --- one run at a time ------------------------------------------------------
+# The lock is shared with acme-queue.sh: a first issue and a renewal must never
+# run acme-client for the same certificate pair at 03:00. A run already holding
+# it is doing today's work and reports for itself, so this one says nothing and
+# cron mails once.
+lock=$(acme_lock_path)
+lock_rc=0
+lock_message=$(lock_dir "$lock" 1 2>&1) || lock_rc=$?
+case "$lock_rc" in
+0) ;;
+1) exit 0 ;;
+*)
+	printf '%s\n' "$lock_message" >&2
+	exit 1
+	;;
+esac
 
 # --- the report, which is also the operator mail ----------------------------
 # Everything this run writes goes to a file rather than to cron, and the trap
@@ -144,8 +205,7 @@ exec >> "$report" 2>&1
 cleanup() {
 	status=$?
 	exec 1>&3 2>&4
-	rm -f "$lock/pid"
-	rmdir "$lock" 2>/dev/null || true
+	unlock_dir "$lock"
 	if [ -s "$report" ]; then
 		if [ "$status" -eq 0 ]; then
 			notify_operator acme renewed "$(cat "$report")"
@@ -175,19 +235,6 @@ trap cleanup EXIT
 # challenge directory called "duplicate", which stopped the run before a single
 # certificate was asked for, every night. A setting is a line that is not a
 # comment.
-domain_blocks() {
-	awk '
-		/^[ \t]*#/ { next }
-		/^domain[ \t]/ { handle = $2; next }
-		handle != "" && /domain full chain certificate/ {
-			path = $5
-			gsub(/"/, "", path)
-			print handle, path
-			handle = ""
-		}
-	' "$@"
-}
-
 domains=$(domain_blocks "$acme_conf")
 
 # Generated blocks live in the directory acme-client.conf includes, one file per
@@ -199,13 +246,14 @@ domains=$(domain_blocks "$acme_conf")
 # provisioning. The same parse reads the files, so the two lanes cannot disagree
 # about a block; index.conf yields no block and is harmless.
 member_conf_d=${ACME_MEMBER_CONF_D:-/etc/acme-client.d}
-set -- "$member_conf_d"/*.conf
-if [ -e "$1" ]; then
-	member_domains=$(domain_blocks "$@")
-	if [ -n "$member_domains" ]; then
-		domains="$domains
+# A generated block exists before its first certificate does: the queue owns that
+# first issue and its rate-limit budget. Renewal only reads blocks whose
+# certificate is already on disk, so this lane cannot first-issue a queued name or
+# fail HTTP-01 for one whose DNS is not pointed yet (#928).
+member_domains=$(renewable_member_blocks "$member_conf_d")
+if [ -n "$member_domains" ]; then
+	domains="$domains
 $member_domains"
-	fi
 fi
 
 if [ -z "$domains" ]; then
@@ -270,26 +318,7 @@ inside_warn_window() {
 # certificate of its own. Neither rc.d defines a reload action, so both are
 # restarted rather than reloaded.
 services_for() {
-	case "$1" in
-	mail.kyriakon.net) printf 'dovecot smtpd' ;;
-	kyriakon.net | oliver.kyriakon.net) printf 'relayd' ;;
-	kyriakon.com) printf 'relayd' ;;
-	# A generated name, a member's or an own-domain body's, is presented by the
-	# relay's generated keypair region (openbsd/etc/relayd.conf,
-	# scripts/relayd-members.sh), so a renewed certificate reaches the daemon that
-	# serves it with the same restart.
-	*.kyriakon.net) printf 'relayd' ;;
-	# Any other handle is generated only when its block is in the included
-	# directory; a handle typed into the top level with no service still stops the
-	# run rather than being renewed into no daemon.
-	*)
-		if [ -f "$member_conf_d/$1.conf" ]; then
-			printf 'relayd'
-			return 0
-		fi
-		return 1
-		;;
-	esac
+	cert_services "$1" "$member_conf_d"
 }
 
 total=0

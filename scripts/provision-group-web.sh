@@ -79,8 +79,7 @@ umask 077
 . "$(dirname "$0")/lib.sh"
 
 httpd_d=/etc/httpd.d
-ssl_dir=/etc/ssl
-ssl_private=/etc/ssl/private
+tls_dirs
 public_root=/home/www
 # The responder's host-to-tree map: one file per domain whose files live in the
 # site owner's member tree rather than in a directory named after the domain.
@@ -114,17 +113,11 @@ die() {
 # host map that collide with the platform's own. The name is the first line of
 # mail_domains, and kyriakon.com is refused for the reason remove-group.sh gives.
 domain_ok() {
-	typeset name="$1"
-	[ "${#name}" -le 253 ] || return 1
-	case "$name" in
-	*.*) ;;
-	*) return 1 ;;
-	esac
-	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' || return 1
+	valid_domain "$1" || return 1
 	# The platform's own names are the operator's, the rule the drain applies
 	# before it runs this lane; lib.sh holds the rule and its `kyriakon.com`
 	# clause so a hand-run does not need a second copy.
-	domain_is_platform "$name" "$mail_domains" && return 1
+	domain_is_platform "$1" "$mail_domains" && return 1
 	return 0
 }
 

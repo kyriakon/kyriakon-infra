@@ -55,13 +55,15 @@ umask 077
 script_dir=$(cd "$(dirname "$0")" && pwd)
 
 httpd_d=${RELAYD_MEMBERS_HTTPD_D:-/etc/httpd.d}
-ssl_dir=${RELAYD_MEMBERS_SSL_DIR:-/etc/ssl}
-ssl_private=${RELAYD_MEMBERS_SSL_PRIVATE:-/etc/ssl/private}
 
 # link_cert: the certificate link is made here and by deploy-relayd.sh, so the
 # two cannot disagree about which name it points at.
 # shellcheck disable=SC1091 # resolves at runtime from this script's directory
 . "$script_dir/lib.sh"
+
+tls_dirs
+ssl_dir=${RELAYD_MEMBERS_SSL_DIR:-$ssl_dir}
+ssl_private=${RELAYD_MEMBERS_SSL_PRIVATE:-$ssl_private}
 
 # Matched anywhere in a line, because the markers are comments inside a block and
 # may be indented. Nothing else in relayd.conf carries either phrase.

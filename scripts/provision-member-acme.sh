@@ -67,6 +67,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 # shellcheck disable=SC1091 # resolves at runtime from this script's directory
 . "$script_dir/lib.sh"
 acme_d=${ACME_D:-/etc/acme-client.d}
+tls_dirs
 public_root=${PUBLIC_ROOT:-/home/www}
 acme_queue=${ACME_QUEUE:-/root/bin/acme-queue.sh}
 conf_owner="root:wheel"
@@ -87,8 +88,10 @@ die() {
 # The paths, as functions rather than variables so the self-test rebinds the
 # directory once and every caller follows.
 member_conf() { printf '%s/%s.kyriakon.net.conf' "$acme_d" "$user"; }
-cert_file() { printf '/etc/ssl/%s.kyriakon.net.fullchain.pem' "$user"; }
-key_file() { printf '/etc/ssl/private/%s.kyriakon.net.key' "$user"; }
+# shellcheck disable=SC2154 # ssl_dir and ssl_private are set by tls_dirs
+cert_file() { printf '%s/%s.kyriakon.net.fullchain.pem' "$ssl_dir" "$user"; }
+# shellcheck disable=SC2154 # ssl_dir and ssl_private are set by tls_dirs
+key_file() { printf '%s/%s.kyriakon.net.key' "$ssl_private" "$user"; }
 
 # The file body, printed rather than written so the caller can compare it with
 # what is already there. The comment says where it came from, because this file
@@ -159,8 +162,12 @@ self_test() {
 	tree=$self_test_work
 
 	acme_d="$tree/etc/acme-client.d"
+	SSL_DIR="$tree/etc/ssl"
+	SSL_PRIVATE_DIR="$tree/etc/ssl/private"
+	tls_dirs
 	public_root="$tree/home/www"
-	install -d -m 0755 "$acme_d" "$public_root/alice.kyriakon.net"
+	install -d -m 0755 "$acme_d" "$SSL_DIR" "$SSL_PRIVATE_DIR" \
+		"$public_root/alice.kyriakon.net"
 	conf_owner="$(id -un):$(stat -f '%Sg' "$acme_d")"
 	user=alice
 
@@ -184,9 +191,9 @@ self_test() {
 	check "the challenge directory is the httpd one" \
 		"$(grep -c 'challengedir "/home/www/acme"' "$conf")" 1
 	check "the domain key is the pair's private half" \
-		"$(grep -c 'domain key "/etc/ssl/private/alice.kyriakon.net.key"' "$conf")" 1
+		"$(grep -cF "domain key \"$ssl_private/alice.kyriakon.net.key\"" "$conf")" 1
 	check "the full chain is the acme-client name relayd links from" \
-		"$(grep -c 'domain full chain certificate "/etc/ssl/alice.kyriakon.net.fullchain.pem"' "$conf")" 1
+		"$(grep -cF "domain full chain certificate \"$ssl_dir/alice.kyriakon.net.fullchain.pem\"" "$conf")" 1
 	check "the authority is the tracked one" \
 		"$(grep -c 'sign with letsencrypt' "$conf")" 1
 	check "and there is one block, not two" "$(grep -c '^domain ' "$conf")" 1

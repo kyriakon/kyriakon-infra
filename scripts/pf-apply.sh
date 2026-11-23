@@ -34,6 +34,10 @@
 
 set -euo pipefail
 
+script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
+
 pf_conf=/etc/pf.conf
 nospamd=/etc/mail/nospamd
 check_only=no
@@ -285,8 +289,6 @@ END { if (inblk) printf "%s", buf }
 }
 
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	typeset tree first second env relayd_accounts account hopped old
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
@@ -787,7 +789,10 @@ if [ "$check_only" = yes ]; then
 fi
 
 cp -p "$pf_conf" "$bak"
-install -m "$(stat -f %Lp "$pf_conf")" "$work" "$pf_conf"
+write_atomic "$pf_conf" "root:wheel" "$(stat -f %Lp "$pf_conf")" "$work" || {
+	rm -f "$work"
+	die "the candidate could not be installed; ${pf_conf} is unchanged"
+}
 rm -f "$work"
 pfctl -nf "$pf_conf" || die "${pf_conf} does not re-check; restore ${bak}"
 pfctl -f "$pf_conf"

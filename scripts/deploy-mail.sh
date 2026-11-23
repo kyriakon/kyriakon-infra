@@ -266,7 +266,7 @@ install_keyring_key() {
 			return 0
 		fi
 	fi
-	install -m 0644 "$1" "$keyring_dir/$name"
+	write_atomic "$keyring_dir/$name" "" 0644 "$1" || return 1
 	printf 'installed %s\n' "$name"
 	warn_aead "$1"
 }
@@ -1847,6 +1847,7 @@ fi
 # install with "install: /root/bin/INS@...: No such file or directory".
 # 0755 inside /root, which is already 0700 root.
 install -d -m 0755 /root/bin
+install -d -m 0755 /root/bin/lib
 # The scripts themselves, from the table's /root/bin rows. Nothing used to put
 # them there, so every box had them copied by hand from the repo and each crontab
 # line pasted by hand too, which is how the monitor spent a week unscheduled.

@@ -34,6 +34,9 @@
 # installs it again when it runs. deploy-mail.sh installs it directly; the drain
 # copy is the source the per-member run reads, the way the login class below is.
 lib.sh	/root/bin	-
+lib/atomic-fs.sh	/root/bin	-
+lib/tls-acme.sh	/root/bin	-
+lib/identity.sh	/root/bin	-
 abuse-monitor.sh	/root/bin	*/15 * * * *
 check-keyring-drift.sh	/root/bin	0 4 * * *	--box
 renew-acme.sh	/root/bin	0 3 * * *
@@ -50,6 +53,9 @@ check-hygiene.sh	checkout	30 4 * * 1
 self-test-all.sh	checkout	0 5 * * 1
 
 lib.sh	drain	-
+lib/atomic-fs.sh	drain	-
+lib/tls-acme.sh	drain	-
+lib/identity.sh	drain	-
 add-user.sh	drain	-
 provision-member.sh	drain	-
 delete-user.sh	drain	-
