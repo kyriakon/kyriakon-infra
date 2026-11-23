@@ -8,9 +8,10 @@
 //! Both maps are bounded. The request map drops a batch of its oldest entries at
 //! `MAX_KEYS`, so an attacker cannot grow memory without bound and the scan that
 //! finds the batch happens once per batch of new addresses rather than on every
-//! request. The draft map holds a day and refuses a source it has not seen rather
-//! than evict a live entry: eviction would hand a source that rotates addresses a
-//! fresh daily cap.
+//! request. The draft map holds a day, so it makes room by dropping a bucket that
+//! is below its cap and refuses a new source only when every bucket is at its cap.
+//! A capped bucket is never dropped: that would hand a rotating source a fresh
+//! daily cap.
 //!
 //! A std mutex, not parking_lot: the release's dependency list is frozen and a
 //! counter held for a few instructions does not earn a new crate. The lock is
@@ -30,8 +31,10 @@ pub const DRAFTS_PER_DAY: usize = 5;
 const MINUTE: Duration = Duration::from_secs(60);
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// The most keys either map holds before a batch is evicted.
-const MAX_KEYS: usize = 4096;
+/// The most keys either map holds. The request map drops a batch past it; the
+/// draft map makes room for one source and refuses when every bucket is at its
+/// cap.
+pub const MAX_KEYS: usize = 4096;
 /// The bits of an IPv6 address a bucket keeps: one site delegation. A /56 or /48
 /// holder can rotate the /64s inside it, so a /64 bucket would mint a fresh cap
 /// per address it owns.
@@ -123,7 +126,7 @@ pub struct Counter {
 #[derive(Default)]
 struct Inner {
     requests: HashMap<Key, Vec<Instant>>,
-    drafts: HashMap<Key, Vec<Instant>>,
+    drafts: Drafts,
 }
 
 impl Default for Counter {
@@ -142,24 +145,13 @@ impl Counter {
     /// Count one request. `false` once the key has made sixty in the last
     /// minute, so the sixty-first is the one refused.
     pub fn allow_request(&self, key: Key) -> bool {
-        allow(
-            &mut self.lock().requests,
-            key,
-            MINUTE,
-            REQUESTS_PER_MINUTE,
-            Full::EvictOldest,
-        )
+        allow_request(&mut self.lock().requests, key)
     }
 
-    /// Count one draft. `false` once the key has started five in the last day.
-    pub fn allow_draft(&self, key: Key) -> bool {
-        allow(
-            &mut self.lock().drafts,
-            key,
-            DAY,
-            DRAFTS_PER_DAY,
-            Full::Refuse,
-        )
+    /// Count one draft. The answer tells the front-end whether this source is
+    /// at its cap or whether the map has no room for a source it has not seen.
+    pub fn allow_draft(&self, key: Key) -> Admission {
+        self.lock().drafts.allow(key, Instant::now())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -167,44 +159,154 @@ impl Counter {
     }
 }
 
-/// What a full map does with a source it has not seen. The request map drops its
-/// oldest batch, because a minute's windows are spent by the time a flood fills
-/// 4096 buckets. The draft map holds a day, so dropping a live entry would give a
-/// rotating source the fresh cap eviction is meant to deny it.
-#[derive(Clone, Copy)]
-enum Full {
-    EvictOldest,
-    Refuse,
+/// The answer to one draft attempt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Admission {
+    /// Counted.
+    Allowed,
+    /// This source has started its five in the day.
+    Denied,
+    /// Every bucket in the map is at its cap, so this source cannot be counted
+    /// without dropping a live cap. The front-end answers a temporary failure
+    /// rather than the per-source message.
+    Unavailable,
 }
 
-fn allow(
-    map: &mut HashMap<Key, Vec<Instant>>,
-    key: Key,
-    window: Duration,
-    limit: usize,
-    full: Full,
-) -> bool {
+fn allow_request(map: &mut HashMap<Key, Vec<Instant>>, key: Key) -> bool {
     let now = Instant::now();
     if map.len() >= MAX_KEYS && !map.contains_key(&key) {
-        evict(map, now, window);
+        evict(map, now, MINUTE);
         if map.len() >= MAX_KEYS {
-            match full {
-                Full::EvictOldest => drop_oldest(map, now),
-                Full::Refuse => return false,
-            }
+            drop_oldest(map, now);
         }
     }
     let times = map.entry(key).or_default();
-    times.retain(|t| now.duration_since(*t) < window);
-    if times.len() >= limit {
+    times.retain(|t| now.duration_since(*t) < MINUTE);
+    if times.len() >= REQUESTS_PER_MINUTE {
         return false;
     }
     times.push(now);
     true
 }
 
-/// Empty the windows that have run out. This is the only scan in the module, so
-/// it runs once per batch of new keys rather than on every request.
+/// The draft map. It holds a day of starts, so the batch eviction a request map
+/// can afford would erase a live cap. It makes room from a bucket below its cap,
+/// and says `Unavailable` only when every bucket is at its cap.
+#[derive(Default)]
+struct Drafts {
+    entries: HashMap<Key, Window>,
+    /// Buckets at `DRAFTS_PER_DAY`. Kept here so the unavailable answer does not
+    /// walk 4096 buckets to find out that there is no room.
+    capped: usize,
+    /// The earliest moment a capped bucket can fall below the cap. It is a
+    /// lower bound: once it has passed, the map is read again.
+    next_uncap: Option<Instant>,
+}
+
+#[derive(Default)]
+struct Window {
+    times: Vec<Instant>,
+    capped: bool,
+}
+
+impl Drafts {
+    fn allow(&mut self, key: Key, now: Instant) -> Admission {
+        if self.entries.contains_key(&key) {
+            self.prune(&key, now);
+            if self.entries[&key].times.len() >= DRAFTS_PER_DAY {
+                return Admission::Denied;
+            }
+        } else if self.entries.len() >= MAX_KEYS && !self.make_room(now) {
+            return Admission::Unavailable;
+        }
+        {
+            let window = self.entries.entry(key).or_default();
+            window.times.push(now);
+        }
+        self.settle(&key);
+        Admission::Allowed
+    }
+
+    /// Drop the starts outside the day and keep the capped count in step.
+    fn prune(&mut self, key: &Key, now: Instant) {
+        if let Some(window) = self.entries.get_mut(key) {
+            window.times.retain(|t| now.duration_since(*t) < DAY);
+        }
+        self.settle(key);
+    }
+
+    /// Record whether the bucket is at its cap, and the moment it could next
+    /// fall below it.
+    fn settle(&mut self, key: &Key) {
+        let (was, capped, expiry) = {
+            let Some(window) = self.entries.get_mut(key) else {
+                return;
+            };
+            let was = window.capped;
+            window.capped = window.times.len() >= DRAFTS_PER_DAY;
+            (
+                was,
+                window.capped,
+                window.times.first().copied().map(|t| t + DAY),
+            )
+        };
+        match (was, capped) {
+            (false, true) => self.capped += 1,
+            (true, false) => self.capped -= 1,
+            _ => {}
+        }
+        if let (true, Some(expiry)) = (capped, expiry) {
+            self.next_uncap = Some(self.next_uncap.map_or(expiry, |t| t.min(expiry)));
+        }
+    }
+
+    /// Make room for one new source. This reads the map only when a bucket can
+    /// actually be dropped: a full map whose every bucket is capped and whose
+    /// earliest cap has not aged yet answers from the counters. A capped bucket
+    /// is never the one dropped.
+    fn make_room(&mut self, now: Instant) -> bool {
+        if self.capped == self.entries.len() && self.next_uncap.is_some_and(|t| now < t) {
+            return false;
+        }
+        let mut victim: Option<(Instant, Key)> = None;
+        let mut capped = 0;
+        let mut next_uncap: Option<Instant> = None;
+        self.entries.retain(|key, window| {
+            window.times.retain(|t| now.duration_since(*t) < DAY);
+            if window.times.is_empty() {
+                window.capped = false;
+                return false;
+            }
+            window.capped = window.times.len() >= DRAFTS_PER_DAY;
+            if window.capped {
+                capped += 1;
+                if let Some(expiry) = window.times.first().map(|t| *t + DAY) {
+                    next_uncap = Some(next_uncap.map_or(expiry, |t| t.min(expiry)));
+                }
+            } else {
+                let seen = window.times.last().copied().unwrap_or(now);
+                if victim.is_none_or(|(v, _)| seen < v) {
+                    victim = Some((seen, *key));
+                }
+            }
+            true
+        });
+        self.capped = capped;
+        self.next_uncap = next_uncap;
+        if self.entries.len() < MAX_KEYS {
+            return true;
+        }
+        match victim {
+            Some((_, key)) => {
+                self.entries.remove(&key);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Empty the windows that have run out before the request map drops a batch.
 fn evict(map: &mut HashMap<Key, Vec<Instant>>, now: Instant, window: Duration) {
     map.retain(|_, times| {
         times.retain(|t| now.duration_since(*t) < window);
@@ -212,9 +314,9 @@ fn evict(map: &mut HashMap<Key, Vec<Instant>>, now: Instant, window: Duration) {
     });
 }
 
-/// Drop the oldest batch when `evict` left the map at its cap. The oldest entry
-/// is the one seen least recently, so a flood loses the buckets it filled first
-/// rather than the ones still counting.
+/// Drop the oldest batch when `evict` left the request map at its cap. The oldest
+/// entry is the one seen least recently, so a flood loses the buckets it filled
+/// first rather than the ones still counting.
 fn drop_oldest(map: &mut HashMap<Key, Vec<Instant>>, now: Instant) {
     let mut ages: Vec<(Instant, Key)> = map
         .iter()
@@ -249,10 +351,10 @@ mod tests {
     fn the_sixth_draft_in_a_day_is_refused() {
         let c = Counter::new();
         for i in 0..DRAFTS_PER_DAY {
-            assert!(c.allow_draft(v4(1)), "draft {i} was refused");
+            assert_eq!(c.allow_draft(v4(1)), Admission::Allowed, "draft {i}");
         }
-        assert!(!c.allow_draft(v4(1)));
-        assert!(c.allow_draft(v4(2)));
+        assert_eq!(c.allow_draft(v4(1)), Admission::Denied);
+        assert_eq!(c.allow_draft(v4(2)), Admission::Allowed);
     }
 
     #[test]
@@ -261,7 +363,7 @@ mod tests {
         for _ in 0..DRAFTS_PER_DAY {
             c.allow_draft(v4(1));
         }
-        assert!(!c.allow_draft(v4(1)));
+        assert_eq!(c.allow_draft(v4(1)), Admission::Denied);
         assert!(c.allow_request(v4(1)));
     }
 
@@ -274,6 +376,15 @@ mod tests {
         let c: Ipv6Addr = "2001:db8:2::1".parse().unwrap();
         assert_eq!(bucket(IpAddr::V6(a)), bucket(IpAddr::V6(b)));
         assert_ne!(bucket(IpAddr::V6(a)), bucket(IpAddr::V6(c)));
+        // These share the first six bytes and differ in the seventh, which is
+        // the /56 boundary. The bucket must stop at the /48.
+        let lower: Ipv6Addr = "2001:db8:aa:0100::1".parse().unwrap();
+        let upper: Ipv6Addr = "2001:db8:aa:0200::1".parse().unwrap();
+        assert_eq!(
+            bucket(IpAddr::V6(lower)),
+            bucket(IpAddr::V6(upper)),
+            "the bucket must stop at the /48 boundary"
+        );
     }
 
     #[test]
@@ -299,12 +410,17 @@ mod tests {
         // the same source for the cap.
         for i in 0..DRAFTS_PER_DAY {
             let addr = fourth(0);
-            assert!(c.allow_draft(key(None, Some(addr.as_str()))), "draft {i}");
+            assert_eq!(
+                c.allow_draft(key(None, Some(addr.as_str()))),
+                Admission::Allowed,
+                "draft {i}"
+            );
         }
         for n in 1..=255u16 {
             let addr = fourth(n);
-            assert!(
-                !c.allow_draft(key(None, Some(addr.as_str()))),
+            assert_eq!(
+                c.allow_draft(key(None, Some(addr.as_str()))),
+                Admission::Denied,
                 "{addr} inside the /56 reset the cap"
             );
         }
@@ -315,18 +431,69 @@ mod tests {
         let c = Counter::new();
         let offender = key(None, Some("198.51.100.7"));
         for _ in 0..DRAFTS_PER_DAY {
-            assert!(c.allow_draft(offender));
+            assert_eq!(c.allow_draft(offender), Admission::Allowed);
         }
+        // Each flood bucket is below its cap, so the map makes room from one of
+        // them rather than closing the form.
         for i in 0..MAX_KEYS + EVICT_BATCH {
             let a = (i >> 8) as u8;
             let b = (i & 0xff) as u8;
-            c.allow_draft(key(None, Some(&format!("10.2.{a}.{b}"))));
+            assert_eq!(
+                c.allow_draft(key(None, Some(&format!("10.2.{a}.{b}")))),
+                Admission::Allowed
+            );
         }
-        assert!(c.lock().drafts.len() <= MAX_KEYS);
-        assert!(
-            !c.allow_draft(offender),
+        assert_eq!(c.lock().drafts.entries.len(), MAX_KEYS);
+        assert_eq!(
+            c.allow_draft(offender),
+            Admission::Denied,
             "the flood evicted the bucket that was already capped"
         );
+        // A new applicant still gets in, because a below-cap bucket makes room.
+        assert_eq!(
+            c.allow_draft(key(None, Some("192.0.2.52"))),
+            Admission::Allowed
+        );
+    }
+
+    #[test]
+    fn a_full_map_of_capped_sources_is_unavailable() {
+        let c = Counter::new();
+        for i in 0..MAX_KEYS {
+            let a = (i >> 8) as u8;
+            let b = (i & 0xff) as u8;
+            let k = key(None, Some(&format!("10.9.{a}.{b}")));
+            for _ in 0..DRAFTS_PER_DAY {
+                assert_eq!(c.allow_draft(k), Admission::Allowed);
+            }
+        }
+        assert_eq!(
+            c.allow_draft(key(None, Some("192.0.2.50"))),
+            Admission::Unavailable,
+            "a map with no below-cap bucket has no room"
+        );
+        // The answer does not reset a capped source.
+        assert_eq!(
+            c.allow_draft(key(None, Some("10.9.0.0"))),
+            Admission::Denied
+        );
+    }
+
+    #[test]
+    fn a_full_map_makes_room_from_a_source_below_its_cap() {
+        let c = Counter::new();
+        for i in 0..MAX_KEYS {
+            let a = (i >> 8) as u8;
+            let b = (i & 0xff) as u8;
+            let k = key(None, Some(&format!("10.8.{a}.{b}")));
+            assert_eq!(c.allow_draft(k), Admission::Allowed);
+        }
+        assert_eq!(
+            c.allow_draft(key(None, Some("192.0.2.51"))),
+            Admission::Allowed,
+            "a below-cap bucket must make room for a new source"
+        );
+        assert_eq!(c.lock().drafts.entries.len(), MAX_KEYS);
     }
 
     #[test]
