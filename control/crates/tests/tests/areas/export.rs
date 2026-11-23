@@ -552,7 +552,15 @@ fn the_application_is_in_the_bundle_only_inside_the_purge() {
     copy["filed_at"] = json!(old
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap());
+    // The payment window an approval opens is not the export's subject; close
+    // it so the ninety-day purge can take the answers.
+    copy["payment"]["window"]["state"] = json!("closed");
     std::fs::write(&path, serde_json::to_vec_pretty(&copy).unwrap()).unwrap();
+    let token_path = fix.dir.join(format!("store/applications/{TOKEN}.json"));
+    let mut record: Value =
+        serde_json::from_str(&std::fs::read_to_string(&token_path).unwrap()).unwrap();
+    record["payment"]["window"]["state"] = json!("closed");
+    std::fs::write(&token_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
 
     // One export per second names one directory.
     std::thread::sleep(std::time::Duration::from_secs(1));

@@ -982,11 +982,14 @@ fn a_refused_free_note_does_not_fail_the_pass() {
 
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
-    // The notice is recorded before the send, so the refusal is visible and the
-    // year is not mailed twice by a later pass.
-    assert!(fix
-        .read("accounts/secretary/notices.jsonl")
-        .contains("free.anniversary"));
+    // The lifecycle senders unrecord a failed enqueue, so the line is not left
+    // behind to make a later pass read the note as sent.
+    assert!(
+        !fix.read("accounts/secretary/notices.jsonl")
+            .contains("free.anniversary"),
+        "a refused enqueue left a notice line: {}",
+        fix.read("accounts/secretary/notices.jsonl")
+    );
 }
 
 /// An application that asked for no charge is never charged, even by the
@@ -1506,6 +1509,15 @@ fn age_filed_at(fix: &Fix, rel: &str, days: i64) {
     std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
 }
 
+/// Close the payment window an approval opened, so a test about the ninety-day
+/// boundary is not also about the live window a payment can still use.
+fn close_payment_window(fix: &Fix, rel: &str) {
+    let path = fix.dir.join("store").join(rel);
+    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    record["payment"]["window"]["state"] = json!("closed");
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+}
+
 /// ADR 0005's ninety days: an approved application's answers are cleared from
 /// the mailbox's copy and the token record on the first pass after the window,
 /// while `account.json` keeps the payment and the outside address. The token is
@@ -1534,6 +1546,8 @@ fn an_approved_applications_answers_purge_after_ninety_days() {
     );
     age_filed_at(&fix, copy, 100);
     age_filed_at(&fix, &token, 100);
+    close_payment_window(&fix, copy);
+    close_payment_window(&fix, &token);
 
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
@@ -1568,6 +1582,59 @@ fn an_approved_applications_answers_purge_after_ninety_days() {
     // A retry over the cleared store adds nothing.
     assert!(fix.drain().status.success());
     assert_eq!(counted(), 2, "{}", fix.journal());
+}
+
+/// #901: an approval on the ninety-day boundary opens a fourteen-day payment
+/// window, and the purge must leave the record until that window closes: a
+/// payment through the link after the purge pass still credits the account.
+#[test]
+fn an_application_approved_on_the_purge_boundary_survives_its_open_window() {
+    let fix = Fix::new("purge-open-window");
+    let record = fix.filed("secretary", "card", &[("rail", "card")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+
+    // The review ran late: the application is past ninety days when it is
+    // approved, and the approval opens a fresh window.
+    age_filed_at(&fix, &format!("applications/{TOKEN}.json"), 100);
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let copy = "accounts/secretary/application.json";
+    let application = format!("applications/{TOKEN}.json");
+    assert!(
+        fix.dir.join("store").join(&copy).exists(),
+        "the approval copies the answers"
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir.join("store").join(&copy).exists(),
+        "the purge removed the copy while the payment window is open"
+    );
+    assert!(
+        fix.dir.join("store").join(&application).exists(),
+        "the purge removed the record a payment can still name"
+    );
+    assert!(
+        !fix.journal()
+            .contains(&format!("\"intent\":\"purge-{TOKEN}\"")),
+        "{}",
+        fix.journal()
+    );
+
+    // The card payment the mailed link opens still resolves through that
+    // record and credits the account.
+    fix.stripe_session_repair(TOKEN);
+    fix.webhook("evt_purge_paid", "invoice.paid", invoice("in_purge_paid"));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.account("secretary")["payment"]["paid_until"].is_string(),
+        "the payment after the purge pass did not credit the account"
+    );
+    assert_eq!(payment_lines(&fix).len(), 1, "{:?}", payment_lines(&fix));
 }
 
 /// Inside the window the answers stay: the boundary is the ninetieth day, and
@@ -1699,6 +1766,7 @@ fn a_decided_application_with_no_mailbox_copy_purges_after_ninety_days() {
     // mailbox copy to reach it.
     std::fs::remove_dir_all(fix.dir.join("store/accounts/secretary")).unwrap();
     age_filed_at(&fix, &format!("applications/{TOKEN}.json"), 100);
+    close_payment_window(&fix, &format!("applications/{TOKEN}.json"));
 
     // A decided record inside the window, for a name no account holds. Written
     // directly: `Fix::filed` also writes the fixture to `applications/<TOKEN>`,
@@ -1810,6 +1878,8 @@ fn show_reports_an_account_whose_application_was_purged() {
     let token_ref = approved_paid(&fix, "secretary", "cash");
     age_filed_at(&fix, "accounts/secretary/application.json", 100);
     age_filed_at(&fix, &format!("applications/{TOKEN}.json"), 100);
+    close_payment_window(&fix, "accounts/secretary/application.json");
+    close_payment_window(&fix, &format!("applications/{TOKEN}.json"));
     assert!(fix.drain().status.success());
     assert!(!fix
         .dir

@@ -2758,6 +2758,68 @@ fn the_grace_sends_one_final_notice_then_deletes_the_account() {
     );
 }
 
+/// #893: a final notice whose enqueue fails leaves no line, so the next pass
+/// sends it again, and the deletion waits while the member has not been warned.
+#[test]
+fn a_final_notice_that_cannot_leave_is_retried_before_the_account_is_deleted() {
+    let fix = Fix::new("grace-enqueue");
+    let _token = approved_paid(&fix, "secretary", "cash");
+    let mut account = fix.account("secretary");
+    account["payment"]["window"]["closes_at"] = json!("2020-01-01T00:00:00Z");
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    assert!(fix.drain().status.success());
+
+    // The grace ends today and the mail path is broken.
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(0));
+    std::fs::write(
+        fix.dir.join("store/accounts/secretary/account.json"),
+        serde_json::to_vec_pretty(&account).unwrap(),
+    )
+    .unwrap();
+    fix.enqueuer_fails();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.dir.join("store/accounts/secretary").exists(),
+        "the account was deleted without a final notice"
+    );
+    assert!(
+        !fix.scripts_log().contains("delete-user.sh secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+    assert!(
+        !fix.read("accounts/secretary/notices.jsonl")
+            .contains("prepaid.final"),
+        "a refused enqueue left a notice line that suppresses the retry"
+    );
+
+    // The mail path is repaired: the same notice leaves, and then the deletion
+    // runs on that pass.
+    fix.enqueuer_works();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.sent().contains("will be deleted in seven days"),
+        "the retry did not send the final notice: {}",
+        fix.sent()
+    );
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "the account was not deleted after the notice left"
+    );
+    assert!(
+        fix.scripts_log().contains("delete-user.sh secretary"),
+        "{}",
+        fix.scripts_log()
+    );
+}
+
 /// A closing or suspended account is not the payment sweep's to overwrite: the
 /// window closing leaves the state and its own date alone, and a credit records
 /// the money without resurrecting it.

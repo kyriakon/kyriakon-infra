@@ -111,7 +111,20 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
     // after a deletion. A report that could not be settled skips the sweep: a
     // failure is a reason to retry, and a deletion is not a settlement.
     let bounces_settled = crate::mailbox::bounces(cfg, store, &journal).await?;
-    if bounces_settled {
+    // The card rail's arriving events are settled before the grace sweep: a
+    // payment that arrived before this pass on the grace date restores the
+    // account here, before the sweep can delete it. The error is held rather
+    // than raised, so a misconfigured signing secret does not hold up the rest
+    // of the pass; the sweep is skipped below, because a delivery still queued
+    // may be that payment.
+    let stripe = transitions::stripe::stripe_webhooks(cfg, store, &journal).await;
+    let card_queue_empty = stripe.is_ok()
+        && !store
+            .list("webhooks")
+            .await?
+            .iter()
+            .any(|name| name.ends_with(".body"));
+    if bounces_settled && card_queue_empty {
         // A lapsed account's grace: the final notice at day 33, and the one
         // deletion transition when the 40 days end.
         transitions::lifecycle::grace_sweep(cfg, store, &journal).await?;
@@ -125,10 +138,6 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
     // cannot repair, and it must not delay a filed application or a member's
     // mail. It is due-gated, so most passes do no DNS work.
     transitions::lifecycle::check_group_dns(cfg, store, &journal).await?;
-    // The card rail's arriving events are settled after everything else: a
-    // misconfigured signing secret must not hold up an approval, and an event
-    // that cannot be applied yet is left for the next pass.
-    let stripe = transitions::stripe::stripe_webhooks(cfg, store, &journal).await;
     // Released holds go last, so the prune's rewrite of `journal.jsonl` is not
     // followed by an append that would use the loaded index's stale positions.
     // The sweep runs even when the card pass failed.

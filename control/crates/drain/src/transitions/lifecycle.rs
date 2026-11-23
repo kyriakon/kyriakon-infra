@@ -779,7 +779,7 @@ async fn group_lapse_notice(
         group.domain,
         kyriakon_control_core::account::LAPSE_NOTE
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         &group.site_owner,
@@ -820,7 +820,7 @@ async fn group_grace_notice(
         group.domain,
         kyriakon_control_core::account::LAPSE_NOTE
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         &group.site_owner,
@@ -859,7 +859,7 @@ async fn group_final_notice(
          admin@kyriakon.net before that date.\n",
         group.domain
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         &group.site_owner,
@@ -916,6 +916,18 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
             // restart the clock. Only `notice resend` clears it, and that
             // extends the grace.
             if account.notice_stopped.is_some() {
+                continue;
+            }
+            // The final notice is sent, or found already recorded, before the
+            // deletion: an enqueue that failed leaves no notice line, and the
+            // account must not be erased without the warning it exists for.
+            let warned = if account.state == "suspended" {
+                suspension_final_notice(cfg, store, &username, &account).await
+            } else {
+                final_notice(cfg, store, &username, &account).await
+            };
+            if let Err(e) = warned {
+                e.report(&format!("the final notice for {username}"));
                 continue;
             }
             if let Err(e) = delete_account(cfg, store, journal, &username).await {
@@ -993,6 +1005,12 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
                     Error::from(e).report(&format!("the notice record for {}", group.site_owner));
                     continue;
                 }
+            }
+            // The body's last notice must have left before its accounts are
+            // erased, for the same reason the individual account waits.
+            if let Err(e) = group_final_notice(cfg, store, journal, &group, grace).await {
+                e.report(&format!("the final notice for {domain}"));
+                continue;
             }
             if let Err(e) = delete_group(cfg, store, journal, &group, &id).await {
                 report_failure(cfg, store, journal, &id, "delete", &e).await;
@@ -1100,7 +1118,7 @@ async fn grace_notice(
          Your payment reference is {token}.\n",
         kyriakon_control_core::account::LAPSE_NOTE
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         username,
@@ -1188,7 +1206,7 @@ async fn final_notice(
          Your payment reference is {token}. If you have posted the money, write to\n\
          admin@kyriakon.net before that date.\n"
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         username,
@@ -1227,7 +1245,7 @@ async fn suspension_final_notice(
          admin@kyriakon.net. A suspension the operator resolves is lifted with\n\
          `kyriakon-admin resume {username}` and the deletion does not run.\n"
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         username,
@@ -1497,7 +1515,7 @@ async fn lapse_notice(
          seven days before the end.\n",
         kyriakon_control_core::account::LAPSE_NOTE
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         username,
@@ -1600,7 +1618,7 @@ pub async fn suspend(
          that is not resolved enters the same forty-day grace as an unpaid account, and\n\
          that grace ends in deletion.\n"
     );
-    notice::send_account_notice(
+    notice::send_account_notice_retryable(
         cfg,
         store,
         username,
@@ -1795,7 +1813,7 @@ pub async fn delete_account(
         .await?;
     }
     if let Some(to) = account.outside_address.as_deref() {
-        notice::send_account_notice(
+        notice::send_account_notice_retryable(
             cfg,
             store,
             username,
@@ -2436,7 +2454,7 @@ pub async fn test_mail(
          not restored: look for a PGP/MIME or protected-headers setting in the client. \
          Nothing about the account changes either way; this message is the whole test.\n"
     );
-    let sent = notice::send_account_notice(
+    let sent = notice::send_account_notice_retryable(
         cfg,
         store,
         &intent.username,
@@ -2493,8 +2511,16 @@ async fn rotation_notices(
         } else {
             format!("{notice_type}.{request}.outside")
         };
-        notice::send_account_notice(cfg, store, &account.username, &kind, subject, to, body)
-            .await?;
+        notice::send_account_notice_retryable(
+            cfg,
+            store,
+            &account.username,
+            &kind,
+            subject,
+            to,
+            body,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2895,7 +2921,7 @@ async fn check_one_group(
              observed again on the next check. This notice is sent once per outage.\n",
             domain = group.domain
         );
-        notice::send_account_notice(
+        notice::send_account_notice_retryable(
             cfg,
             store,
             &group.site_owner,
@@ -3295,7 +3321,7 @@ pub async fn free_anniversaries(
         // One account's refused notice is reported and skipped, the way the DNS
         // sweep treats one group's: it must not stop the pass's mail spool or
         // the DNS check behind it.
-        if let Err(e) = notice::send_account_notice(
+        if let Err(e) = notice::send_account_notice_retryable(
             cfg,
             store,
             &username,
@@ -3377,7 +3403,7 @@ pub async fn prepaid_renewals(
              arrange the renewal or if you have already sent the money; the renewal is\n\
              handled by the operator, and no automatic deletion runs from this date.\n"
         );
-        if let Err(e) = notice::send_account_notice(
+        if let Err(e) = notice::send_account_notice_retryable(
             cfg,
             store,
             &username,
@@ -3434,7 +3460,7 @@ pub async fn prepaid_renewals(
                 continue;
             }
         };
-        if let Err(e) = notice::send_account_notice(
+        if let Err(e) = notice::send_account_notice_retryable(
             cfg,
             store,
             &group.site_owner,
@@ -3943,6 +3969,53 @@ fn purge_due(filed_at: &str, today: time::Date) -> bool {
         .is_some_and(|filed| !export::within_purge(filed.date(), today))
 }
 
+/// Whether an application record is an approval whose payment window is still
+/// open. The ninety-day purge leaves that record in place: a card or prepaid
+/// payment through the link it names can still be charged, and without the
+/// record the card pass cannot attach the money to an account.
+fn payment_window_open(record: &Record, today: time::Date) -> bool {
+    let Some(payment) = record.payment.as_ref() else {
+        return false;
+    };
+    record.stage.starts_with("approved")
+        && record.decided_at.is_some()
+        && payment.paid_until.is_none()
+        && payment.window.as_ref().is_some_and(|window| {
+            window.state == "open"
+                && OffsetDateTime::parse(&window.closes_at, &Rfc3339)
+                    .ok()
+                    .is_some_and(|closes| closes.date() >= today)
+        })
+}
+
+/// The same test on a mailbox copy read as `Value`, because that loop does not
+/// model the record's unknown fields. The approval writes this copy before the
+/// decision stamp, so the payment block is the evidence here rather than the
+/// stage: an undecided application has no block at all.
+fn value_payment_window_open(record: &Value, today: time::Date) -> bool {
+    let Some(payment) = record.get("payment") else {
+        return false;
+    };
+    if payment
+        .get("paid_until")
+        .is_some_and(|paid| !paid.is_null())
+    {
+        return false;
+    }
+    let Some(window) = payment.get("window") else {
+        return false;
+    };
+    window.get("state").and_then(Value::as_str) == Some("open")
+        && window
+            .get("closes_at")
+            .and_then(Value::as_str)
+            .is_some_and(|closes| {
+                OffsetDateTime::parse(closes, &Rfc3339)
+                    .ok()
+                    .is_some_and(|closes| closes.date() >= today)
+            })
+}
+
 /// The status tokens queued intents name. An approval writes `mark_decided`
 /// last, so a failure or a backoff leaves the record at `received` with its
 /// intent still in `intents/`; the purge must not take the record out from under
@@ -4017,6 +4090,15 @@ pub async fn purge_applications(
         if export::within_purge(filed, today) {
             continue;
         }
+        // An approval whose payment window is still open keeps its copy: the
+        // link it carries can still take money, and the join must survive to
+        // attach it.
+        if serde_json::from_str::<Value>(&text)
+            .ok()
+            .is_some_and(|copy| value_payment_window_open(&copy, today))
+        {
+            continue;
+        }
         // The copy is the handler's, and the token becomes a name under
         // `applications/`: a planted value that is not the generated shape names
         // nothing under that directory. The account copy is not named by the
@@ -4079,6 +4161,12 @@ pub async fn purge_applications(
             continue;
         };
         if !purge_due(&record.filed_at, today) {
+            continue;
+        }
+        // An approval whose payment window is still open is not abandoned: its
+        // link can still be charged, and this record is what resolves that
+        // payment to the account.
+        if payment_window_open(&record, today) {
             continue;
         }
         // A received record with its decision still queued is mid-approval, not
