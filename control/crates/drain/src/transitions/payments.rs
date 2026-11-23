@@ -1035,7 +1035,6 @@ pub async fn refund(
             payment.balance_gbp = (left > 0).then(|| util::gbp(left));
         }
         let close = intent.close;
-        let excess = intent.excess;
         let closing_until = closing_until.clone();
         let payment_for_record = payment.clone();
         store
@@ -1045,9 +1044,9 @@ pub async fn refund(
                         account.state = "closing".to_string();
                         account.closing_until = Some(closing_until.clone());
                     }
-                    if excess {
-                        account.payment = Some(payment_for_record.clone());
-                    }
+                    // A close stops the card and the excess refund changes the
+                    // balance, so the block is written for either.
+                    account.payment = Some(payment_for_record.clone());
                 }
                 Ok::<(), Error>(())
             })

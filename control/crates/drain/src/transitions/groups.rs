@@ -1571,10 +1571,17 @@ pub async fn group_address(
                 }
             }
             group.accounts.retain(|a| a != &intent.mailbox);
+            // The handover moves the site with the list edit, in one record
+            // write. Once the record names the replacement, a retry finds
+            // `site_owner_leaving` false and leaves it there.
+            let replacement = site_owner_leaving.then(|| group.site_owner.clone());
             store
                 .update_group(&intent.domain, |current| {
                     if let Some(current) = current {
                         current.accounts.retain(|a| a != &intent.mailbox);
+                        if let Some(replacement) = replacement.clone() {
+                            current.site_owner = replacement;
+                        }
                     }
                     Ok::<(), Error>(())
                 })

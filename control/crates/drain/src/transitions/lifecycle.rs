@@ -2161,11 +2161,13 @@ pub async fn close_account(
         }
     }
     let closing_until = account.closing_until.clone();
+    let payment = account.payment.clone();
     store
         .update_account(&intent.username, |current| {
             if let Some(account) = current.as_mut() {
                 account.state = "closing".to_string();
                 account.closing_until = closing_until.clone();
+                account.payment = payment.clone();
             }
             Ok::<(), Error>(())
         })
@@ -2403,10 +2405,14 @@ pub async fn upload_key(
         }
     }
     let upload_keys = account.upload_keys.clone();
+    let site_served = account.site_served;
+    let capsule_served = account.capsule_served;
     store
         .update_account(&account.username, |current| {
             if let Some(account) = current.as_mut() {
                 account.upload_keys = upload_keys;
+                account.site_served = site_served;
+                account.capsule_served = capsule_served;
             }
             Ok::<(), Error>(())
         })
