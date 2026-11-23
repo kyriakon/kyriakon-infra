@@ -19,13 +19,18 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures;
+static volatile sig_atomic_t sibling_pid;
+static volatile sig_atomic_t sibling_reaped;
 
 static void
 expect(bool ok, const char *what)
@@ -571,6 +576,136 @@ test_plaintext_cap(const char *fake)
 	kyriakon_save_deinit(&save);
 }
 
+/* A stopped or slow encryptor must not hold the mail process forever: the
+ * deadline passes, the child is killed, and the save fails (#881). */
+static void
+test_stalled_child_timeout(const char *fake)
+{
+	struct kyriakon_encrypt_result result;
+	struct timespec before, after;
+	unsigned char input[64];
+	bool ok;
+
+	memset(input, 'x', sizeof(input));
+	mode("stall");
+	clock_gettime(CLOCK_MONOTONIC, &before);
+	ok = kyriakon_encrypt_message_timeout(fake, "alice", "/keyring", "/gpg",
+					      input, sizeof(input), 150,
+					      &result);
+	clock_gettime(CLOCK_MONOTONIC, &after);
+	mode(NULL);
+	expect(!ok, "a stalled encryptor fails the save");
+	expect(result.ciphertext == NULL,
+	       "a stalled encryptor returns no bytes");
+	expect(strstr(result.error, "timed out") != NULL,
+	       "the timeout is the reported reason");
+	expect((after.tv_sec - before.tv_sec) * 1000 +
+			       (after.tv_nsec - before.tv_nsec) / 1000000 <
+	       5000,
+	       "the stalled run returns at its deadline, not never");
+}
+
+/* The child must not inherit the mail process's descriptors (#882). */
+static void
+test_child_inherited_fds(const char *fake)
+{
+	struct kyriakon_encrypt_result result;
+	char path[] = "/tmp/kyriakon-fds.XXXXXX";
+	char listed[64] = "";
+	unsigned char input[16];
+	int temporary, sentinel, log;
+	ssize_t got;
+	bool ok;
+
+	memset(input, 'x', sizeof(input));
+	temporary = mkstemp(path);
+	expect(temporary >= 0, "the fd log path is created");
+	if (temporary < 0)
+		return;
+	close(temporary);
+	sentinel = open("/dev/null", O_RDONLY);
+	expect(sentinel >= 0, "a sentinel descriptor is opened");
+	setenv("KYRIAKON_FAKE_MODE", "fds", 1);
+	setenv("KYRIAKON_FAKE_FD_LOG", path, 1);
+	ok = kyriakon_encrypt_message(fake, "alice", "/keyring", "/gpg", input,
+				      sizeof(input), &result);
+	unsetenv("KYRIAKON_FAKE_FD_LOG");
+	mode(NULL);
+	if (sentinel >= 0)
+		close(sentinel);
+	expect(ok, "the fd-reporting child runs");
+	if (ok)
+		free(result.ciphertext);
+	log = open(path, O_RDONLY);
+	expect(log >= 0, "the child left its descriptor list");
+	if (log >= 0) {
+		got = read(log, listed, sizeof(listed) - 1);
+		if (got > 0)
+			listed[got] = '\0';
+		close(log);
+	}
+	unlink(path);
+	expect(strcmp(listed, "0,1,2,") == 0,
+	       "the child holds only stdin, stdout and stderr");
+}
+
+static void
+reap_sibling(int signal_number)
+{
+	int status;
+
+	(void)signal_number;
+	if (waitpid((pid_t)sibling_pid, &status, WNOHANG) ==
+	    (pid_t)sibling_pid)
+		sibling_reaped = 1;
+}
+
+/* Dovecot's SIGCHLD handler must keep working for its other children while an
+ * encryption runs (#938). */
+static void
+test_sibling_sigchld(const char *fake)
+{
+	struct sigaction handler, previous;
+	struct kyriakon_encrypt_result result;
+	unsigned char input[16];
+	int status;
+	bool ok;
+
+	memset(input, 'x', sizeof(input));
+	memset(&handler, 0, sizeof(handler));
+	handler.sa_handler = reap_sibling;
+	sigemptyset(&handler.sa_mask);
+	handler.sa_flags = SA_RESTART;
+	if (sigaction(SIGCHLD, &handler, &previous) < 0) {
+		expect(false, "the test can install a SIGCHLD handler");
+		return;
+	}
+	sibling_reaped = 0;
+	sibling_pid = fork();
+	if (sibling_pid == 0) {
+		struct timespec nap = { 0, 50 * 1000 * 1000 };
+
+		nanosleep(&nap, NULL);
+		_exit(0);
+	}
+	expect(sibling_pid > 0, "a sibling child starts");
+	mode("slow");
+	ok = kyriakon_encrypt_message_timeout(fake, "alice", "/keyring", "/gpg",
+					      input, sizeof(input), 5000,
+					      &result);
+	mode(NULL);
+	expect(ok, "the slow encryptor still succeeds");
+	if (ok)
+		free(result.ciphertext);
+	/* The handler runs when the mask is restored; give the kernel a moment. */
+	poll(NULL, 0, 50);
+	expect(sibling_reaped == 1,
+	       "the host's SIGCHLD handler reaped a sibling that exited");
+	if (!sibling_reaped && sibling_pid > 0)
+		(void)waitpid((pid_t)sibling_pid, &status, 0);
+	(void)sigaction(SIGCHLD, &previous, NULL);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -677,6 +812,9 @@ main(int argc, char **argv)
 	test_save_ordering(fake);
 	test_backend_begin_failure(fake);
 	test_plaintext_cap(fake);
+	test_stalled_child_timeout(fake);
+	test_child_inherited_fds(fake);
+	test_sibling_sigchld(fake);
 
 	free(input);
 	if (failures != 0)
