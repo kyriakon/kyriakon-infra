@@ -1931,7 +1931,7 @@ fn a_groups_application_copy_in_every_mailbox_purges_once() {
     for mailbox in ["parish-secretary", "parish-office"] {
         let copy = format!("accounts/{mailbox}/application.json");
         assert!(
-            fix.dir.join("store").join(copy).exists(),
+            fix.dir.join("store").join(&copy).exists(),
             "{mailbox} has no copy"
         );
         age_filed_at(&fix, &copy, 100);
