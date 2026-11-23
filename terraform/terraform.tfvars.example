@@ -1,4 +1,10 @@
-# Copy to terraform.tfvars and set the real value. terraform.tfvars is gitignored
-# because server_name is host-identifying. The rest have defaults; uncomment to
-# override (see variables.tf).
+# Copy to terraform.tfvars and set the real values. terraform.tfvars is gitignored
+# because server_name is host-identifying. server_name, image_id and
+# image_description have no defaults; the rest have defaults (see variables.tf).
 server_name = "example.invalid"
+
+# The reviewed provisioning image, from `hcloud image list`. The two values are
+# recorded together in docs/runbook.md and the plan fails when they disagree, so
+# the placeholders below cannot quietly boot the wrong disk.
+image_id          = 0
+image_description = "REPLACE_ME"

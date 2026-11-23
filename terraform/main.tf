@@ -1,10 +1,22 @@
-# Snapshots have a description, not a name - select by label and always take
-# the newest matching snapshot, so a re-snapshot after a patch cycle is picked
-# up without editing this file.
+# The provisioning image is pinned by numeric ID, never by a label selector: a
+# label is mutable, so anyone holding HCLOUD_TOKEN could give a snapshot of the
+# live box the provisioning label and have the next create boot it, disk and
+# all. The ID is reviewed in a diff instead, and the check below makes a
+# mismatched pair fail visibly at plan time.
 data "hcloud_image" "openbsd" {
-  with_selector     = var.snapshot_selector
-  most_recent       = true
-  with_architecture = "x86"
+  id = var.image_id
+}
+
+check "provisioning_image" {
+  assert {
+    condition     = data.hcloud_image.openbsd.description == var.image_description
+    error_message = "Image ${var.image_id} is described \"${data.hcloud_image.openbsd.description}\", not \"${var.image_description}\". Set both variables from `hcloud image list` and record them together in docs/runbook.md."
+  }
+
+  assert {
+    condition     = data.hcloud_image.openbsd.architecture == "x86"
+    error_message = "Image ${var.image_id} is ${data.hcloud_image.openbsd.architecture}, not x86; the server types this stack uses are x86."
+  }
 }
 
 resource "hcloud_server" "mail" {
@@ -14,13 +26,12 @@ resource "hcloud_server" "mail" {
   image       = data.hcloud_image.openbsd.id
 
   lifecycle {
-    # `image` is ForceNew in the provider, so a change to the data source is not
-    # an in-place update: it is destroy and recreate, and the server it would
+    # `image` is ForceNew in the provider, so a change to the variable is not an
+    # in-place update: it is destroy and recreate, and the server it would
     # destroy is the only copy of the mail. The live box must never be rebuilt
-    # from whatever the selector currently resolves to. The selector moves on
-    # its own as snapshots are taken and relabelled, and the existing server's
-    # image is a historical fact about when it was built, not a setting to keep
-    # in sync.
+    # by an apply. The existing server's image is a historical fact about when
+    # it was built, not a setting to keep in sync, so a newer reviewed image is
+    # picked up by a deliberate rebuild, not by a variable edit here.
     #
     # `server_type` is ignored for the same console reason as `public_net`
     # below: the provider's update path for a type change powers the server

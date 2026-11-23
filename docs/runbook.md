@@ -1111,7 +1111,15 @@ The base system and the packages move on different clocks. `syspatch` carries ba
 		hcloud server create-image --type snapshot --label kind=gold --description "kyriakon-openbsd-<rev>" <gold-server-id>
 		hcloud server delete <gold-server-id>
 
-   `terraform/variables.tf` fixes the label convention: provisioning images carry `kind=gold` and point-in-time copies of the live box carry `kind=dr`, so a copy of the live box can never be picked up for provisioning. The terraform data source reads the newest image matching `kind=gold` (`terraform/main.tf`), and the weekly restore test reads the snapshot labelled `kind=restore`. Each label must name exactly one snapshot, and the standup refuses to run when two snapshots carry its label, because which one boots the test would otherwise be decided by the order of an API reply. Remove or relabel the snapshot that a newer one replaces.
+   Then pin the snapshot Terraform provisions from. `terraform/main.tf` reads `image_id`, not a label, and fails the plan when the image's description does not match `image_description`. Set both in `terraform/terraform.tfvars` and record them here.
+
+   | Image ID | Description | Recorded |
+   | -------- | ----------- | -------- |
+   | none     | none        | no reviewed image pinned yet |
+
+   Until that pair is set, no image is pinned, and the image the live server was created from (425837263, `kyriakon-live-20260829-213209`) is a snapshot of the live box: never use it for provisioning. Build the first pinned image by `terraform/README.md` section 1 on a throwaway box.
+
+   Labels remain an operator aid. Provisioning images carry `kind=gold` and point-in-time copies of the live box carry `kind=dr`, so `hcloud image list` can tell them apart, but a label grants no provisioning authority. The weekly restore test reads the snapshot labelled `kind=restore`, and the standup refuses to run when two snapshots carry that label, because which one boots the test would otherwise be decided by the order of an API reply. Remove or relabel the snapshot that a newer one replaces, and update the pinned pair with it.
 
 5. Audit the snapshot's age against both clocks.
 
@@ -1119,7 +1127,7 @@ The base system and the packages move on different clocks. `syspatch` carries ba
 		doas syspatch -l
 		uname -a
 
-   Compare the `created` value of the newest `kind=gold` image with the date of the last `syspatch` and `pkg_add -u` run on the box. A snapshot older than the last patch run reprovisions a box without that patch, which is the failure the re-snapshot in step 4 prevents.
+   Compare the `created` value of the newest `kind=gold` image with the date of the last `syspatch` and `pkg_add -u` run on the box. A snapshot older than the last patch run reprovisions a box without that patch, which is the failure the re-snapshot in step 4 prevents. Also check that the image the table in step 4 records is the ID and description `terraform/terraform.tfvars` names.
 
 ## Operator actions before the first payment
 

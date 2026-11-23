@@ -15,8 +15,12 @@ variable "location" {
   default     = "hel1"
 }
 
-variable "snapshot_selector" {
-  description = "Label selector matching the OpenBSD snapshot, set at `hcloud server create-image --label ...` time. Snapshots have no name; the selector is the stable handle across re-snapshots. Convention: only images meant for provisioning carry this label (`kind=gold`), while point-in-time copies of the live box are labelled `kind=dr` so they can never be picked up here."
+variable "image_id" {
+  description = "Numeric ID of the reviewed OpenBSD provisioning snapshot. Pin the ID: a label selector is mutable, so anyone holding HCLOUD_TOKEN could point it at a snapshot of the live box. Change it only after building the image on a throwaway box (terraform/README.md section 1) and recording it in docs/runbook.md."
+  type        = number
+}
+
+variable "image_description" {
+  description = "Description of the image named by image_id, as set at `create-image` time. The plan check in main.tf compares it with the description the ID resolves to, so a mistyped or stale ID shows up during plan rather than at first boot."
   type        = string
-  default     = "kind=gold"
 }
