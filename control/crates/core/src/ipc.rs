@@ -145,15 +145,9 @@ fn connect_with(socket: &Path, what: &str, timeout: Duration) -> Result<UnixStre
     Ok(stream)
 }
 
-/// Connect to a unix socket, giving up after `timeout`.
-///
-/// A plain blocking connect waits in the listener's backlog, so a handler that
-/// has stopped accepting would hang the portal before its read timeout could
-/// apply (#878). The socket is non-blocking for the connect and `poll` waits for
-/// it to finish; `SO_ERROR` says whether it succeeded.
-///
-/// [#878]: https://github.com/kyriakon/kyriakon-infra/issues/878
-fn connect_timeout(socket: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+/// The socket address and its length for `socket`. The BSD address carries its
+/// own length; Linux's does not.
+fn socket_address(socket: &Path) -> std::io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     use std::os::unix::ffi::OsStrExt;
 
     let bytes = socket.as_os_str().as_bytes();
@@ -179,7 +173,79 @@ fn connect_timeout(socket: &Path, timeout: Duration) -> std::io::Result<UnixStre
     {
         address.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
     }
+    Ok((
+        address,
+        std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+    ))
+}
 
+fn timed_out() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "the connection was not accepted in time",
+    )
+}
+
+/// Wait until `fd` is writable, or the deadline passes. `false` is the deadline.
+fn wait_writable(fd: i32, deadline: std::time::Instant) -> std::io::Result<bool> {
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        let wait = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+        let mut ready = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut ready, 1, wait) };
+        if polled > 0 {
+            return Ok(true);
+        }
+        if polled == 0 {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+/// The pending error on a socket, or zero when the connect succeeded.
+fn socket_error(fd: i32) -> std::io::Result<libc::c_int> {
+    let mut pending: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut pending as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(pending)
+}
+
+/// Connect to a unix socket, giving up after `timeout`.
+///
+/// A plain blocking connect waits in the listener's backlog, so a handler that
+/// has stopped accepting would hang the portal before its read timeout could
+/// apply (#878). The socket is non-blocking for the connect. `EINPROGRESS` waits
+/// for writability; `EAGAIN` is a full backlog, which is a retry rather than a
+/// completed connect, so the loop tries again until the deadline.
+///
+/// [#878]: https://github.com/kyriakon/kyriakon-infra/issues/878
+fn connect_timeout(socket: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    use std::time::Instant;
+
+    let (address, length) = socket_address(socket)?;
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
@@ -193,50 +259,42 @@ fn connect_timeout(socket: &Path, timeout: Duration) -> std::io::Result<UnixStre
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let connected = unsafe {
-        libc::connect(
-            fd,
-            &address as *const libc::sockaddr_un as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-        )
-    };
-    if connected != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::WouldBlock {
-            return Err(error);
-        }
-        let mut ready = libc::pollfd {
-            fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        let wait = timeout.as_millis().min(i32::MAX as u128) as i32;
-        let polled = unsafe { libc::poll(&mut ready, 1, wait) };
-        if polled == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "the connection was not accepted in time",
-            ));
-        }
-        if polled < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut pending: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        if unsafe {
-            libc::getsockopt(
+    let deadline = Instant::now() + timeout;
+    loop {
+        let connected = unsafe {
+            libc::connect(
                 fd,
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                &mut pending as *mut libc::c_int as *mut libc::c_void,
-                &mut len,
+                &address as *const libc::sockaddr_un as *const libc::sockaddr,
+                length,
             )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error());
+        };
+        if connected == 0 {
+            break;
         }
-        if pending != 0 {
-            return Err(std::io::Error::from_raw_os_error(pending));
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINPROGRESS) => {
+                if !wait_writable(fd, deadline)? {
+                    return Err(timed_out());
+                }
+                let pending = socket_error(fd)?;
+                if pending != 0 {
+                    return Err(std::io::Error::from_raw_os_error(pending));
+                }
+                break;
+            }
+            Some(libc::EAGAIN) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(timed_out());
+                }
+                // The backlog is full. Waiting a little and trying again is what
+                // a blocking connect does in the kernel, and it keeps the poll
+                // branch above for a connect that is genuinely in progress.
+                std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
+            }
+            Some(libc::EINTR) => continue,
+            _ => return Err(error),
         }
     }
     // Back to blocking for the read and write timeouts.
@@ -469,6 +527,61 @@ mod tests {
             "the failure names the boundary: {why}"
         );
         handler.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A listener whose queue is full never accepts, so the connect itself must
+    /// end at the bound rather than waiting for a reply. This is the case the
+    /// read timeout cannot see ([#878]).
+    ///
+    /// Linux only: macOS's AF_UNIX accepts connections past the listen backlog,
+    /// so a full queue cannot be built there and the read timeout is the only
+    /// bound that can fire.
+    ///
+    /// [#878]: https://github.com/kyriakon/kyriakon-infra/issues/878
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_connect_queue_times_out() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::time::Instant;
+
+        let dir = std::env::temp_dir().join(format!("onboard-portal-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("portal.sock");
+
+        let (address, length) = socket_address(&path).unwrap();
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "a socket");
+        let _listener = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert_eq!(
+            unsafe {
+                libc::bind(
+                    fd,
+                    &address as *const libc::sockaddr_un as *const libc::sockaddr,
+                    length,
+                )
+            },
+            0,
+            "bind {}",
+            path.display()
+        );
+        // A queue of zero holds one pending connection and no more, so one
+        // client fills it.
+        assert_eq!(unsafe { libc::listen(fd, 0) }, 0, "listen");
+
+        let _held = UnixStream::connect(&path).unwrap();
+        let started = Instant::now();
+        let why = ask(&path, None, "abcdefghjkmnpqrstvwxyz0123").unwrap_err();
+        let waited = started.elapsed();
+        assert!(
+            waited < TIMEOUT + Duration::from_secs(3),
+            "the connect did not end near its bound: {waited:?}"
+        );
+        assert!(
+            why.to_string().contains("not accepted in time"),
+            "the failure is the connect, not the read: {why}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

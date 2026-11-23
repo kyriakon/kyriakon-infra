@@ -149,6 +149,8 @@ fn run() -> Result<Departure, Error> {
     };
     let mode = forced.unwrap_or_else(chosen);
     let mut term = Term::new(mode);
+    let mut screen =
+        tui::SessionOut::timed(std::io::stdout(), tui::IDLE_TIMEOUT, tui::SESSION_LIFETIME);
     let flow = tui::Flow {
         questions: &questions,
         reserved: &reserved,
@@ -160,7 +162,7 @@ fn run() -> Result<Departure, Error> {
         &mut term,
         &mut status,
         &mut filing,
-        &mut std::io::stdout(),
+        &mut screen,
     )?;
     // A filed application logged itself in `file`; every other ending abandons
     // the session and files nothing.

@@ -174,7 +174,7 @@ impl Sessions {
             }));
         };
 
-        let prefix = format!("{}@", bucket(address));
+        let prefix = session_prefix(address);
         let mut held = 0;
         let mut total = 0;
         for entry in fs::read_dir(dir)
@@ -236,7 +236,7 @@ impl Drop for Sessions {
 ///
 /// [#930]: https://github.com/kyriakon/kyriakon-infra/issues/930
 fn bucket(address: IpAddr) -> String {
-    match address {
+    match address.to_canonical() {
         IpAddr::V4(v4) => format!("v4-{v4}"),
         IpAddr::V6(v6) => {
             let mut key = String::from("v6-");
@@ -246,6 +246,12 @@ fn bucket(address: IpAddr) -> String {
             key
         }
     }
+}
+
+/// The file-name prefix one session of `address` uses. The family rule lives
+/// here so the race reproducer, which counts files by hand, cannot drift from it.
+pub fn session_prefix(address: IpAddr) -> String {
+    format!("{}@", bucket(address))
 }
 
 /// Lock one file, or say which one could not be locked.
@@ -404,19 +410,22 @@ pub struct Reader<R: Read> {
     watch: Option<Watch>,
 }
 
-/// One session's deadline. `poll` waits for input with the shorter of the two
-/// remaining times, so an idle reader wakes at its idle limit and a busy one
-/// still ends at the lifetime limit.
+/// One session's deadline. `poll` waits for the input or output it is asked
+/// about with the shorter of the two remaining times, so an idle session wakes at
+/// its idle limit and a busy one still ends at the lifetime limit.
 struct Watch {
     fd: i32,
     idle: Duration,
     started: Instant,
     lifetime: Duration,
-    last_read: Instant,
+    last_activity: Instant,
 }
 
 impl Watch {
-    fn wait(&mut self) -> Result<(), Error> {
+    /// Wait until `events` is ready on the fd, or a deadline passes. `events` is
+    /// `POLLIN` for the session's input and `POLLOUT` for its screen: either one
+    /// making progress is activity.
+    fn wait(&mut self, events: libc::c_short) -> Result<(), Error> {
         loop {
             let now = Instant::now();
             let lifetime_end = self.started + self.lifetime;
@@ -425,7 +434,7 @@ impl Watch {
                     "the session has reached its maximum length".to_string(),
                 ));
             }
-            let idle_end = self.last_read + self.idle;
+            let idle_end = self.last_activity + self.idle;
             if now >= idle_end {
                 return Err(Error::Failed(
                     "the session was idle for too long".to_string(),
@@ -434,13 +443,14 @@ impl Watch {
             let wait = (idle_end - now).min(lifetime_end - now);
             let mut ready = libc::pollfd {
                 fd: self.fd,
-                events: libc::POLLIN,
+                events,
                 revents: 0,
             };
             // Rounded up so a sub-millisecond remainder cannot spin the poll.
             let millis = wait.as_millis().max(1).min(i32::MAX as u128) as i32;
             let polled = unsafe { libc::poll(&mut ready, 1, millis) };
             if polled > 0 {
+                self.last_activity = Instant::now();
                 return Ok(());
             }
             if polled < 0 {
@@ -486,30 +496,63 @@ impl<R: Read> Reader<R> {
                 idle,
                 started: now,
                 lifetime,
-                last_read: now,
+                last_activity: now,
             }),
         }
     }
 
     /// Wait for at least one byte, and say whether there is one. `false` is a
     /// connection that closed.
+    ///
+    /// A timed reader reads its descriptor directly. The inner reader may be a
+    /// `BufReader`, which can hold bytes left from a read larger than this
+    /// buffer; polling the fd would then block on an empty descriptor while the
+    /// bytes sit in userspace. An untimed reader is an in-memory one in a test,
+    /// and keeps the plain read.
     fn hold(&mut self) -> Result<bool, Error> {
         while self.held_at == self.held_len {
-            if let Some(watch) = &mut self.watch {
-                watch.wait()?;
-            }
-            let n = match self.inner.read(&mut self.held) {
-                Ok(0) => return Ok(false),
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    return Err(Error::Failed(format!(
-                        "cannot read the session's input: {e}"
-                    )))
+            let fd = match &mut self.watch {
+                Some(watch) => {
+                    watch.wait(libc::POLLIN)?;
+                    Some(watch.fd)
                 }
+                None => None,
             };
-            if let Some(watch) = &mut self.watch {
-                watch.last_read = Instant::now();
+            let n = match fd {
+                Some(fd) => loop {
+                    // SAFETY: the descriptor is the session's own and the buffer
+                    // is this reader's, writable for its whole length.
+                    let read = unsafe {
+                        libc::read(
+                            fd,
+                            self.held.as_mut_ptr() as *mut libc::c_void,
+                            self.held.len(),
+                        )
+                    };
+                    if read >= 0 {
+                        break read as usize;
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(Error::Failed(format!(
+                        "cannot read the session's input: {error}"
+                    )));
+                },
+                None => match self.inner.read(&mut self.held) {
+                    Ok(0) => return Ok(false),
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        return Err(Error::Failed(format!(
+                            "cannot read the session's input: {e}"
+                        )))
+                    }
+                },
+            };
+            if n == 0 {
+                return Ok(false);
             }
             self.held_at = 0;
             self.held_len = n;
@@ -597,7 +640,7 @@ pub fn run(
     input: &mut dyn Input,
     status: &mut dyn StatusSource,
     filing: &mut dyn Filing,
-    out: &mut dyn Write,
+    out: &mut dyn Output,
 ) -> Result<Departure, Error> {
     if rows.is_empty() {
         return Err(Error::Failed(format!(
@@ -903,7 +946,7 @@ fn application(
     mode: Mode,
     input: &mut dyn Input,
     filing: &mut dyn Filing,
-    out: &mut dyn Write,
+    out: &mut dyn Output,
 ) -> Result<Departure, Error> {
     let mut draft = draft::Draft::new(String::new());
     let mut index = 0;
@@ -1321,7 +1364,7 @@ https://{}.\n",
 
 /// The token the reader pasted, or `None` when they left the prompt empty and
 /// want the first screen back.
-fn token_word(input: &mut dyn Input, out: &mut dyn Write) -> Result<Option<String>, Error> {
+fn token_word(input: &mut dyn Input, out: &mut dyn Output) -> Result<Option<String>, Error> {
     put(
         out,
         "\nPaste the token from your status link, or press Enter to go back.\n",
@@ -1353,7 +1396,7 @@ fn token_word(input: &mut dyn Input, out: &mut dyn Write) -> Result<Option<Strin
 fn show_status(
     status: &mut dyn StatusSource,
     token: &str,
-    out: &mut dyn Write,
+    out: &mut dyn Output,
 ) -> Result<(), Error> {
     // A handler that is not answering is a screen, not the end of the session: the
     // reader can still use the menu, and a restart is the operator's repair. The
@@ -1369,19 +1412,81 @@ fn show_status(
 /// Paint a screen: the drawing mode clears the terminal first, because every
 /// screen here is a whole one. The line mode writes nothing but the screen's own
 /// words.
-fn paint(mode: Mode, out: &mut dyn Write, text: &str) -> Result<(), Error> {
+fn paint(mode: Mode, out: &mut dyn Output, text: &str) -> Result<(), Error> {
     if mode == Mode::Full {
         put(out, CLEAR)?;
     }
     put(out, text)
 }
 
+/// The session's screen. Writing is the other half of the deadline: a client
+/// that advertises a small window and never reads leaves a blocking write
+/// waiting, so a real writer polls before it writes and the session ends at the
+/// same idle or lifetime limit as its input.
+pub trait Output: Write {
+    /// Write one screen. The default is an in-memory writer or a test's buffer;
+    /// a session over a terminal overrides it with the deadline.
+    fn put(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.write_all(bytes)
+            .and_then(|()| self.flush())
+            .map_err(|e| Error::context("cannot write to the session", e))
+    }
+}
+
+impl Output for Vec<u8> {}
+
+/// A session's stdout, with the session's deadline applied before each screen.
+pub struct SessionOut<W: Write> {
+    inner: W,
+    watch: Option<Watch>,
+}
+
+impl<W: Write + AsRawFd> SessionOut<W> {
+    /// A writer bounded by the session's idle and lifetime limits. Both watches
+    /// (input and screen) start here, so a session cannot outlive the lifetime by
+    /// writing without reading, or by reading without writing.
+    pub fn timed(inner: W, idle: Duration, lifetime: Duration) -> SessionOut<W> {
+        let fd = inner.as_raw_fd();
+        let now = Instant::now();
+        SessionOut {
+            inner,
+            watch: Some(Watch {
+                fd,
+                idle,
+                started: now,
+                lifetime,
+                last_activity: now,
+            }),
+        }
+    }
+}
+
+impl<W: Write> Write for SessionOut<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> Output for SessionOut<W> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if let Some(watch) = &mut self.watch {
+            watch.wait(libc::POLLOUT)?;
+        }
+        self.inner
+            .write_all(bytes)
+            .and_then(|()| self.inner.flush())
+            .map_err(|e| Error::context("cannot write to the session", e))
+    }
+}
+
 /// Write a screen and flush, because the next thing this program does is wait for
 /// a reader to answer it.
-fn put(out: &mut dyn Write, text: &str) -> Result<(), Error> {
-    out.write_all(text.as_bytes())
-        .and_then(|()| out.flush())
-        .map_err(|e| Error::context("cannot write to the session", e))
+fn put(out: &mut dyn Output, text: &str) -> Result<(), Error> {
+    out.put(text.as_bytes())
 }
 
 #[cfg(test)]
@@ -2936,6 +3041,114 @@ mod tests {
         drop(second);
     }
 
+    /// A timed reader reads its descriptor directly, so bytes a `BufReader`
+    /// holds past this reader's buffer are consumed rather than left behind a
+    /// poll that would block ([#930]).
+    ///
+    /// [#930]: https://github.com/kyriakon/kyriakon-infra/issues/930
+    #[test]
+    fn a_timed_reader_drains_a_paste_larger_than_its_buffer() {
+        use std::io::Write;
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+
+        let (mut writer, connection) = UnixStream::pair().unwrap();
+        let text: String = (0..500)
+            .map(|i| format!("line {i:04} {}\n", "x".repeat(8)))
+            .collect();
+        assert!(text.len() > 4096, "the fixture spans more than one read");
+        // A socket buffer is smaller than the paste, so the writer must not run
+        // on the reader's thread or the fixture deadlocks on its own size.
+        let expected = text.clone();
+        let sender = std::thread::spawn(move || {
+            writer.write_all(expected.as_bytes()).unwrap();
+            writer.shutdown(Shutdown::Write).unwrap();
+        });
+
+        // A buffered reader like the `Stdin` the real session passes, whose
+        // buffer can hold bytes past this reader's own.
+        struct Buffered<R>(std::io::BufReader<R>);
+        impl<R: Read> Read for Buffered<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+        impl<R: std::os::fd::AsRawFd> std::os::fd::AsRawFd for Buffered<R> {
+            fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                std::os::fd::AsRawFd::as_raw_fd(self.0.get_ref())
+            }
+        }
+
+        let mut reader = Reader::timed(
+            Buffered(std::io::BufReader::new(connection)),
+            Duration::from_secs(3),
+            Duration::from_secs(10),
+        );
+        let mut seen = String::new();
+        let mut lines = 0;
+        while let Some(word) = reader.word().unwrap() {
+            let Word::Line(line) = word else {
+                panic!("a fixture line is over the cap")
+            };
+            seen.push_str(&line);
+            seen.push('\n');
+            lines += 1;
+        }
+        assert_eq!(lines, 500, "every line was consumed");
+        assert_eq!(seen, text);
+        sender.join().unwrap();
+    }
+
+    /// A screen that cannot be written ends at the same deadline as a stalled
+    /// read, so a client that never drains its window cannot hold the slot
+    /// ([#930]).
+    ///
+    /// [#930]: https://github.com/kyriakon/kyriakon-infra/issues/930
+    #[test]
+    fn a_screen_that_cannot_be_written_ends_at_the_deadline() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let (mut writer, _peer) = UnixStream::pair().unwrap();
+        // Fill the pair so the screen's poll has no room to report. The peer is
+        // kept open and never reads.
+        writer.set_nonblocking(true).unwrap();
+        let chunk = [0u8; 8192];
+        loop {
+            match writer.write(&chunk) {
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("cannot fill the pair: {e}"),
+            }
+        }
+        writer.set_nonblocking(false).unwrap();
+
+        let mut out = SessionOut::timed(writer, Duration::from_millis(100), Duration::from_secs(5));
+        let why = out.put(b"a screen the client will not read").unwrap_err();
+        assert!(
+            why.to_string().contains("idle"),
+            "the write deadline ended the session: {why}"
+        );
+    }
+
+    /// A read that has not reached its idle limit still ends at the session's
+    /// lifetime, so one connection cannot hold a slot indefinitely ([#930]).
+    ///
+    /// [#930]: https://github.com/kyriakon/kyriakon-infra/issues/930
+    #[test]
+    fn a_session_reader_ends_at_its_lifetime() {
+        use std::os::unix::net::UnixStream;
+
+        // The idle limit is far away, so the lifetime is what ends this read.
+        let (silent, _client) = UnixStream::pair().unwrap();
+        let mut reader = Reader::timed(silent, Duration::from_secs(30), Duration::from_millis(100));
+        let why = reader.word().unwrap_err();
+        assert!(
+            why.to_string().contains("maximum length"),
+            "the lifetime ended the session: {why}"
+        );
+    }
+
     /// An IPv6 client controls a whole `/64`, so the per-address cap counts that
     /// prefix rather than each address inside it ([#930]).
     ///
@@ -2966,6 +3179,35 @@ mod tests {
                 Admission::Open(_)
             ),
             "another /64 was counted against this one"
+        );
+        drop(a);
+        drop(b);
+    }
+
+    /// An IPv4-mapped address is an IPv4 client, so it must share the IPv4
+    /// bucket rather than the all-zero `/64` ([#930]).
+    ///
+    /// [#930]: https://github.com/kyriakon/kyriakon-infra/issues/930
+    #[test]
+    fn an_ipv4_mapped_address_counts_as_its_ipv4_client() {
+        let dir = scratch("mapped");
+        let mapped: IpAddr = "::ffff:198.51.100.7".parse().unwrap();
+        let plain: IpAddr = "198.51.100.7".parse().unwrap();
+        assert_eq!(
+            session_prefix(mapped),
+            session_prefix(plain),
+            "the mapped form has its own bucket"
+        );
+
+        let Admission::Open(a) = Sessions::open(&dir, Some(mapped)).unwrap() else {
+            panic!("the mapped session was refused");
+        };
+        let Admission::Open(b) = Sessions::open(&dir, Some(plain)).unwrap() else {
+            panic!("the plain session was refused");
+        };
+        assert!(
+            matches!(Sessions::open(&dir, Some(plain)).unwrap(), Admission::Busy),
+            "the third session in one IPv4 bucket was allowed"
         );
         drop(a);
         drop(b);

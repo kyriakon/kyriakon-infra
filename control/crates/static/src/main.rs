@@ -56,22 +56,26 @@ const ALIAS_MAX: u64 = 4096;
 /// body record is therefore refused on its first byte rather than drained.
 const MAX_BODY: usize = 0;
 
-/// How long one connection may take, from accept to the reply's last byte. It
-/// bounds both the request read and the file write, so a front-end that stops
-/// reading is gone by it rather than holding a descriptor.
+/// How long one request read, or one reply record's write, may take. It is not a
+/// total accept-to-last-byte timeout: a member file is streamed with client
+/// backpressure, and a 16 MiB transfer slower than 2.2 Mbps would fail a total
+/// 60-second deadline partway through. Each record must be accepted within this
+/// time and the timer starts again for the next, so a client that stops reading
+/// is dropped and one that keeps reading is served.
 const DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Connections served at once on one listener. The permit is taken before a
 /// task is spawned, so a flood costs the backlog and one socket.
 ///
-/// Two listeners at 24 each is 48 of the login class's `openfiles-cur=128`; the
-/// rest is the process's own descriptors and each member file's. A single pool
-/// shared by both listeners was 64 and left no room once open files were
-/// counted ([#877]). The test `the_listener_budgets_fit_the_login_class` holds
-/// the arithmetic.
-///
-/// [#877]: https://github.com/kyriakon/kyriakon-infra/issues/877
-const CONNECTIONS: usize = 24;
+/// Twenty-four was too many once each connection's descriptors were counted.
+/// A served file holds the accepted socket, the served file and, while the path
+/// is resolved, the directory descriptor it is opening through. With an extra
+/// accepted socket waiting for a permit and the listener itself, one listener's
+/// worst case is `3 * CONNECTIONS + 2`. Two listeners plus the process's own
+/// files must fit `openfiles-cur=128`, so the count is 14: 32 reserved + 2 *
+/// (3 * 14 + 2) = 120, leaving eight descriptors spare. The test
+/// `the_listener_budgets_fit_the_login_class` holds that arithmetic.
+const CONNECTIONS: usize = 14;
 
 #[derive(Clone, serde::Deserialize)]
 struct Config {
@@ -242,10 +246,10 @@ async fn run() -> Result<(), Error> {
         cfg.gemini_socket.display(),
         cfg.root.display()
     ));
-    let limits = fastcgi::Limits {
+    let limits = kyriakon_control_core::socket::Limits {
         connections: CONNECTIONS,
         deadline: DEADLINE,
-        body_cap: MAX_BODY,
+        program: "kyriakon-control-static",
     };
     let listen = |front_end: FrontEnd| {
         let cfg = cfg.clone();
@@ -264,7 +268,7 @@ async fn run() -> Result<(), Error> {
         }
     };
     let httpd = async {
-        fastcgi::serve(&cfg.httpd_socket, limits, listen(FrontEnd::Httpd))
+        fastcgi::serve(&cfg.httpd_socket, limits, MAX_BODY, listen(FrontEnd::Httpd))
             .await
             .map_err(|source| Error::Io {
                 what: "serve",
@@ -273,13 +277,18 @@ async fn run() -> Result<(), Error> {
             })
     };
     let gemini = async {
-        fastcgi::serve(&cfg.gemini_socket, limits, listen(FrontEnd::Gemini))
-            .await
-            .map_err(|source| Error::Io {
-                what: "serve",
-                path: Some(cfg.gemini_socket.clone()),
-                source,
-            })
+        fastcgi::serve(
+            &cfg.gemini_socket,
+            limits,
+            MAX_BODY,
+            listen(FrontEnd::Gemini),
+        )
+        .await
+        .map_err(|source| Error::Io {
+            what: "serve",
+            path: Some(cfg.gemini_socket.clone()),
+            source,
+        })
     };
     tokio::try_join!(httpd, gemini).map(|_| ())
 }
@@ -369,9 +378,7 @@ fn answer(cfg: &Config, front_end: FrontEnd, request: &Request) -> (Answer, Stri
             )
         }
         Ok(Served::Redirect) => (Answer::Reply(redirect(front_end, &host, &path)), route),
-        // Both refusals are the same answer: a client that could tell "no such
-        // file" from "not a file" would learn which of its guesses resolved.
-        Err(Refusal::Missing | Refusal::NotAFile) => (Answer::Reply(refuse(front_end)), route),
+        Err(refusal) => (Answer::Reply(refusal_reply(front_end, refusal)), route),
     }
 }
 
@@ -506,6 +513,35 @@ fn refuse(front_end: FrontEnd) -> Reply {
     match front_end {
         FrontEnd::Httpd => Reply::file(404, "text/plain; charset=utf-8", b"Not found\n".to_vec()),
         FrontEnd::Gemini => Reply::gemini(51, "Not found", ""),
+    }
+}
+
+/// The reply for a refusal. A missing name and a name that is not a file are the
+/// same 404: a client that could tell them apart would learn which of its guesses
+/// resolved. An exhausted descriptor table is the process's own failure, so it is
+/// a 503 and one line in the log rather than a 404 that hides it ([#877]).
+///
+/// [#877]: https://github.com/kyriakon/kyriakon-infra/issues/877
+fn refusal_reply(front_end: FrontEnd, refusal: Refusal) -> Reply {
+    match refusal {
+        Refusal::Missing | Refusal::NotAFile => refuse(front_end),
+        Refusal::Exhausted => {
+            util::log("kyriakon-control-static: cannot open a member's file: no descriptors left");
+            busy(front_end)
+        }
+    }
+}
+
+/// A temporary failure: the process cannot open one more file, and the same
+/// request may work on the next attempt.
+fn busy(front_end: FrontEnd) -> Reply {
+    match front_end {
+        FrontEnd::Httpd => Reply::file(
+            503,
+            "text/plain; charset=utf-8",
+            b"Temporarily unavailable\n".to_vec(),
+        ),
+        FrontEnd::Gemini => Reply::gemini(40, "Temporarily unavailable", ""),
     }
 }
 
@@ -650,7 +686,7 @@ mod tests {
         let (answer, _) = answer(cfg, front_end, request);
         let code = answer.code();
         let mut out = Vec::new();
-        answer.write_to(&mut out, 1).await.unwrap();
+        answer.write_to(&mut out, 1, None).await.unwrap();
         let (body, _) = fixture::reply(&out);
         (code, String::from_utf8_lossy(&body).into_owned())
     }
@@ -1063,16 +1099,38 @@ mod tests {
         assert_eq!(uri("/a%zz"), "/a%zz");
     }
 
-    /// Both listeners' permits fit the login class's 128 descriptors once the
-    /// process's own files are set aside. A pool sized without the open member
-    /// files is what #877 was.
+    /// A full descriptor table is the server's failure, so it must not be
+    /// disguised as a missing file on either front end ([#877]).
+    ///
+    /// [#877]: https://github.com/kyriakon/kyriakon-infra/issues/877
+    #[test]
+    fn an_exhausted_descriptor_table_is_a_503_not_a_404() {
+        assert_eq!(
+            refusal_reply(FrontEnd::Httpd, Refusal::Exhausted).code(),
+            503
+        );
+        assert_eq!(
+            refusal_reply(FrontEnd::Gemini, Refusal::Exhausted).code(),
+            40
+        );
+        assert_eq!(refusal_reply(FrontEnd::Httpd, Refusal::Missing).code(), 404);
+        assert_eq!(
+            refusal_reply(FrontEnd::Httpd, Refusal::NotAFile).code(),
+            404
+        );
+    }
+
+    /// The whole process's descriptor worst case, not just the permit count: a
+    /// served file holds its socket, the file and the directory it is resolved
+    /// through, plus one accepted socket waiting for a permit and the listener,
+    /// on each of two listeners.
     #[test]
     fn the_listener_budgets_fit_the_login_class() {
-        use kyriakon_control_core::fastcgi::{OPEN_FILES, RESERVED_FILES};
-        let held = 2 * CONNECTIONS;
+        use kyriakon_control_core::socket::{OPEN_FILES, RESERVED_FILES};
+        let held = RESERVED_FILES + 2 * (3 * CONNECTIONS + 2);
         assert!(
-            held <= OPEN_FILES - RESERVED_FILES,
-            "{held} connection permits do not fit in {OPEN_FILES} descriptors"
+            held <= OPEN_FILES,
+            "{held} descriptors do not fit in {OPEN_FILES}"
         );
     }
 }

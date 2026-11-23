@@ -15,6 +15,7 @@ pub mod intent;
 pub mod ipc;
 pub mod mail;
 pub mod payments;
+pub mod socket;
 pub mod store;
 pub mod util;
 

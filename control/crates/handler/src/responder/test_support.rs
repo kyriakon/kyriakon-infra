@@ -93,7 +93,7 @@ pub(crate) async fn ask(app: &App, bytes: &[u8]) -> (u16, String) {
     let code = outcome.reply.code();
     let mut out = Vec::new();
     fastcgi::Answer::Reply(outcome.reply)
-        .write_to(&mut out, request.id())
+        .write_to(&mut out, request.id(), None)
         .await
         .expect("the reply is written");
     let (body, last) = fixture::reply(&out);

@@ -274,12 +274,13 @@ struct Outcome {
 /// TCP and a permit timeout there closes the socket rather than queueing it.
 pub async fn serve(cfg: config::Config) -> Result<(), Error> {
     let app = Arc::new(App::load(cfg).await?);
-    let portal =
-        crate::fastcgi::bind(Path::new(&app.cfg.portal_socket)).map_err(|source| Error::Io {
+    let portal = kyriakon_control_core::socket::bind(Path::new(&app.cfg.portal_socket)).map_err(
+        |source| Error::Io {
             what: "listen on",
             path: Some(app.cfg.portal_socket.clone().into()),
             source,
-        })?;
+        },
+    )?;
     let titan = TcpListener::bind(&app.cfg.titan_listener)
         .await
         .map_err(|source| Error::Io {
@@ -296,10 +297,10 @@ pub async fn serve(cfg: config::Config) -> Result<(), Error> {
         app.cfg.store_root,
         app.questions.len()
     ));
-    let limits = crate::fastcgi::Limits {
+    let limits = kyriakon_control_core::socket::Limits {
         connections: FRONTEND_CONNECTIONS,
         deadline: FRONTEND_TIMEOUT,
-        body_cap: MAX_BODY,
+        program: "kyriakon-control",
     };
     tokio::try_join!(
         serve_front_end(app.cfg.httpd_socket.clone(), limits, app.clone()),
@@ -313,10 +314,10 @@ pub async fn serve(cfg: config::Config) -> Result<(), Error> {
 /// Answer one FastCGI listener for the life of the process.
 async fn serve_front_end(
     path: String,
-    limits: crate::fastcgi::Limits,
+    limits: kyriakon_control_core::socket::Limits,
     app: Arc<App>,
 ) -> Result<(), Error> {
-    crate::fastcgi::serve(Path::new(&path), limits, move |request| {
+    crate::fastcgi::serve(Path::new(&path), limits, MAX_BODY, move |request| {
         let app = app.clone();
         async move { connection::fastcgi_answer(app, request).await }
     })
@@ -330,16 +331,23 @@ async fn serve_front_end(
 
 /// Answer the portal's line protocol for the life of the process.
 async fn portal_listener(listener: tokio::net::UnixListener, app: Arc<App>) -> Result<(), Error> {
-    crate::fastcgi::accept(
+    kyriakon_control_core::socket::accept(
         listener,
-        PORTAL_CONNECTIONS,
-        PORTAL_TIMEOUT,
+        kyriakon_control_core::socket::Limits {
+            connections: PORTAL_CONNECTIONS,
+            deadline: PORTAL_TIMEOUT,
+            program: "kyriakon-control",
+        },
         "portal",
         move |stream| {
             let app = app.clone();
             async move {
-                if let Err(e) = portal_connection(stream, &app).await {
-                    e.report("serving a portal connection");
+                match tokio::time::timeout(PORTAL_TIMEOUT, portal_connection(stream, &app)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => e.report("serving a portal connection"),
+                    Err(_) => kyriakon_control_core::util::log(
+                        "kyriakon-control: the portal connection timed out",
+                    ),
                 }
             }
         },
@@ -410,7 +418,7 @@ mod tests {
     /// [#877]: https://github.com/kyriakon/kyriakon-infra/issues/877
     #[test]
     fn the_listener_budgets_fit_the_login_class() {
-        use kyriakon_control_core::fastcgi::{OPEN_FILES, RESERVED_FILES};
+        use kyriakon_control_core::socket::{OPEN_FILES, RESERVED_FILES};
         let held = 2 * FRONTEND_CONNECTIONS + PORTAL_CONNECTIONS + TITAN_CONNECTIONS;
         assert!(
             held <= OPEN_FILES - RESERVED_FILES,

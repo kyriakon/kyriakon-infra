@@ -36,28 +36,14 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Semaphore;
+use tokio::net::UnixStream;
 
-/// The descriptors the daemons may hold: the `daemon` login class gives them
-/// `openfiles-cur=128`, and each listener's permit count is a slice of it.
-pub const OPEN_FILES: usize = 128;
-
-/// What the process keeps outside its listeners: the store's files, the config,
-/// the log and the standard streams. The listener budgets must fit in what is
-/// left.
-pub const RESERVED_FILES: usize = 32;
-
-/// How long the accept loop waits after an error it cannot attribute to a dead
-/// connection. A full descriptor table (`EMFILE`, `ENFILE`) leaves the backlog
-/// as ready as it was, so an unpaused retry would spin.
-const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+use crate::socket;
 
 /// The version byte of the FastCGI specification this speaks. A record that does
 /// not carry it is not a record this responder can read, so the connection fails
@@ -595,14 +581,15 @@ pub async fn write_reply<W: AsyncWrite + Unpin>(
     head: &[u8],
     body: Body<'_>,
     id: u16,
+    deadline: Option<Duration>,
 ) -> std::io::Result<()> {
     for chunk in head.chunks(MAX_CONTENT) {
-        put_record(writer, STDOUT, id, chunk).await?;
+        put_record(writer, STDOUT, id, chunk, deadline).await?;
     }
     match body {
         Body::Bytes(bytes) => {
             for chunk in bytes.chunks(MAX_CONTENT) {
-                put_record(writer, STDOUT, id, chunk).await?;
+                put_record(writer, STDOUT, id, chunk, deadline).await?;
             }
         }
         Body::File(file, len) => {
@@ -624,47 +611,53 @@ pub async fn write_reply<W: AsyncWrite + Unpin>(
                     ));
                 }
                 left -= read as u64;
-                put_record(writer, STDOUT, id, &buf[..read]).await?;
+                put_record(writer, STDOUT, id, &buf[..read], deadline).await?;
             }
         }
     }
-    put_record(writer, END_REQUEST, id, &[0; 8]).await?;
-    writer.flush().await
+    put_record(writer, END_REQUEST, id, &[0; 8], deadline).await?;
+    match deadline {
+        Some(limit) => tokio::time::timeout(limit, writer.flush())
+            .await
+            .map_err(|_| {
+                std::io::Error::new(ErrorKind::TimedOut, "the reply was not sent in time")
+            })?,
+        None => writer.flush().await,
+    }
 }
 
 /// One record, written header then content: the bytes go straight to the socket
 /// rather than through a buffer the size of the chunk, so streaming a file costs
 /// the read buffer and nothing else.
+///
+/// `deadline` bounds this record's write. It is applied per record rather than to
+/// the whole reply, so a client that keeps accepting records is not dropped for
+/// being slow overall; a client that stops accepting one is.
 async fn put_record<W: AsyncWrite + Unpin>(
     writer: &mut W,
     kind: u8,
     id: u16,
     content: &[u8],
+    deadline: Option<Duration>,
 ) -> std::io::Result<()> {
     let mut header = [0u8; HEADER];
     header[0] = VERSION;
     header[1] = kind;
     header[2..4].copy_from_slice(&id.to_be_bytes());
     header[4..6].copy_from_slice(&(content.len() as u16).to_be_bytes());
-    writer.write_all(&header).await?;
-    if !content.is_empty() {
-        writer.write_all(content).await?;
+    let record = async {
+        writer.write_all(&header).await?;
+        if !content.is_empty() {
+            writer.write_all(content).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    match deadline {
+        Some(limit) => tokio::time::timeout(limit, record).await.map_err(|_| {
+            std::io::Error::new(ErrorKind::TimedOut, "the record was not sent in time")
+        })?,
+        None => record.await,
     }
-    Ok(())
-}
-
-/// What one listener may serve, and for how long.
-#[derive(Clone, Copy, Debug)]
-pub struct Limits {
-    /// Requests served at once on this listener. Each one holds a descriptor,
-    /// so the four listeners' counts must fit in the login class's file table.
-    pub connections: usize,
-    /// The longest one connection may take, from accept to its last byte. It
-    /// bounds both the request read and the reply write, so a peer that stalls
-    /// either half is gone by it.
-    pub deadline: Duration,
-    /// The most of a request body this listener accepts.
-    pub body_cap: usize,
 }
 
 /// One request's answer: a reply already in memory, or a member's file streamed
@@ -689,149 +682,97 @@ impl Answer {
         }
     }
 
-    /// Write the answer, end marker included, to one front-end.
+    /// Write the answer, end marker included, to one front-end. `deadline` is the
+    /// longest one record may take to be accepted; a streamed file resets it for
+    /// each record, so a slow client that keeps reading is served.
     pub async fn write_to<W: AsyncWrite + Unpin>(
         self,
         writer: &mut W,
         id: u16,
+        deadline: Option<Duration>,
     ) -> std::io::Result<()> {
         match self {
             Answer::Reply(reply) => {
                 let head = reply.head_block();
-                write_reply(writer, &head, Body::Bytes(reply.body()), id).await
+                write_reply(writer, &head, Body::Bytes(reply.body()), id, deadline).await
             }
             Answer::File {
                 head,
                 mut file,
                 len,
                 ..
-            } => write_reply(writer, &head, Body::File(&mut file, len), id).await,
+            } => write_reply(writer, &head, Body::File(&mut file, len), id, deadline).await,
         }
     }
 }
 
-/// Bind `path`, replacing whatever a previous run left there, with mode 0660 so
-/// the socket directory's group decides who may connect. A socket file outlives
-/// the process that made it, so a restart after a crash would otherwise fail to
-/// bind until somebody removed it by hand. `symlink_metadata` makes a dangling
-/// symlink a file to clear rather than the `ENOENT` a following `metadata`
-/// reports, and `remove_file` unlinks the symlink itself, never its target.
-pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => std::fs::remove_file(path)?,
-        Err(source) if source.kind() == ErrorKind::NotFound => {}
-        Err(source) => return Err(source),
-    }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
-    Ok(listener)
-}
-
-/// Accept connections until the listener fails, bounding how many are served at
-/// once and how long each may take. A refusal is answered by `answer`, which
-/// receives the parsed request.
+/// Bind the socket `path` names and answer FastCGI requests until the listener
+/// fails. The socket bind, accept loop and permit count are `socket`'s; the wire
+/// and a body cap are this module's.
 ///
-/// The permit is taken before the task is spawned, so a flood costs the
-/// listening backlog and one accepted socket rather than a task and a descriptor
-/// per waiting connection.
-pub async fn serve<F, Fut>(path: &Path, limits: Limits, answer: F) -> std::io::Result<()>
+/// The deadline is applied per operation rather than to the connection as a
+/// whole: each request read and each record written must finish within it. A
+/// streamed file is therefore dropped only when the client stops accepting
+/// records, not when the whole transfer is slower than one deadline.
+pub async fn serve<F, Fut>(
+    path: &Path,
+    limits: socket::Limits,
+    body_cap: usize,
+    answer: F,
+) -> std::io::Result<()>
 where
     F: Fn(Request) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Answer> + Send + 'static,
 {
-    let listener = bind(path)?;
+    let listener = socket::bind(path)?;
     let answer = Arc::new(answer);
-    let body_cap = limits.body_cap;
-    accept(
-        listener,
-        limits.connections,
-        limits.deadline,
-        "front-end",
-        move |stream| {
-            let answer = answer.clone();
-            async move {
-                if let Err(error) = connection(stream, body_cap, &*answer).await {
-                    crate::util::log(&format!(
-                        "kyriakon-control: the fastcgi connection failed: {error}"
-                    ));
-                }
+    let deadline = limits.deadline;
+    let program = limits.program;
+    socket::accept(listener, limits, "front-end", move |stream| {
+        let answer = answer.clone();
+        async move {
+            if let Err(error) = connection(stream, body_cap, deadline, &*answer).await {
+                crate::util::log(&format!(
+                    "{program}: the fastcgi connection failed: {error}"
+                ));
             }
-        },
-    )
+        }
+    })
     .await
-}
-
-/// Serve a Unix listener at `connections` at a time, each for at most
-/// `deadline`, until the listener cannot accept. `name` is the word the timeout
-/// line carries.
-///
-/// An accept error is a connection a flood provoked, not the listener:
-/// returning it would cancel the process's other listeners, so the loop reports,
-/// waits and continues. Errors inside one connection are the closure's to log.
-pub async fn accept<F, Fut>(
-    listener: UnixListener,
-    connections: usize,
-    deadline: Duration,
-    name: &'static str,
-    served: F,
-) -> std::io::Result<()>
-where
-    F: Fn(UnixStream) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    let slots = Arc::new(Semaphore::new(connections));
-    let served = Arc::new(served);
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(error) => {
-                let wait = match error.kind() {
-                    ErrorKind::ConnectionAborted | ErrorKind::Interrupted => Duration::ZERO,
-                    _ => ACCEPT_BACKOFF,
-                };
-                crate::util::log(&format!(
-                    "kyriakon-control: cannot accept a {name} connection: {error}"
-                ));
-                tokio::time::sleep(wait).await;
-                continue;
-            }
-        };
-        let permit = match slots.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            // The semaphore is never closed while the process lives.
-            Err(_) => return Ok(()),
-        };
-        let served = served.clone();
-        tokio::spawn(async move {
-            // Held for as long as this connection is served.
-            let _permit = permit;
-            if tokio::time::timeout(deadline, served(stream))
-                .await
-                .is_err()
-            {
-                crate::util::log(&format!(
-                    "kyriakon-control: the {name} connection timed out"
-                ));
-            }
-        });
-    }
 }
 
 /// Answer the requests on one connection. Both front-ends connect for one
 /// request and close, and gmid asks for the connection to be kept in case it has
 /// another, so the loop runs until the peer closes, the request is refused for
 /// its body, or a record cannot be read.
-async fn connection<F, Fut>(stream: UnixStream, body_cap: usize, answer: &F) -> Result<(), Error>
+async fn connection<F, Fut>(
+    stream: UnixStream,
+    body_cap: usize,
+    deadline: Duration,
+    answer: &F,
+) -> Result<(), Error>
 where
     F: Fn(Request) -> Fut,
     Fut: Future<Output = Answer>,
 {
     let (mut reader, mut writer) = stream.into_split();
     loop {
-        let request = match read_request(&mut reader, body_cap).await? {
-            Some(request) => request,
-            None => return Ok(()),
-        };
+        let request =
+            match tokio::time::timeout(deadline, read_request(&mut reader, body_cap)).await {
+                Ok(result) => match result? {
+                    Some(request) => request,
+                    None => return Ok(()),
+                },
+                Err(_) => {
+                    return Err(Error::Io {
+                        what: "read a request",
+                        source: std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            "the request was not read in time",
+                        ),
+                    })
+                }
+            };
         let id = request.id();
         let keep_conn = request.keep_conn;
         // The body was not read to its end, so the bytes still on the socket
@@ -839,7 +780,7 @@ where
         let refused = request.body_too_large;
         answer(request)
             .await
-            .write_to(&mut writer, id)
+            .write_to(&mut writer, id, Some(deadline))
             .await
             .map_err(|source| Error::Io {
                 what: "write the reply",
@@ -1003,7 +944,10 @@ mod tests {
     /// A reply as the front-end reads it.
     async fn wire(reply: Reply, id: u16) -> Vec<u8> {
         let mut out = Vec::new();
-        Answer::Reply(reply).write_to(&mut out, id).await.unwrap();
+        Answer::Reply(reply)
+            .write_to(&mut out, id, None)
+            .await
+            .unwrap();
         out
     }
 
@@ -1197,14 +1141,15 @@ mod tests {
 
     fn spawn_server<F, Fut>(
         path: std::path::PathBuf,
-        limits: Limits,
+        limits: socket::Limits,
+        body_cap: usize,
         answer: F,
     ) -> tokio::task::JoinHandle<std::io::Result<()>>
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Answer> + Send + 'static,
     {
-        tokio::spawn(async move { serve(&path, limits, answer).await })
+        tokio::spawn(async move { serve(&path, limits, body_cap, answer).await })
     }
     /// Wait until the listener's path exists. `serve` binds before its first
     /// await, and the wait yields so its task runs.
@@ -1236,11 +1181,12 @@ mod tests {
         let (_dir, path) = temp_socket("body-cap");
         let server = spawn_server(
             path.clone(),
-            Limits {
+            socket::Limits {
                 connections: 1,
                 deadline: Duration::from_secs(5),
-                body_cap: 0,
+                program: "kyriakon-control",
             },
+            0,
             |_request| async { Answer::Reply(Reply::html(413, String::new())) },
         );
         wait_for(&path).await;
@@ -1273,11 +1219,12 @@ mod tests {
 
         let server = spawn_server(
             path.clone(),
-            Limits {
+            socket::Limits {
                 connections: 1,
                 deadline: Duration::from_secs(5),
-                body_cap: 0,
+                program: "kyriakon-control",
             },
+            0,
             move |_request| {
                 let file_path = file_path.clone();
                 async move {
@@ -1319,11 +1266,12 @@ mod tests {
 
         let server = spawn_server(
             path.clone(),
-            Limits {
+            socket::Limits {
                 connections: 1,
                 deadline: Duration::from_millis(150),
-                body_cap: 0,
+                program: "kyriakon-control",
             },
+            0,
             move |request| {
                 let file_path = file_path.clone();
                 async move {
@@ -1369,14 +1317,14 @@ mod tests {
     async fn each_listener_spends_its_own_permits() {
         let (_dir_a, first_path) = temp_socket("permits-a");
         let (_dir_b, second_path) = temp_socket("permits-b");
-        let limits = Limits {
+        let limits = socket::Limits {
             connections: 1,
             deadline: Duration::from_secs(30),
-            body_cap: 0,
+            program: "kyriakon-control",
         };
         let answer = |_request: Request| async { Answer::Reply(Reply::html(200, "ok".into())) };
-        let first = spawn_server(first_path.clone(), limits, answer);
-        let second = spawn_server(second_path.clone(), limits, answer);
+        let first = spawn_server(first_path.clone(), limits, 0, answer);
+        let second = spawn_server(second_path.clone(), limits, 0, answer);
         wait_for(&first_path).await;
         wait_for(&second_path).await;
 
@@ -1398,35 +1346,5 @@ mod tests {
         drop(held);
         first.abort();
         second.abort();
-    }
-
-    /// A file or a dangling symlink left at the path is cleared, and the link's
-    /// target is untouched.
-    #[tokio::test]
-    async fn bind_clears_a_file_or_a_dangling_link_at_the_path() {
-        use std::os::unix::fs::{symlink, FileTypeExt};
-
-        let (dir, path) = temp_socket("bind");
-        std::fs::write(&path, b"planted").unwrap();
-        let listener = bind(&path).expect("bind over a planted file");
-        assert!(std::fs::symlink_metadata(&path)
-            .unwrap()
-            .file_type()
-            .is_socket());
-        drop(listener);
-
-        let target = dir.join("gone");
-        std::fs::remove_file(&path).unwrap();
-        symlink(&target, &path).unwrap();
-        let listener = bind(&path).expect("bind over a dangling symlink");
-        assert!(
-            target.symlink_metadata().is_err(),
-            "the link's target is untouched"
-        );
-        assert!(std::fs::symlink_metadata(&path)
-            .unwrap()
-            .file_type()
-            .is_socket());
-        drop(listener);
     }
 }
