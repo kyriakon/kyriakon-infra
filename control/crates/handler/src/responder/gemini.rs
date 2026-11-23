@@ -189,7 +189,7 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
         .update_draft(token, |record| {
             let path = flow_path(&app.questions, &record.answers);
             if record.cursor >= path.len() {
-                return Ok((Step::File(record.clone()), false));
+                return Ok((Step::File, false));
             }
             if page != record.cursor + 1 {
                 return Ok((Step::Redirect(record.cursor + 1), false));
@@ -199,7 +199,7 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
             // past every such page rather than asking for a key already sent.
             if capsule_skip_mailed(&path, record) {
                 if record.cursor >= path.len() {
-                    return Ok((Step::File(record.clone()), true));
+                    return Ok((Step::File, true));
                 }
                 return Ok((Step::Redirect(record.cursor + 1), true));
             }
@@ -263,7 +263,9 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
 
             let next = flow_path(&app.questions, &record.answers);
             if record.cursor >= next.len() {
-                return Ok((Step::File(record.clone()), false));
+                // Save the last answer before completing, so the filing step
+                // reads the whole record under the same draft lock it removes.
+                return Ok((Step::File, true));
             }
             Ok::<_, kyriakon_control_core::Error>((Step::Redirect(record.cursor + 1), true))
         })
@@ -274,7 +276,7 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
         Err(e) => return respond(&Error::from(e), FrontEnd::Gemini),
     };
     match step {
-        Step::File(record) => capsule_file(app, &record).await,
+        Step::File => capsule_file(app, token).await,
         Step::Redirect(page) => capsule_redirect(token, page),
         Step::Ask(meta) => Reply::gemini(10, &meta, String::new()),
     }
@@ -282,7 +284,7 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
 
 /// What one capsule answer decided, once the draft is out of the closure.
 enum Step {
-    File(draft::Draft),
+    File,
     Redirect(usize),
     Ask(String),
 }
@@ -407,21 +409,23 @@ pub(super) fn capsule_not_found() -> Reply {
 /// Every answer is in hand: file the application and the one intent through the
 /// same builder the web form uses, then remove the draft. The token stays the
 /// one the draft carried, which is the capability the status link already holds.
-pub(super) async fn capsule_file(app: &App, record: &draft::Draft) -> Reply {
-    let body = record.answers.get("whose").map(String::as_str) == Some("body");
-    let answers = flow_answers(record, body);
-    let application = match build_record(app, &answers, body, &record.token, "capsule") {
-        Ok(application) => application,
-        Err(e) => return respond(&e, FrontEnd::Gemini),
-    };
-    if let Err(e) = file_application(app, &application).await {
-        return respond(&e, FrontEnd::Gemini);
+pub(super) async fn capsule_file(app: &App, token: &str) -> Reply {
+    let filed = app
+        .store
+        .complete_draft::<Reply, Error, _>(token, |record| async move {
+            let body = record.answers.get("whose").map(String::as_str) == Some("body");
+            let answers = flow_answers(&record, body);
+            let application = build_record(app, &answers, body, &record.token, "capsule")?;
+            file_application(app, &application).await?;
+            let link = format!("gemini://{HOST}/status/{}", record.token);
+            Ok(Reply::gemini(20, "text/gemini", capsule::filed(&link)))
+        })
+        .await;
+    match filed {
+        Ok(Some(reply)) => reply,
+        Ok(None) => capsule_not_found(),
+        Err(e) => respond(&e, FrontEnd::Gemini),
     }
-    if let Err(e) = draft::remove(&app.store, &record.token).await {
-        e.report("removing the draft");
-    }
-    let link = format!("gemini://{HOST}/status/{}", record.token);
-    Reply::gemini(20, "text/gemini", capsule::filed(&link))
 }
 
 #[cfg(test)]

@@ -647,14 +647,17 @@ pub async fn window_sweep(
         let grace = util::date_after_days(40);
         // A new date does not prove a channel works, so a stop set by a bounce
         // stays until an operator resends or the member pays.
-        store
+        // The notice prints the grace date, so it is rendered from the record
+        // as written, not from the copy read before the update.
+        let account = store
             .update_account(&username, |current| {
-                if let Some(account) = current.as_mut() {
-                    account.state = "lapsed".to_string();
-                    account.grace_until = Some(grace.clone());
-                    account.payment = Some(payment.clone());
-                }
-                Ok::<(), Error>(())
+                let Some(account) = current.as_mut() else {
+                    return Err(Error::Failed(format!("no account for {username}")));
+                };
+                account.state = "lapsed".to_string();
+                account.grace_until = Some(grace.clone());
+                account.payment = Some(payment.clone());
+                Ok(account.clone())
             })
             .await?;
         store.write_payment_copy(&username, &payment).await?;
@@ -4536,10 +4539,66 @@ pub async fn purge_drafts(
 ) -> Result<(), Error> {
     let cutoff = OffsetDateTime::now_utc()
         - Duration::days(kyriakon_control_core::store::draft::RETENTION_DAYS);
-    // The store holds the draft lock across each age check, its journal lines
-    // and the unlink, so a save cannot slip between them.
-    for (token, e) in store.purge_drafts(cutoff, journal, &cfg.release).await? {
-        report_record(cfg, store, journal, "draft", &token, &Error::from(e)).await;
+    for name in store.list("drafts").await? {
+        let Some(token) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let purge_id = format!("purge-draft-{token}");
+        let subject = ApplicationRef::application("", token);
+        let in_lock_id = purge_id.clone();
+        let in_lock_subject = subject.clone();
+        let removed = match store
+            .purge_draft::<bool, Error, _>(token, |draft| async move {
+                // A stamp that cannot be read is not an age this sweep can
+                // prove, so the file stays for the operator's report rather
+                // than being deleted.
+                let Some(draft) = draft else {
+                    return Ok((false, false));
+                };
+                let Ok(updated) = OffsetDateTime::parse(&draft.updated_at, &Rfc3339) else {
+                    return Ok((false, false));
+                };
+                if updated > cutoff {
+                    return Ok((false, false));
+                }
+                if !journal.has(&in_lock_id, "purged") && !journal.has(&in_lock_id, "applying") {
+                    write_journal(
+                        store,
+                        journal,
+                        &cfg.release,
+                        &in_lock_id,
+                        "draft",
+                        &in_lock_subject,
+                        "applying",
+                        Some("the draft's seven days are up; the answers are being cleared away"),
+                    )
+                    .await?;
+                }
+                Ok((true, true))
+            })
+            .await
+        {
+            Ok(removed) => removed,
+            Err(e) => {
+                report_record(cfg, store, journal, "draft", token, &e).await;
+                continue;
+            }
+        };
+        // The line is written once the record is gone, inside the same lock, so
+        // a save cannot bring the token back between the unlink and the note.
+        if removed && !journal.has(&purge_id, "purged") {
+            write_journal(
+                store,
+                journal,
+                &cfg.release,
+                &purge_id,
+                "draft",
+                &subject,
+                "purged",
+                Some("the abandoned draft answers were cleared away"),
+            )
+            .await?;
+        }
     }
     Ok(())
 }

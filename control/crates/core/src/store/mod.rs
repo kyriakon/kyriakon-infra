@@ -13,8 +13,12 @@
 //! names a record as a path string can still pass a `.jsonl` name to
 //! [`Store::write_record_mode`], which refuses it rather than writing it. Names
 //! are built at runtime (`format!("{token}.json")`), so no signature can make
-//! that a compile error. The only write that completes a recorded line is
-//! [`Store::rewrite_log`], measured by the name and by `pub(crate)`.
+//! that a compile error. The only write that rewrites a recorded line is
+//! [`Store::rewrite_log`], measured by the name and by `pub(crate)`. An append
+//! also recovers a crash fragment at the tail: [`repair_tail`] completes a JSON
+//! line whose newline was lost, or quarantines the bytes to `<path>.bad`, before
+//! it writes. That is recovery of an unreported write, not a rewrite of a line
+//! the record holds.
 
 pub mod draft;
 pub mod error;
@@ -35,6 +39,56 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 /// The queue money with no token is held in, append-only except for the one
 /// line `reconcile` completes under its lock.
 pub const UNATTRIBUTED: &str = "ledger/unattributed.jsonl";
+
+/// What [`Store::update_locked`] needs from one record type: its lock, its
+/// reader and its writer.
+trait RecordKind: Sized {
+    fn lock_path(name: &str) -> String;
+    async fn load(store: &Store, name: &str) -> Result<Option<Self>, Error>;
+    async fn write(store: &Store, record: &mut Self) -> Result<(), Error>;
+}
+
+impl RecordKind for Account {
+    fn lock_path(name: &str) -> String {
+        format!("accounts/{name}/.lock")
+    }
+
+    async fn load(store: &Store, name: &str) -> Result<Option<Self>, Error> {
+        store.account(name).await
+    }
+
+    async fn write(store: &Store, record: &mut Self) -> Result<(), Error> {
+        store.write_account_record(record).await
+    }
+}
+
+impl RecordKind for GroupRecord {
+    fn lock_path(name: &str) -> String {
+        format!("groups/{name}/.lock")
+    }
+
+    async fn load(store: &Store, name: &str) -> Result<Option<Self>, Error> {
+        store.group(name).await
+    }
+
+    async fn write(store: &Store, record: &mut Self) -> Result<(), Error> {
+        store.write_group_record(record).await
+    }
+}
+
+impl RecordKind for draft::Draft {
+    fn lock_path(_name: &str) -> String {
+        "drafts/.lock".to_string()
+    }
+
+    async fn load(store: &Store, name: &str) -> Result<Option<Self>, Error> {
+        draft::load(store, name).await
+    }
+
+    async fn write(store: &Store, record: &mut Self) -> Result<(), Error> {
+        draft::save_locked(store, record).await
+    }
+}
 
 pub struct Store {
     root: PathBuf,
@@ -314,6 +368,30 @@ impl Store {
         self.remove("webhooks", &format!("{id}.at")).await
     }
 
+    /// The one read-modify-write shape: take the record's lock, load it, apply
+    /// the closure to that fresh copy, and write only when the closure asks. A
+    /// caller that read the record earlier cannot publish a stale copy, because
+    /// its edits land on the record as it is under the lock.
+    async fn update_locked<R, T, E>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&mut Option<R>) -> Result<(T, bool), E>,
+    ) -> Result<T, E>
+    where
+        R: RecordKind,
+        E: From<Error>,
+    {
+        let _lock = self.lock(&R::lock_path(name)).await.map_err(E::from)?;
+        let mut current = R::load(self, name).await.map_err(E::from)?;
+        let (out, changed) = f(&mut current)?;
+        if changed {
+            if let Some(record) = current.as_mut() {
+                R::write(self, record).await.map_err(E::from)?;
+            }
+        }
+        Ok(out)
+    }
+
     /// Read-modify-write one account under `accounts/<username>/.lock`. The
     /// closure sees the record as it is at that moment, so a field another
     /// writer set between this caller's own read and this call is preserved.
@@ -327,16 +405,8 @@ impl Store {
         E: From<Error>,
     {
         check_name(username).map_err(E::from)?;
-        let _lock = self
-            .lock(&format!("accounts/{username}/.lock"))
+        self.update_locked(username, |current| f(current).map(|out| (out, true)))
             .await
-            .map_err(E::from)?;
-        let mut current = self.account(username).await.map_err(E::from)?;
-        let out = f(&mut current)?;
-        if let Some(account) = current {
-            self.write_account_record(&account).await.map_err(E::from)?;
-        }
-        Ok(out)
     }
 
     /// Read-modify-write one group under `groups/<domain>/.lock`, with the same
@@ -350,16 +420,8 @@ impl Store {
         E: From<Error>,
     {
         check_name(domain).map_err(E::from)?;
-        let _lock = self
-            .lock(&format!("groups/{domain}/.lock"))
+        self.update_locked(domain, |current| f(current).map(|out| (out, true)))
             .await
-            .map_err(E::from)?;
-        let mut current = self.group(domain).await.map_err(E::from)?;
-        let out = f(&mut current)?;
-        if let Some(group) = current {
-            self.write_group_record(&group).await.map_err(E::from)?;
-        }
-        Ok(out)
     }
 
     /// Read-modify-write one capsule draft under `drafts/.lock`. `Ok(None)` only
@@ -377,100 +439,61 @@ impl Store {
         if !is_status_token(token) {
             return Ok(None);
         }
-        let _lock = self.lock("drafts/.lock").await.map_err(E::from)?;
-        let Some(mut current) = draft::load(self, token).await.map_err(E::from)? else {
-            return Ok(None);
-        };
-        let (out, write) = f(&mut current)?;
-        if write {
-            draft::save_locked(self, &mut current)
-                .await
-                .map_err(E::from)?;
-        }
-        Ok(Some(out))
+        self.update_locked(token, |current| match current.as_mut() {
+            Some(record) => {
+                let (out, changed) = f(record)?;
+                Ok((Some(out), changed))
+            }
+            None => Ok((None, false)),
+        })
+        .await
     }
 
-    /// Remove every draft older than `cutoff`, holding `drafts/.lock` across the
-    /// age check, the journal line and the unlink. Returns the drafts whose
-    /// record could not be read, for the pass to report and leave in place.
-    pub async fn purge_drafts(
+    /// Hold `drafts/.lock` across one draft's age check and its unlink. The
+    /// caller's closure decides whether this draft is old and writes its own
+    /// journal lines under the same lock; the store only moves the file. The
+    /// closure's bool is whether to remove it.
+    pub async fn purge_draft<T, E, F>(
         &self,
-        cutoff: OffsetDateTime,
-        journal: &journal::Journal,
-        release: &str,
-    ) -> Result<Vec<(String, Error)>, Error> {
-        let mut damaged = Vec::new();
-        for name in self.list("drafts").await? {
-            let Some(token) = name.strip_suffix(".json") else {
-                continue;
-            };
-            let _lock = self.lock("drafts/.lock").await?;
-            let draft = match draft::load(self, token).await {
-                Ok(Some(draft)) => draft,
-                Ok(None) => continue,
-                Err(e) => {
-                    damaged.push((token.to_string(), e));
-                    continue;
-                }
-            };
-            let Ok(updated) = OffsetDateTime::parse(
-                &draft.updated_at,
-                &time::format_description::well_known::Rfc3339,
-            ) else {
-                continue;
-            };
-            if updated > cutoff {
-                continue;
-            }
-            let purge_id = format!("purge-draft-{token}");
-            let subject = ApplicationRef::application("", token);
-            if !journal.has(&purge_id, "purged") && !journal.has(&purge_id, "applying") {
-                journal
-                    .append(
-                        self,
-                        &JournalLine {
-                            version: 1,
-                            at: crate::util::filed_at(),
-                            intent: purge_id.clone(),
-                            kind: "draft".to_string(),
-                            release: release.to_string(),
-                            application: subject.clone(),
-                            outcome: "applying".to_string(),
-                            note: Some(
-                                "the draft's seven days are up; the answers are being cleared away"
-                                    .to_string(),
-                            ),
-                            review: None,
-                            credit: None,
-                        },
-                    )
-                    .await?;
-            }
-            if let Err(e) = draft::remove_locked(self, token).await {
-                damaged.push((token.to_string(), e));
-                continue;
-            }
-            if !journal.has(&purge_id, "purged") {
-                journal
-                    .append(
-                        self,
-                        &JournalLine {
-                            version: 1,
-                            at: crate::util::filed_at(),
-                            intent: purge_id,
-                            kind: "draft".to_string(),
-                            release: release.to_string(),
-                            application: subject,
-                            outcome: "purged".to_string(),
-                            note: Some("the abandoned draft answers were cleared away".to_string()),
-                            review: None,
-                            credit: None,
-                        },
-                    )
-                    .await?;
-            }
+        token: &str,
+        f: impl FnOnce(Option<draft::Draft>) -> F,
+    ) -> Result<T, E>
+    where
+        E: From<Error>,
+        F: std::future::Future<Output = Result<(T, bool), E>>,
+    {
+        let _lock = self.lock("drafts/.lock").await.map_err(E::from)?;
+        let current = draft::load(self, token).await.map_err(E::from)?;
+        let (out, remove) = f(current).await?;
+        if remove {
+            draft::remove_locked(self, token).await.map_err(E::from)?;
         }
-        Ok(damaged)
+        Ok(out)
+    }
+
+    /// Complete a draft under `drafts/.lock`: load it, run the filing closure,
+    /// and remove it only when the closure succeeds. Two concurrent last-page
+    /// submissions both reach here; the first files and removes, and the second
+    /// finds no draft, so one application is filed.
+    pub async fn complete_draft<T, E, F>(
+        &self,
+        token: &str,
+        f: impl FnOnce(draft::Draft) -> F,
+    ) -> Result<Option<T>, E>
+    where
+        E: From<Error>,
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        if !is_status_token(token) {
+            return Ok(None);
+        }
+        let _lock = self.lock("drafts/.lock").await.map_err(E::from)?;
+        let Some(current) = draft::load(self, token).await.map_err(E::from)? else {
+            return Ok(None);
+        };
+        let out = f(current).await?;
+        draft::remove_locked(self, token).await.map_err(E::from)?;
+        Ok(Some(out))
     }
 
     /// Write one record by rename: a temporary file in the same directory, then
@@ -1211,10 +1234,11 @@ impl Store {
             match decode_line(path, i, line) {
                 Ok(value) => out.push(value),
                 // A crash between a short write and its newline leaves one
-                // fragment at the end. It is not a line anyone wrote; the next
-                // append repairs it (`repair_tail`). An interior bad line is
-                // still corruption and still fails.
-                Err(_) if i == last && !terminated => break,
+                // malformed fragment at the end. It is not a line anyone wrote;
+                // the next append repairs it (`repair_tail`). A final line that
+                // parses but is the wrong version or shape is complete, and its
+                // refusal is propagated. An interior bad line is corruption.
+                Err(_) if i == last && !terminated && not_json(line) => break,
                 Err(e) => return Err(e),
             }
         }
@@ -1234,7 +1258,7 @@ impl Store {
         for (i, line) in lines.iter().enumerate() {
             let value: T = match decode_line(path, i, line) {
                 Ok(value) => value,
-                Err(_) if i == last && !terminated => break,
+                Err(_) if i == last && !terminated && not_json(line) => break,
                 Err(e) => return Err(e),
             };
             if !walk(i, &value) {
@@ -1700,6 +1724,12 @@ fn decode_line<T: DeserializeOwned>(path: &str, index: usize, line: &str) -> Res
         line: index + 1,
         source,
     })
+}
+
+/// Whether a line is malformed JSON rather than a complete line of another
+/// version or shape. Only this is a crash fragment a reader may skip.
+fn not_json(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).is_err()
 }
 
 /// A record whose `version` says it was written by a schema this build does not
@@ -3581,6 +3611,7 @@ mod tests {
 
         let root = dir.to_str().unwrap().to_string();
         let (holding, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
         let first_root = root.clone();
         let first = std::thread::spawn(move || {
             let store = Store::new(&first_root);
@@ -3595,11 +3626,11 @@ mod tests {
                     status: "5.1.1".to_string(),
                     at: "2026-11-01T09:00:00Z".to_string(),
                 });
-                // Tell the other writer we hold the record, then keep holding it
-                // long enough for it to reach the lock. Without the lock it reads
+                // Tell the other writer we hold the record, and wait until it
+                // has tried the lock and seen it held. Without the lock it reads
                 // and writes in this window and the latch below is lost.
                 holding.send(()).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(300));
+                released.recv().unwrap();
                 Ok::<(), Error>(())
             }))
         });
@@ -3610,10 +3641,23 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            runtime.block_on(store.update_account("alice", |current| {
-                current.as_mut().unwrap().state = "suspended".to_string();
-                Ok::<(), Error>(())
-            }))
+            runtime.block_on(async {
+                assert!(
+                    store
+                        .try_lock("accounts/alice/.lock")
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "the first writer did not hold the account lock"
+                );
+                release.send(()).unwrap();
+                store
+                    .update_account("alice", |current| {
+                        current.as_mut().unwrap().state = "suspended".to_string();
+                        Ok::<(), Error>(())
+                    })
+                    .await
+            })
         });
         first.join().unwrap().unwrap();
         second.join().unwrap().unwrap();
@@ -3694,6 +3738,38 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A final line without a newline is not automatically a crash fragment: a
+    /// complete line of a version this build does not read is still refused.
+    #[tokio::test]
+    async fn a_complete_final_line_of_an_unsupported_version_is_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("control-journal-version-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.to_str().unwrap());
+        store.append_journal(&journal_line("01H")).await.unwrap();
+        let mut line = serde_json::to_value(journal_line("02H")).unwrap();
+        line["version"] = serde_json::json!(2);
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("journal.jsonl"))
+                .unwrap();
+            // Complete JSON, deliberately without the trailing newline.
+            f.write_all(serde_json::to_string(&line).unwrap().as_bytes())
+                .unwrap();
+        }
+        let err = journal::Journal::load(&store)
+            .await
+            .err()
+            .expect("a complete version 2 line must not read as absent");
+        assert!(
+            matches!(&err, Error::Refused(message) if message.contains("version 2")),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The sweep cannot unlink a draft while another writer holds the draft
     /// lock, so its age check and its remove are one step (#912).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3702,17 +3778,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("drafts")).unwrap();
         let store = Store::new(dir.to_str().unwrap());
-        let token = "abcdefghjkmnpqrstvwxyz0123";
-        let mut draft = draft::Draft::new(token.to_string());
+        let token = status_token().await.unwrap();
+        let mut draft = draft::Draft::new(token.clone());
+        // The age is set directly because the production save stamps it to now.
         draft.updated_at = "2020-01-01T00:00:00Z".to_string();
-        std::fs::write(
-            dir.join(format!("drafts/{token}.json")),
-            serde_json::to_vec(&draft).unwrap(),
-        )
-        .unwrap();
+        store
+            .write_record(
+                "drafts",
+                &format!("{token}.json"),
+                &serde_json::to_vec(&draft).unwrap(),
+            )
+            .await
+            .unwrap();
 
         let held = store.lock("drafts/.lock").await.unwrap();
         let root = dir.to_str().unwrap().to_string();
+        let sweep_token = token.clone();
+        let (started, sweeping) = std::sync::mpsc::channel();
         let sweep = std::thread::spawn(move || {
             let store = Store::new(&root);
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3720,13 +3802,20 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let journal = journal::Journal::load(&store).await.unwrap();
-                let cutoff =
-                    OffsetDateTime::now_utc() - time::Duration::days(draft::RETENTION_DAYS);
-                store.purge_drafts(cutoff, &journal, "test").await
+                assert!(
+                    store.try_lock("drafts/.lock").await.unwrap().is_none(),
+                    "the test did not hold the draft lock"
+                );
+                started.send(()).unwrap();
+                store
+                    .purge_draft::<(), Error, _>(&sweep_token, |draft| async move {
+                        assert!(draft.is_some(), "the sweep saw no draft");
+                        Ok(((), true))
+                    })
+                    .await
             })
         });
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        sweeping.recv().unwrap();
         assert!(
             dir.join(format!("drafts/{token}.json")).exists(),
             "the sweep removed a draft without the draft lock"
@@ -3734,6 +3823,32 @@ mod tests {
         drop(held);
         sweep.join().unwrap().unwrap();
         assert!(!dir.join(format!("drafts/{token}.json")).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Completion is one locked step: the first call files and removes, and a
+    /// second call for the same token finds no draft, so a replayed last page
+    /// cannot file a second application.
+    #[tokio::test]
+    async fn completing_a_draft_files_once() {
+        let dir =
+            std::env::temp_dir().join(format!("control-complete-draft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.to_str().unwrap());
+        let token = status_token().await.unwrap();
+        let mut draft = draft::Draft::new(token.clone());
+        draft::save(&store, &mut draft).await.unwrap();
+
+        let first = store
+            .complete_draft::<bool, Error, _>(&token, |_| async { Ok(true) })
+            .await
+            .unwrap();
+        assert_eq!(first, Some(true));
+        let second = store
+            .complete_draft::<bool, Error, _>(&token, |_| async { Ok(true) })
+            .await
+            .unwrap();
+        assert_eq!(second, None, "a replayed last page filed twice");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
