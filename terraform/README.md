@@ -26,15 +26,18 @@ Hetzner has no native OpenBSD image, so install once by hand and snapshot it:
    with `signify` before trusting it** - a substituted image is a compromised
    platform from first boot:
    ```sh
-   wget https://cdn.openbsd.org/pub/OpenBSD/7.9/amd64/miniroot79.img
-   signify -Cp /etc/signify/openbsd-7X-base.pub -x SHA256.sig miniroot79.img
+   wget https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/miniroot80.img \
+        https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/SHA256 \
+        https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/SHA256.sig
+   signify -Cp /etc/signify/openbsd-80-base.pub -x SHA256.sig miniroot80.img
    ```
-   (`miniroot` pulls file sets over the network; `install79.img` bundles them.
-   Substitute the current 7.x release. `signify` catches tampering, `SHA256`
-   only corruption.)
+   (`miniroot` pulls file sets over the network; `install80.img` bundles them.
+   Take the release the box runs, not whatever is newest: the response file and
+   the restore rehearsal are both written for that release. `signify` catches
+   tampering, `SHA256` only corruption.)
 4. Write it to disk and reboot:
    ```sh
-   dd if=miniroot79.img of=/dev/sda bs=4M && sync && reboot
+   dd if=miniroot80.img of=/dev/sda bs=4M && sync && reboot
    ```
 5. Complete the **interactive** installer over the VNC console. Choose **full-disk
    `softraid` encryption** when prompted - now-or-never, and required by the
@@ -150,7 +153,9 @@ So the template is section 1 with these differences:
   template.
 
 The installer's answers live in `openbsd/restore-template/install.conf`, written against the
-question text 7.9 actually uses, read out of the release's own `bsd.rd` ramdisk. The file
+question text 8.0 actually uses, read out of the release's own `bsd.rd` ramdisk (re-checked
+against 8.0 on 2026-11-23: every question it answers is still present with the same text, and
+the 13-asterisk password sentinel is still accepted). The file
 carries no comments and no blank lines, only `question = answer`, so that nothing about
 parsing is left to chance. This section is where the reasoning lives.
 
@@ -196,20 +201,25 @@ twenty: the URL.
 
 Fully unattended is not built yet, and the image's shape is why.
 
-`miniroot79.img` has no disklabel and no OpenBSD filesystem. It is an MBR with x86 boot
-code at sector 0, then a FAT partition starting at sector 64 whose OEM name is `BSD  4.4`,
-holding the installer kernel under the name `bsd` rather than `bsd.rd`. The first attempt at
-a patch script mounted `/dev/vnd0a` and `/dev/vnd0c` looking for an FFS, found neither, and
-reported the kernel as missing when the truth was that nothing had mounted at all. That
-script is deleted rather than left to be run.
+`miniroot80.img` has no disklabel. It is an MBR with x86 boot code at sector 0, an EFI FAT
+partition at sector 64 whose OEM name is `BSD  4.4` and whose root holds a single `EFI`
+directory, and an OpenBSD partition at sector 1024 of 10,368 sectors. That partition does
+carry an FFS: the superblock magic `0x011954` sits at its usual offset, and the only gzip
+stream in the image begins at partition offset 180,224 and runs to the end of it, which is
+the installer kernel. Measured on 2026-11-23; 7.9's and 8.0's images have the same size and
+the same partition geometry.
+
+The first attempt at a patch script reported the image as carrying no FFS after mounting
+`/dev/vnd0a` and `/dev/vnd0c` and finding nothing, and from that said the kernel was missing.
+The kernel is not in the FAT. That script is deleted rather than left to be run.
 
 The unattended route is worth having and needs the kernel patched rather than a filesystem
-mounted: the response file has to reach `/auto_install.conf` inside the kernel's ramdisk, so
-the work is to lift `/bsd` out of the FAT partition, `gunzip` it, `rdsetroot -x` the ramdisk,
-add the file, put both back, and write the result where the FAT expects the kernel. The
-signature-verified `bsd.rd` from the release directory is the same kernel under its release
-name, which is where the ramdisk can be built from without touching the FAT at all, if the
-kernel can be put back afterwards.
+mounted for its own sake: the response file has to reach `/auto_install.conf` inside the
+kernel's ramdisk, so the work is to lift the kernel out of the image's OpenBSD partition,
+`gunzip` it, `rdsetroot -x` the ramdisk, add the file, put both back, and write the result
+to the same offset. The signature-verified `bsd.rd` from the release directory is the same
+kernel under its release name, so it can be used directly instead of extracting from the
+image, if the modified kernel can be written back where the boot loader looks for it.
 
 Until that exists, the URL route is the one to use, and the URL is kept short deliberately:
 `https://kyriakon.net/install.conf`, served from the site's document root, which is a git
