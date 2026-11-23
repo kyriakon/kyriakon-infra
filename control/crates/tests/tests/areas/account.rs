@@ -31,11 +31,11 @@ fn fixture(name: &str) -> String {
     .unwrap()
 }
 
-/// A throwaway signing keypair in a temporary GNUPGHOME, with its public key, a
-/// detached armored signature over `payload`, and `payload` as a clearsigned
-/// message. The private key never enters the repository, and the homedir is
-/// removed with the temp directory.
-fn signing_key(payload: &str) -> (String, String, String) {
+/// A throwaway signing keypair in a temporary GNUPGHOME, with its home, public
+/// key, a detached armored signature over `payload`, and `payload` as a
+/// clearsigned message. The private key never enters the repository, and the
+/// homedir is removed with the temp directory.
+fn signing_key(payload: &str) -> (std::path::PathBuf, String, String, String) {
     // A short path on purpose: gpg's agent socket lives under the homedir, and a
     // UNIX socket path is bounded, so the per-user temp directory's own long
     // path fails to connect the agent before key generation begins.
@@ -72,26 +72,8 @@ fn signing_key(payload: &str) -> (String, String, String) {
     assert!(export.status.success(), "the key could not be exported");
     let public = String::from_utf8(export.stdout).unwrap();
 
+    let signature = signing_key_with(&home, payload);
     let message = home.join("payload");
-    std::fs::write(&message, payload).unwrap();
-    let sign = gpg(&[
-        "--batch",
-        "--no-tty",
-        "--pinentry-mode",
-        "loopback",
-        "--passphrase",
-        "",
-        "--armor",
-        "--output",
-        home.join("payload.sig").to_str().unwrap(),
-        "--detach-sign",
-        message.to_str().unwrap(),
-    ]);
-    assert!(
-        sign.status.success(),
-        "signing failed: {}",
-        String::from_utf8_lossy(&sign.stderr)
-    );
     let clear = gpg(&[
         "--batch",
         "--no-tty",
@@ -109,10 +91,42 @@ fn signing_key(payload: &str) -> (String, String, String) {
         "clearsigning failed: {}",
         String::from_utf8_lossy(&clear.stderr)
     );
-    let signature = std::fs::read_to_string(home.join("payload.sig")).expect("the signature file");
     let clearsigned =
         std::fs::read_to_string(home.join("payload.signed")).expect("the clearsigned message");
-    (public, signature, clearsigned)
+    (home, public, signature, clearsigned)
+}
+
+/// A detached armored signature over `payload` by the key in `home`, so a test
+/// can sign more than one payload with the same keypair.
+fn signing_key_with(home: &std::path::Path, payload: &str) -> String {
+    let message = home.join("payload");
+    std::fs::write(&message, payload).unwrap();
+    // gpg refuses to overwrite an existing output, and a second payload reuses
+    // this homedir.
+    let _ = std::fs::remove_file(home.join("payload.sig"));
+    let sign = std::process::Command::new("gpg")
+        .env("GNUPGHOME", home)
+        .args([
+            "--batch",
+            "--no-tty",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--armor",
+            "--output",
+            home.join("payload.sig").to_str().unwrap(),
+            "--detach-sign",
+            message.to_str().unwrap(),
+        ])
+        .output()
+        .expect("gpg is on PATH");
+    assert!(
+        sign.status.success(),
+        "signing failed: {}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+    std::fs::read_to_string(home.join("payload.sig")).expect("the signature file")
 }
 
 /// A password change files the plaintext and the drain hashes it, so the stored
@@ -753,7 +767,7 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
     let key = replacement_key();
     let fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&key).unwrap();
 
-    let (public, signature, _) = signing_key(&fingerprint);
+    let (_, public, signature, _) = signing_key(&fingerprint);
     let current = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&public).unwrap();
     fix.page_account("alice", json!({"mail_key": current}));
     fix.mail_key("alice", &public);
@@ -798,11 +812,11 @@ fn a_mail_key_replacement_signed_by_the_current_key_applies_at_once() {
     // A signature made with a different key is not the current key's, so
     // nothing changes.
     let fix = Fix::new("account-rotation-forged");
-    let (public, _, _) = signing_key("another fingerprint");
+    let (_, public, _, _) = signing_key("another fingerprint");
     let current = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&public).unwrap();
     fix.page_account("alice", json!({"mail_key": current}));
     fix.mail_key("alice", &public);
-    let (_, wrong, _) = signing_key("a different fingerprint");
+    let (_, _, wrong, _) = signing_key("a different fingerprint");
     fix.file_page_action(
         "mail-key",
         "alice",
@@ -967,7 +981,7 @@ fn request_verify_accepts_the_keyring_key_over_the_accounts_own_address() {
     let fix = Fix::new("request-verify-key");
     let message = "From: Alice <alice@kyriakon.net>\nTo: admin@kyriakon.net\n\
                    Subject: my data\n\nPlease send me a copy.\n";
-    let (public, detached, clearsigned) = signing_key(message);
+    let (_, public, detached, clearsigned) = signing_key(message);
     let fingerprint = kyriakon_control_core::mail::keycheck::pgp_fingerprint(&public).unwrap();
     fix.page_account("alice", json!({}));
     fix.mail_key("alice", &public);
@@ -1014,7 +1028,7 @@ fn request_verify_accepts_the_keyring_key_over_the_accounts_own_address() {
 
     // A group mailbox's own address is at the group's domain, not kyriakon.net.
     let group_message = "From: alice@example.org\n\nPlease send me a copy.\n";
-    let (public, detached, _) = signing_key(group_message);
+    let (_, public, detached, _) = signing_key(group_message);
     fix.page_account("alice", json!({"group": "example.org"}));
     fix.mail_key("alice", &public);
     std::fs::write(&message_path, group_message).unwrap();
@@ -1043,7 +1057,7 @@ fn request_verify_accepts_the_keyring_key_over_the_accounts_own_address() {
 fn request_verify_refuses_a_wrong_signer_from_or_missing_keyring_entry() {
     let fix = Fix::new("request-verify-refusals");
     let own = "From: alice@kyriakon.net\n\nPlease send me a copy.\n";
-    let (keyring, keyring_signature, _) = signing_key(own);
+    let (home, keyring, keyring_signature, _) = signing_key(own);
     fix.page_account("alice", json!({"outside_address": "alice@example.invalid"}));
     let message_path = fix.path("message.eml");
     std::fs::write(&message_path, own).unwrap();
@@ -1067,7 +1081,7 @@ fn request_verify_refuses_a_wrong_signer_from_or_missing_keyring_entry() {
     fix.mail_key("alice", &keyring);
 
     // A signature made with another key over the same text.
-    let (_, wrong_signature, _) = signing_key(own);
+    let (_, _, wrong_signature, _) = signing_key(own);
     std::fs::write(&signature_path, &wrong_signature).unwrap();
     let out = fix.ctl(&verify);
     assert!(!out.status.success());
@@ -1075,7 +1089,7 @@ fn request_verify_refuses_a_wrong_signer_from_or_missing_keyring_entry() {
 
     // The account's outside contact address, correctly signed.
     let outside = "From: alice@example.invalid\n\nPlease send me a copy.\n";
-    let (_, outside_signature, _) = signing_key(outside);
+    let outside_signature = signing_key_with(&home, outside);
     std::fs::write(&message_path, outside).unwrap();
     std::fs::write(&signature_path, &outside_signature).unwrap();
     let out = fix.ctl(&verify);
@@ -1086,7 +1100,7 @@ fn request_verify_refuses_a_wrong_signer_from_or_missing_keyring_entry() {
 
     // Another domain is not the account's own address even when signed.
     let other = "From: alice@other.example\n\nPlease send me a copy.\n";
-    let (_, other_signature, _) = signing_key(other);
+    let other_signature = signing_key_with(&home, other);
     std::fs::write(&message_path, other).unwrap();
     std::fs::write(&signature_path, &other_signature).unwrap();
     let out = fix.ctl(&verify);

@@ -9,3 +9,4 @@ description = "Zero-access mail encryptor: RFC 5322 message in, whole-message RF
 fuzz = []
 
 [dependencies]
+kyriakon-mailparse = { path = "../mailparse" }

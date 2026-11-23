@@ -758,6 +758,13 @@ if ensure_dir "$public/gemini" 0755 "$user" members; then changed=yes; fi
 if [ "$have_key" = yes ]; then
 	if ensure_dir "$home/repos" 0700 "$user" "$group"; then changed=yes; fi
 	if ensure_dir "$home/.ssh" 0750 root "$group"; then changed=yes; fi
+	# The home is member-owned, so ~/.ssh can be replaced between ensure_dir and
+	# the key install. Refuse that here rather than follow it as root (#934).
+	if [ -L "$home/.ssh" ] || [ -L "$authorized_keys" ]; then
+		printf '%s or %s is a symlink; refusing to install a key through it\n' \
+			"$home/.ssh" "$authorized_keys" >&2
+		exit 1
+	fi
 	if ensure_dir "$managed_keys_dir" 0755 root wheel; then changed=yes; fi
 
 	# The key is installed whole rather than appended: the source file is the

@@ -67,6 +67,13 @@ set -euo pipefail
 umask 077
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+if [ ! -f "$script_dir/lib.sh" ]; then
+	printf '%s: lib.sh is not in %s. Install the two files together, as lib.sh describes.\n' \
+		"$0" "$script_dir" >&2
+	exit 1
+fi
+# shellcheck disable=SC1091 # resolves at runtime from this script's directory
+. "$script_dir/lib.sh"
 
 check_only=no
 web_only=no
@@ -267,10 +274,10 @@ acme_d=/etc/acme-client.d
 httpd_conf=/etc/httpd.conf
 gmid_conf=/etc/gmid.conf
 relayd_conf=/etc/relayd.conf
-ssl_dir=/etc/ssl
-ssl_private=/etc/ssl/private
+tls_dirs
 # One writer at a time for --web. The lock lives beside the deploy marker, which
-# is root's directory on this box, and its shape is acme-queue.sh's run lock.
+# is root's directory on this box, and uses the same lock_dir as the other
+# writers.
 state_dir="${KYRIAKON_STATE_DIR:-/var/db/kyriakon}"
 web_lock="$state_dir/cron-apply-web.lock"
 
@@ -353,38 +360,47 @@ restore_keypairs() {
 	mv "$relayd_conf.saved.$$" "$relayd_conf"
 }
 
-# take_web_lock: the lock is one file created with noclobber, so a create only
-# succeeds when no lock file exists and the old mkdir-plus-pid pair cannot be
-# observed half-built. The takeover rule is acme-queue.sh's: a lock whose pid is
-# gone, or whose contents are not a live pid at all, is removed and the create
-# is retried, so a reboot cannot wedge the web lane. Returns 1 with the holder's
-# pid on stderr when a live pass owns it: the caller has to retry, because that
-# pass writes the indexes and this one would otherwise report success having
-# written none of them.
+# take_web_lock: lock_dir makes the lock directory and writes this process's pid,
+# and a lock whose pid is gone or is not a writer is reaped atomically. Returns 1
+# with the holder's pid on stderr when a live pass owns it: the caller has to
+# retry, because that pass writes the indexes and this one would otherwise report
+# success having written none of them.
 take_web_lock() {
-	typeset holder
+	typeset holder lock_message lock_rc
 	mkdir -p "$state_dir" \
 		|| die "could not create $state_dir, so no index was rewritten"
-	if ! (set -C; printf '%s\n' "$$" > "$web_lock") 2>/dev/null; then
-		holder=$(cat "$web_lock" 2>/dev/null || true)
-		if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-			printf 'another --web pass holds %s (pid %s); retry when it has finished\n' \
-				"$web_lock" "$holder" >&2
-			return 1
-		fi
-		rm -f "$web_lock"
-		(set -C; printf '%s\n' "$$" > "$web_lock") 2>/dev/null \
-			|| die "could not take $web_lock, and no live process holds it"
+	# A box from the previous scheme can hold a regular file here. Remove it
+	# rather than failing every --web pass until an operator notices.
+	if [ -e "$web_lock" ] && { [ ! -d "$web_lock" ] || [ -L "$web_lock" ]; }; then
+		rm -f "$web_lock" \
+			|| die "could not remove the old lock file $web_lock"
 	fi
-	return 0
+	lock_rc=0
+	lock_message=$(lock_dir "$web_lock" 1 2>&1) || lock_rc=$?
+	if [ "$lock_rc" -eq 2 ] &&
+		[ -e "$web_lock" ] && { [ ! -d "$web_lock" ] || [ -L "$web_lock" ]; }; then
+		rm -f "$web_lock" \
+			|| die "could not remove the old lock file $web_lock"
+		lock_rc=0
+		lock_message=$(lock_dir "$web_lock" 1 2>&1) || lock_rc=$?
+	fi
+	if [ "$lock_rc" -eq 0 ]; then
+		return 0
+	fi
+	if [ "$lock_rc" -eq 1 ]; then
+		holder=$(cat "$web_lock/pid" 2>/dev/null || true)
+		printf 'another --web pass holds %s (pid %s); retry when it has finished\n' \
+			"$web_lock" "$holder" >&2
+		return 1
+	fi
+	die "$lock_message"
 }
 
 release_web_lock() {
 	[ -n "${web_lock:-}" ] || return 0
 	# Only a lock this process wrote. Removing another pass's lock would be the
 	# second writer this exists to prevent.
-	[ "$(cat "$web_lock" 2>/dev/null || true)" = "$$" ] || return 0
-	rm -f "$web_lock"
+	unlock_dir "$web_lock"
 }
 
 apply_web() {
@@ -490,8 +506,6 @@ apply_web() {
 # function does with the indexes when a reload fails, and that is not something a
 # fixture can be asked about separately.
 self_test() {
-	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
-	. "$(dirname "$0")/lib.sh"
 	typeset tree stub code index_before gmid_before got installed
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
@@ -675,7 +689,9 @@ http protocol "kyriakon-https" {
 }
 EOF
 	mkdir -p "$state_dir"
-	printf '%s\n' "$$" > "$web_lock"
+	rm -rf "$web_lock"
+	mkdir "$web_lock"
+	printf '%s\n' "$$" > "$web_lock/pid"
 	printf 'server "blocked.example" {}\n' > "$httpd_d/blocked.conf"
 	index_before=$(cat "$httpd_d/index.conf")
 	code=0
@@ -687,26 +703,46 @@ EOF
 	check "and writes nothing" \
 		"$(grep -vc '(pid ' "$tree/locked.out")" 0
 	check "and leaves the index alone" "$(cat "$httpd_d/index.conf")" "$index_before"
-	check "and leaves the holder's lock alone" "$(cat "$web_lock")" "$$"
+	check "and leaves the holder's lock alone" "$(cat "$web_lock/pid")" "$$"
 
 	# A lock left by a pass that died is taken over, so a reboot or a killed run
 	# cannot wedge the web lane for ever.
-	printf '%s\n' 999999 > "$web_lock"
+	rm -rf "$web_lock"
+	mkdir "$web_lock"
+	printf '%s\n' 999999 > "$web_lock/pid"
 	apply_web > "$tree/takeover.out" 2>&1
 	check "a dead pass's lock is taken over" \
 		"$(grep -c 'blocked.conf' "$httpd_d/index.conf")" 1
 	check "and the pass releases the lock" \
 		"$([ -e "$web_lock" ] && printf yes || printf no)" no
 
-	# An empty or corrupt lock is a dead holder's too, not one to join. Leaving
-	# it in place would make every later pass read it as live forever.
+	# A box from the previous scheme holds a regular file at the lock path. The
+	# pass removes it and proceeds rather than failing every --web run.
+	printf 'server "legacy-lock.example" {}\n' > "$httpd_d/legacy-lock.conf"
+	printf 'old-scheme\n' > "$web_lock"
+	apply_web > "$tree/legacy-lock.out" 2>&1
+	check "a legacy lock file is taken over" \
+		"$(grep -c 'legacy-lock.conf' "$httpd_d/index.conf")" 1
+	check "and replaced by a released lock directory" \
+		"$([ -e "$web_lock" ] && printf yes || printf no)" no
+
+	# An empty or corrupt lock is a dead holder's too, not one to join. A pid
+	# that has not been written is only stale after max-age, so these fixtures
+	# are backdated. Leaving one in place would make every later pass read it as
+	# live.
 	printf 'server "empty-lock.example" {}\n' > "$httpd_d/empty-lock.conf"
-	: > "$web_lock"
+	rm -rf "$web_lock"
+	mkdir "$web_lock"
+	: > "$web_lock/pid"
+	touch -t 202001010000 "$web_lock"
 	apply_web > "$tree/empty-lock.out" 2>&1
 	check "an empty lock is taken over" \
 		"$(grep -c 'empty-lock.conf' "$httpd_d/index.conf")" 1
 	check "and released" "$([ -e "$web_lock" ] && printf yes || printf no)" no
-	printf 'not-a-pid\n' > "$web_lock"
+	rm -rf "$web_lock"
+	mkdir "$web_lock"
+	printf 'not-a-pid\n' > "$web_lock/pid"
+	touch -t 202001010000 "$web_lock"
 	printf 'server "corrupt-lock.example" {}\n' > "$httpd_d/corrupt-lock.conf"
 	apply_web > "$tree/corrupt-lock.out" 2>&1
 	check "a corrupt lock is taken over" \
@@ -812,7 +848,10 @@ EOF
 		installed="$tree/installed"
 		mkdir "$installed"
 		for s in $(install_rows "$script_dir/install-set.tsv" drain); do
-			cp "$script_dir/$s" "$installed/" \
+			case "$s" in
+			*/*) mkdir -p "$installed/${s%/*}"; cp "$script_dir/$s" "$installed/$s" ;;
+			*) cp "$script_dir/$s" "$installed/" ;;
+			esac \
 				|| die "cannot copy $s into the installed-layout probe"
 		done
 		cp "$script_dir/install-set.tsv" "$installed/"

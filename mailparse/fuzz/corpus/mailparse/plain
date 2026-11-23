@@ -1,0 +1,6 @@
+From: alice@example.invalid
+To: bob@example.invalid
+Subject: hello
+Content-Type: text/plain; charset=utf-8
+
+body line

@@ -42,15 +42,32 @@ pub enum Served {
 
 /// Why a request is refused.
 ///
-/// Both are a 404 to the client. The difference is only what the server's own log
-/// can say, because a client that could tell "no such file" from "not a file"
-/// would learn which of its guesses resolved.
+/// `Missing` and `NotAFile` are both a 404 to the client. The difference is only
+/// what the server's own log can say, because a client that could tell "no such
+/// file" from "not a file" would learn which of its guesses resolved. `Exhausted`
+/// is the process's own failure, so it is a 503 and a log line rather than a
+/// 404 that hides a full descriptor table ([#877]).
+///
+/// [#877]: https://github.com/kyriakon/kyriakon-infra/issues/877
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// A component names nothing in this tree, or the tree itself is gone.
     Missing,
     /// The name resolved to something that is not a served file.
     NotAFile,
+    /// `open` failed because the process has no descriptor left (`EMFILE` or
+    /// `ENFILE`). The answer is temporary, and the failure is the server's.
+    Exhausted,
+}
+
+/// Whether an `open`/`openat` failure is a missing name or the process running out
+/// of descriptors. Rust has no stable `ErrorKind` for `EMFILE` and `ENFILE`, so
+/// the raw errno is the test.
+fn refusal(error: &std::io::Error) -> Refusal {
+    match error.raw_os_error() {
+        Some(libc::EMFILE) | Some(libc::ENFILE) => Refusal::Exhausted,
+        _ => Refusal::Missing,
+    }
 }
 
 /// Open the file `request` names under `root`, or refuse it.
@@ -65,12 +82,12 @@ pub enum Refusal {
 /// tree's is `index.html`, a capsule's is `index.gmi`.
 pub fn open(root: &Path, request: &str, index: &str) -> Result<Served, Refusal> {
     let names = components(request)?;
-    let mut current = open_root(root).ok_or(Refusal::Missing)?;
+    let mut current = open_root(root)?;
     if names.is_empty() {
         return index_in(&current, index);
     }
     for (position, name) in names.iter().enumerate() {
-        let next = step(&current, name).ok_or(Refusal::Missing)?;
+        let next = step(&current, name)?;
         if position + 1 < names.len() {
             current = next;
             continue;
@@ -137,7 +154,7 @@ fn components(request: &str) -> Result<Vec<&str>, Refusal> {
 /// The index file in a directory, which is the only file a directory request ever
 /// serves: a listing would publish names the member did not link.
 fn index_in(directory: &File, index: &str) -> Result<Served, Refusal> {
-    let file = step(directory, index).ok_or(Refusal::Missing)?;
+    let file = step(directory, index)?;
     let metadata = file.metadata().map_err(|_| Refusal::Missing)?;
     if !metadata.is_file() {
         return Err(Refusal::NotAFile);
@@ -160,10 +177,10 @@ fn index_in(directory: &File, index: &str) -> Result<Served, Refusal> {
 /// at once; `O_NOFOLLOW` refuses the link. Ownership already keeps a member out
 /// of the directory that holds these names, and this is the second lock on the
 /// same door.
-fn open_root(root: &Path) -> Option<File> {
+fn open_root(root: &Path) -> Result<File, Refusal> {
     use std::os::unix::ffi::OsStrExt;
 
-    let path = CString::new(root.as_os_str().as_bytes()).ok()?;
+    let path = CString::new(root.as_os_str().as_bytes()).map_err(|_| Refusal::Missing)?;
     // SAFETY: `path` is a NUL-terminated string that outlives the call, and the
     // returned descriptor is taken ownership of by the `File` built from it.
     let fd = unsafe {
@@ -173,15 +190,15 @@ fn open_root(root: &Path) -> Option<File> {
         )
     };
     if fd < 0 {
-        return None;
+        return Err(refusal(&std::io::Error::last_os_error()));
     }
     // SAFETY: the descriptor is fresh and owned here, and nothing else holds it.
-    Some(unsafe { File::from_raw_fd(fd) })
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// One path component, relative to an open directory and refusing a link.
-fn step(directory: &File, name: &str) -> Option<File> {
-    let name = CString::new(name).ok()?;
+fn step(directory: &File, name: &str) -> Result<File, Refusal> {
+    let name = CString::new(name).map_err(|_| Refusal::Missing)?;
     // SAFETY: `directory` is an open descriptor, `name` is a NUL-terminated string
     // that outlives the call, and the returned descriptor is taken ownership of by
     // the `File` built from it. `O_NOFOLLOW` is the entire point of the call: a
@@ -195,10 +212,10 @@ fn step(directory: &File, name: &str) -> Option<File> {
         )
     };
     if fd < 0 {
-        return None;
+        return Err(refusal(&std::io::Error::last_os_error()));
     }
     // SAFETY: the descriptor is fresh and owned here, and nothing else holds it.
-    Some(unsafe { File::from_raw_fd(fd) })
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 #[cfg(test)]
@@ -451,6 +468,30 @@ mod tests {
         assert_eq!(
             body(&tree.root, "/sub/", "index.html"),
             Ok("sub site".to_string())
+        );
+    }
+
+    /// `EMFILE` and `ENFILE` are the process's failure, not the member's missing
+    /// file, and Rust has no stable `ErrorKind` for either ([#877]).
+    ///
+    /// [#877]: https://github.com/kyriakon/kyriakon-infra/issues/877
+    #[test]
+    fn a_full_descriptor_table_is_not_a_missing_file() {
+        for code in [libc::EMFILE, libc::ENFILE] {
+            assert_eq!(
+                refusal(&std::io::Error::from_raw_os_error(code)),
+                Refusal::Exhausted,
+                "errno {code}"
+            );
+        }
+        assert_eq!(
+            refusal(&std::io::Error::from_raw_os_error(libc::ENOENT)),
+            Refusal::Missing
+        );
+        assert_eq!(
+            refusal(&std::io::Error::from_raw_os_error(libc::ELOOP)),
+            Refusal::Missing,
+            "a link is a refusal to serve, not a server failure"
         );
     }
 }

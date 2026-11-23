@@ -54,18 +54,19 @@ and `terraform apply`/`destroy` remain human-only.
 
 ## Fuzz the parsers
 
-Five `cargo-fuzz` targets cover the parsers that read input the box does not
+Six `cargo-fuzz` targets cover the parsers that read input the box does not
 control: the encryptor's message and envelope parsers, the handler's FastCGI
-reader and form decoder, and the member path resolver, which asserts that a
-served file is always one inside the member's own root. The `fuzz` workflow in `.github/workflows/fuzz.yml` runs
-each for two minutes every Monday and on demand. That is coverage over time, not a
-merge gate: a crash is filed as a bug with a regression test, not treated as a
-blocked PR.
+reader and form decoder, the member path resolver, which asserts that a served
+file is always one inside the member's own root, and the shared header, address
+and MIME parsers in `mailparse/fuzz`. The `fuzz` workflow in
+`.github/workflows/fuzz.yml` runs each for two minutes every Monday and on
+demand. That is coverage over time, not a merge gate: a crash is filed as a bug
+with a regression test, not treated as a blocked PR.
 
 Run one for as long as you want, by hand. The paths below are relative to the
 `fuzz` directory the first command enters:
 
-	cd kyriakon-encrypt/fuzz     # or control/fuzz
+	cd kyriakon-encrypt/fuzz     # or control/fuzz, or mailparse/fuzz
 	cargo +nightly fuzz list     # the targets in this crate
 	cargo +nightly fuzz run message -- -max_total_time=300
 
@@ -149,7 +150,7 @@ Open to the world by design: 22, 25, 53, 79, 80, 143, 443, 465, 993, 1965, and 1
 
 `pf.conf` and `sshd_config` stay propose-only: `scripts/deploy.sh` prints the commands and never applies them, and a host rule change is made by hand after review. A provider firewall was considered and declined; the second-host and second-jurisdiction trigger in ADR 0007 is the point to revisit the layering, so it is not decided twice.
 
-Loopback is filtered for one port. `scripts/pf-apply.sh` comments out the stock `set skip on lo` and appends a block-then-pass pair for `127.0.0.1:8080`, the signup vhost: a connection to it is blocked unless the sending socket belongs to root, and on this box that is relayd. So the client address under a relayed request is trustworthy at last, because no unprivileged local process can reach the vhost to forge the header (#758). Nothing else on loopback changes: the stock `pass` still matches every other packet, and the block is limited to connection setup (`flags S/SA`), so replies ride the state the pass rule creates. The one thing that stops the change working is a `set skip on lo` spelling the script does not rewrite, and that stops the run rather than being ignored.
+Loopback is filtered for one port. `scripts/pf-apply.sh` comments out the stock `set skip on lo` and appends a block-then-pass pair for `127.0.0.1:8080`, the signup vhost: a connection to it is blocked unless the sending socket belongs to root or `_relayd`; `_relayd` is the account relayd's relay workers drop to before they connect, and root is the deploy's direct probe. So the client address under a relayed request is trustworthy at last, because no unprivileged local process can reach the vhost to forge the header (#758). Nothing else on loopback changes: the stock `pass` still matches every other packet, and the block is limited to connection setup (`flags S/SA`), so replies ride the state the pass rule creates. The one thing that stops the change working is a `set skip on lo` spelling the script does not rewrite, and that stops the run rather than being ignored.
 
 Check it after applying:
 

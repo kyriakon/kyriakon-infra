@@ -49,7 +49,7 @@ fn concurrent_opens_do_not_lose_a_live_session() {
         threads.push(std::thread::spawn(move || {
             let address = format!("198.51.100.{}", t + 1);
             let addr: IpAddr = address.parse().unwrap();
-            let prefix = format!("{address}@");
+            let prefix = kyriakon_control_tui::session_prefix(addr);
             while !stop.load(Ordering::Relaxed) {
                 let Ok(Admission::Open(a)) = Sessions::open(&dir, Some(addr)) else {
                     continue;

@@ -46,11 +46,10 @@
 //!   subject and any issuer.
 
 use std::collections::{BTreeMap, HashSet};
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
 
 use crate::capsule;
 use crate::fastcgi::{Reply, Request};
@@ -83,8 +82,8 @@ pub use connection::fuzz_decode;
 pub(crate) mod test_support;
 mod titan;
 
-use self::connection::accept;
 pub use self::error::Error;
+use self::portal::portal_connection;
 use self::titan::titan_accept;
 
 /// The only origin a submission may carry. The port-80 vhost redirects, so the
@@ -107,6 +106,27 @@ const MAX_TITAN_BODY: usize = 64 * 1024;
 /// A Titan request line follows the gemini request limit of 1024 bytes. The
 /// PROXY line relayd prepends has its own, shorter bound from the protocol.
 const MAX_TITAN_LINE: usize = 1024;
+
+/// How long one FastCGI connection may take, from accept to the reply's last
+/// byte. The front-end writes the request and reads the reply without pausing,
+/// so a peer that stalls either half is the front-end failing; the deadline
+/// keeps it from pinning a task and a descriptor.
+const FRONTEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// FastCGI connections served at once per listener. The permit is taken before
+/// a task is spawned, so a flood costs the backlog and one socket.
+///
+/// The four counts here are slices of the login class's `openfiles-cur=128`
+/// (`rc.subr` gives the unit the `daemon` class). The sum is 2 * 24 + 16 + 32 =
+/// 96, which leaves the process its own descriptors. The test
+/// `the_listener_budgets_fit_the_login_class` holds the arithmetic.
+const FRONTEND_CONNECTIONS: usize = 24;
+/// How long one portal connection may take, from the first byte to the reply.
+/// The protocol is one line in and one line out, so a client that connects and
+/// sends nothing is gone by this deadline.
+const PORTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Portal connections served at once. It shares the 128-descriptor table with
+/// the two FastCGI listeners and Titan.
+const PORTAL_CONNECTIONS: usize = 16;
 /// How long one Titan connection may take, from the first byte to the reply.
 const TITAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Titan connections served at once. The rest wait for a permit, so a flood
@@ -249,12 +269,18 @@ struct Outcome {
 }
 
 /// Run the responder on the three sockets the config names, until one of them
-/// stops accepting.
+/// stops accepting. The two FastCGI listeners and the portal's line protocol are
+/// the core server's; Titan keeps its own loop because its listener is public
+/// TCP and a permit timeout there closes the socket rather than queueing it.
 pub async fn serve(cfg: config::Config) -> Result<(), Error> {
     let app = Arc::new(App::load(cfg).await?);
-    let httpd = bind(&app.cfg.httpd_socket)?;
-    let gemini = bind(&app.cfg.gemini_socket)?;
-    let portal = bind(&app.cfg.portal_socket)?;
+    let portal = kyriakon_control_core::socket::bind(Path::new(&app.cfg.portal_socket)).map_err(
+        |source| Error::Io {
+            what: "listen on",
+            path: Some(app.cfg.portal_socket.clone().into()),
+            source,
+        },
+    )?;
     let titan = TcpListener::bind(&app.cfg.titan_listener)
         .await
         .map_err(|source| Error::Io {
@@ -271,67 +297,67 @@ pub async fn serve(cfg: config::Config) -> Result<(), Error> {
         app.cfg.store_root,
         app.questions.len()
     ));
+    let limits = kyriakon_control_core::socket::Limits {
+        connections: FRONTEND_CONNECTIONS,
+        deadline: FRONTEND_TIMEOUT,
+        program: "kyriakon-control",
+    };
     tokio::try_join!(
-        accept(httpd, app.clone(), Channel::FrontEnd),
-        accept(gemini, app.clone(), Channel::FrontEnd),
-        accept(portal, app.clone(), Channel::Portal),
+        serve_front_end(app.cfg.httpd_socket.clone(), limits, app.clone()),
+        serve_front_end(app.cfg.gemini_socket.clone(), limits, app.clone()),
+        portal_listener(portal, app.clone()),
         titan_accept(titan, app),
     )
     .map(|_| ())
 }
 
-/// What a listener speaks. The two FastCGI sockets share a loop; the portal's
-/// line protocol is the one difference in the task each connection spawns.
-#[derive(Clone, Copy)]
-enum Channel {
-    FrontEnd,
-    Portal,
-}
-
-/// Bind one socket, replacing whatever a previous run left at the path. A socket
-/// file outlives the process that made it, so a restart after a crash would
-/// otherwise fail to bind until somebody removed it by hand; a plain file or a
-/// dangling symlink at the path does the same, and the socket directory is no
-/// longer a place a local process can put one. `symlink_metadata` is what makes a
-/// dangling symlink a file to remove rather than the `ENOENT` a following
-/// `metadata` would report, and `remove_file` unlinks the symlink itself, never
-/// its target, so the removal reaches nothing the config did not name.
-///
-/// The file is mode 0660, and the group it carries comes from the set-group-id
-/// directory the front-ends' deploy creates it in: `www` for httpd's socket and
-/// `_gmid` for gmid's. A socket any local user could connect to would let that
-/// user forge the whole environment, `REMOTE_ADDR` included, which is the key the
-/// limits and the audit rest on.
-fn bind(path: &str) -> Result<UnixListener, Error> {
-    let path = Path::new(path);
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => std::fs::remove_file(path).map_err(|source| Error::Io {
-            what: "clear the path for",
-            path: Some(path.into()),
-            source,
-        })?,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(Error::Io {
-                what: "check",
-                path: Some(path.into()),
-                source,
-            })
-        }
-    }
-    let listener = UnixListener::bind(path).map_err(|source| Error::Io {
-        what: "listen on",
+/// Answer one FastCGI listener for the life of the process.
+async fn serve_front_end(
+    path: String,
+    limits: kyriakon_control_core::socket::Limits,
+    app: Arc<App>,
+) -> Result<(), Error> {
+    crate::fastcgi::serve(Path::new(&path), limits, MAX_BODY, move |request| {
+        let app = app.clone();
+        async move { connection::fastcgi_answer(app, request).await }
+    })
+    .await
+    .map_err(|source| Error::Io {
+        what: "serve",
         path: Some(path.into()),
         source,
-    })?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660)).map_err(|source| {
-        Error::Io {
-            what: "set the mode on",
-            path: Some(path.into()),
-            source,
-        }
-    })?;
-    Ok(listener)
+    })
+}
+
+/// Answer the portal's line protocol for the life of the process.
+async fn portal_listener(listener: tokio::net::UnixListener, app: Arc<App>) -> Result<(), Error> {
+    kyriakon_control_core::socket::accept(
+        listener,
+        kyriakon_control_core::socket::Limits {
+            connections: PORTAL_CONNECTIONS,
+            deadline: PORTAL_TIMEOUT,
+            program: "kyriakon-control",
+        },
+        "portal",
+        move |stream| {
+            let app = app.clone();
+            async move {
+                match tokio::time::timeout(PORTAL_TIMEOUT, portal_connection(stream, &app)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => e.report("serving a portal connection"),
+                    Err(_) => kyriakon_control_core::util::log(
+                        "kyriakon-control: the portal connection timed out",
+                    ),
+                }
+            }
+        },
+    )
+    .await
+    .map_err(|source| Error::Io {
+        what: "accept a portal connection",
+        path: None,
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -385,35 +411,18 @@ mod tests {
         );
     }
 
-    /// A file left at a socket's path does not stop the handler: bind clears the
-    /// path and listens. The dangling symlink is the case a following `metadata`
-    /// reports as absent, so it is the one the removal has to carry.
-    #[tokio::test]
-    async fn the_handler_binds_over_a_file_left_at_the_socket_path() {
-        use std::os::unix::fs::{symlink, FileTypeExt};
-
-        let dir = fixture_dir("bind-over-file");
-        let path = dir.join("portal.sock");
-        std::fs::write(&path, b"planted").unwrap();
-        let listener = bind(path.to_str().unwrap()).expect("bind over a planted file");
-        assert!(std::fs::symlink_metadata(&path)
-            .unwrap()
-            .file_type()
-            .is_socket());
-        drop(listener);
-
-        let target = dir.join("gone");
-        std::fs::remove_file(&path).unwrap();
-        symlink(&target, &path).unwrap();
-        let listener = bind(path.to_str().unwrap()).expect("bind over a dangling symlink");
+    /// The listener counts are slices of the login class's 128 descriptors. A
+    /// listener added without widening the class must fail here rather than at
+    /// the first flood ([#877]).
+    ///
+    /// [#877]: https://github.com/kyriakon/kyriakon-infra/issues/877
+    #[test]
+    fn the_listener_budgets_fit_the_login_class() {
+        use kyriakon_control_core::socket::{OPEN_FILES, RESERVED_FILES};
+        let held = 2 * FRONTEND_CONNECTIONS + PORTAL_CONNECTIONS + TITAN_CONNECTIONS;
         assert!(
-            target.symlink_metadata().is_err(),
-            "the link's target is untouched"
+            held <= OPEN_FILES - RESERVED_FILES,
+            "{held} connection permits do not fit in {OPEN_FILES} descriptors"
         );
-        assert!(std::fs::symlink_metadata(&path)
-            .unwrap()
-            .file_type()
-            .is_socket());
-        drop(listener);
     }
 }

@@ -185,6 +185,71 @@ pub fn filed_day(text: &str) -> Option<Date> {
         .map(|t| t.date())
 }
 
+/// The status token an account's own application copy carries. `None` once the
+/// 90-day purge has taken the copy.
+fn application_token(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    value
+        .get("status_token")?
+        .as_str()
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
+/// The token of the application an account was approved from, which is the
+/// same token the approval journalled its lines under. The payment block keeps
+/// `application_ref` after the 90-day purge takes the application copy, so it
+/// is read first; the copy is the fallback for a record whose payment block
+/// predates that field. `None` is a boundary the export cannot prove.
+fn lifecycle_token(account: &Account, application_text: Option<&str>) -> Option<String> {
+    account
+        .payment_state()
+        .and_then(|payment| payment.application_ref)
+        .filter(|token| !token.is_empty())
+        .or_else(|| application_text.and_then(application_token))
+}
+
+/// Whether `at` is at or after `created_at`, both RFC 3339. An unreadable pair
+/// fails closed, so a line whose boundary cannot be proved is left out.
+fn at_or_after(at: &str, created_at: &str) -> bool {
+    match (
+        OffsetDateTime::parse(at, &Rfc3339),
+        OffsetDateTime::parse(created_at, &Rfc3339),
+    ) {
+        (Ok(at), Ok(created_at)) => at >= created_at,
+        _ => false,
+    }
+}
+
+/// The journal lines that belong to this account's own lifecycle, copied as
+/// recorded. A line belongs when it names the application the account was
+/// approved from, or when it carries no token and was written after the account
+/// was created: a group transition filed under the site owner's name carries no
+/// token and is theirs, as the data-subject spec's ownership rule says. A reused
+/// username's earlier applicant carries a different token and predates
+/// `created_at`, so neither arm reaches it; a line with neither a matching token
+/// nor a timestamp that can be proved is left out rather than exported.
+fn own_journal(
+    lines: Vec<String>,
+    username: &str,
+    token: Option<&str>,
+    created_at: &str,
+) -> Vec<String> {
+    lines
+        .into_iter()
+        .filter(|line| match serde_json::from_str::<JournalLine>(line) {
+            Ok(entry) => {
+                entry.application.username == username
+                    && (token.is_some_and(|token| {
+                        entry.application.status_token.as_deref() == Some(token)
+                    }) || (entry.application.status_token.is_none()
+                        && at_or_after(&entry.at, created_at)))
+            }
+            Err(_) => false,
+        })
+        .collect()
+}
+
 /// The account's uid and gid, from the box's passwd file. The bundle is handed
 /// to the account that owns it, so a member who is not in the file is a
 /// refusal rather than a root-owned directory they can no longer read.
@@ -257,7 +322,15 @@ async fn written(
     // not yet deleted is still held, so it is named and included, and the note
     // says the purge is due rather than claiming it has run. The "purged"
     // wording belongs to the case where the file has actually gone.
-    let purge_note = match store.account_application_text(username).await? {
+    let application_text = store.account_application_text(username).await?;
+    // The token of the application this account was approved from. It is the
+    // same token the approval journalled its lines under, which is what tells
+    // this lifecycle's lines from a reused username's earlier ones. The payment
+    // block's `application_ref` outlives the 90-day purge; the copy is the
+    // fallback for a record written before the block carried it, and an
+    // unprovable boundary leaves the application lines out.
+    let own_token = lifecycle_token(&account, application_text.as_deref());
+    let purge_note = match application_text {
         Some(text) => match filed_day(&text) {
             Some(filed) if within_purge(filed, now.date()) => {
                 let until = util::date_string(filed + Duration::days(APPLICATION_PURGE_DAYS));
@@ -279,14 +352,12 @@ async fn written(
 
     // Copied as recorded, not re-encoded: the export is the member's copy of
     // their own record, so a line written by another release keeps its bytes.
-    let mut journal = Vec::new();
-    for line in store.log("journal.jsonl").raw_lines().await? {
-        if let Ok(entry) = serde_json::from_str::<JournalLine>(&line) {
-            if entry.application.username == username {
-                journal.push(line);
-            }
-        }
-    }
+    let journal = own_journal(
+        store.log("journal.jsonl").raw_lines().await?,
+        username,
+        own_token.as_deref(),
+        &account.created_at,
+    );
     docs.push(("journal.jsonl".to_string(), join_lines(journal)));
     docs.push((
         "requests.jsonl".to_string(),
@@ -793,5 +864,202 @@ mod tests {
         assert_eq!(member_owner(passwd, "secretary").unwrap(), (1001, 1002));
         assert!(member_owner(passwd, "treasurer").is_err());
         let _ = std::fs::remove_file(passwd);
+    }
+
+    fn line(at: &str, application: crate::store::ApplicationRef, note: &str) -> String {
+        serde_json::to_string(&JournalLine {
+            version: 1,
+            at: at.to_string(),
+            intent: format!("intent-{note}"),
+            kind: "approve".to_string(),
+            release: "test".to_string(),
+            application,
+            outcome: "applied".to_string(),
+            note: Some(note.to_string()),
+            review: None,
+            credit: None,
+        })
+        .unwrap()
+    }
+
+    fn journal_line(at: &str, username: &str, token: Option<&str>, note: &str) -> String {
+        let application = match token {
+            Some(token) => crate::store::ApplicationRef::application(username, token),
+            None => crate::store::ApplicationRef::account(username),
+        };
+        line(at, application, note)
+    }
+
+    fn group_journal_line(at: &str, username: &str, domain: &str, note: &str) -> String {
+        line(
+            at,
+            crate::store::ApplicationRef::group(username, domain),
+            note,
+        )
+    }
+
+    /// A reused username must not carry the earlier lifecycles' lines into the
+    /// export: a declined applicant's review (their outside address and
+    /// hardship waiver) and a deleted member's whole history both share the
+    /// name, and neither carries this account's token or postdates its creation.
+    #[tokio::test]
+    async fn the_journal_export_holds_only_the_current_lifecycle() {
+        let current = crate::store::status_token().await.unwrap();
+        let declined = crate::store::status_token().await.unwrap();
+        let lines = vec![
+            journal_line(
+                "2026-01-10T00:00:00Z",
+                "alice",
+                Some(&declined),
+                "review-sent personA@example.invalid no_charge",
+            ),
+            journal_line(
+                "2026-01-20T00:00:00Z",
+                "alice",
+                Some(&declined),
+                "decline previous applicant",
+            ),
+            journal_line(
+                "2025-11-01T00:00:00Z",
+                "alice",
+                None,
+                "delete previous member suspended",
+            ),
+            journal_line(
+                "2026-05-01T00:00:00Z",
+                "alice",
+                Some(&current),
+                "review-sent current applicant",
+            ),
+            journal_line(
+                "2026-05-02T00:00:00Z",
+                "alice",
+                Some(&current),
+                "approve current applicant",
+            ),
+            journal_line(
+                "2026-06-02T00:00:00Z",
+                "alice",
+                None,
+                "credit current member",
+            ),
+            group_journal_line(
+                "2026-06-03T00:00:00Z",
+                "alice",
+                "parish.example",
+                "group transition current site owner",
+            ),
+            journal_line(
+                "2026-06-02T00:00:00Z",
+                "treasurer",
+                Some(&current),
+                "credit another member",
+            ),
+        ];
+        let own = own_journal(
+            lines.clone(),
+            "alice",
+            Some(&current),
+            "2026-06-01T00:00:00Z",
+        );
+        let text = own.join("\n");
+        assert!(text.contains("current applicant"), "{text}");
+        assert!(text.contains("current member"), "{text}");
+        assert!(
+            text.contains("group transition current site owner"),
+            "{text}"
+        );
+        assert!(!text.contains("personA@example.invalid"), "{text}");
+        assert!(!text.contains("previous applicant"), "{text}");
+        assert!(!text.contains("previous member"), "{text}");
+        assert!(!text.contains("another member"), "{text}");
+        assert_eq!(own.len(), 4);
+
+        // Once the 90-day purge takes the application copy there is no token to
+        // prove the application lines, so only the token-less lines after
+        // creation remain: the boundary fails closed rather than opening up.
+        let reduced = own_journal(lines, "alice", None, "2026-06-01T00:00:00Z");
+        let reduced_text = reduced.join("\n");
+        assert!(
+            reduced_text.contains("credit current member"),
+            "{reduced_text}"
+        );
+        assert!(
+            reduced_text.contains("group transition current site owner"),
+            "{reduced_text}"
+        );
+        assert!(
+            !reduced_text.contains("current applicant"),
+            "{reduced_text}"
+        );
+        assert_eq!(reduced.len(), 2);
+
+        assert_eq!(
+            application_token(&format!(r#"{{"status_token":"{current}"}}"#)).as_deref(),
+            Some(current.as_str())
+        );
+        assert_eq!(application_token(r#"{"status_token":""}"#), None);
+    }
+
+    /// The purge takes `application.json` ninety days in, but the payment
+    /// block's `application_ref` keeps the token the approval journalled
+    /// under. The account's own approve and review lines must still be
+    /// exported, and a prior lifecycle on the same username must still not.
+    #[tokio::test]
+    async fn a_purged_application_copy_still_exports_the_accounts_own_lines() {
+        let current = crate::store::status_token().await.unwrap();
+        let prior = crate::store::status_token().await.unwrap();
+        let account: Account = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "username": "alice",
+            "state": "active",
+            "decision": "approve",
+            "decided_at": "2026-06-01T00:00:00Z",
+            "rail": "cash",
+            "no_charge": false,
+            "created_at": "2026-06-01T00:00:00Z",
+            "payment": {
+                "token_ref": "tok",
+                "token_issued_at": "2026-06-01T00:00:00Z",
+                "application_ref": &current,
+                "paid_until": null,
+            },
+        }))
+        .unwrap();
+        let lines = vec![
+            journal_line(
+                "2026-01-10T00:00:00Z",
+                "alice",
+                Some(&prior),
+                "review-sent personA@example.invalid no_charge",
+            ),
+            journal_line(
+                "2026-01-20T00:00:00Z",
+                "alice",
+                Some(&prior),
+                "decline previous applicant",
+            ),
+            journal_line(
+                "2026-05-01T00:00:00Z",
+                "alice",
+                Some(&current),
+                "review-sent current applicant",
+            ),
+            journal_line(
+                "2026-05-02T00:00:00Z",
+                "alice",
+                Some(&current),
+                "approve current applicant",
+            ),
+        ];
+        let token = lifecycle_token(&account, None);
+        assert_eq!(token.as_deref(), Some(current.as_str()));
+        let own = own_journal(lines, "alice", token.as_deref(), &account.created_at);
+        let text = own.join("\n");
+        assert!(text.contains("review-sent current applicant"), "{text}");
+        assert!(text.contains("approve current applicant"), "{text}");
+        assert!(!text.contains("personA@example.invalid"), "{text}");
+        assert!(!text.contains("previous applicant"), "{text}");
+        assert_eq!(own.len(), 2);
     }
 }

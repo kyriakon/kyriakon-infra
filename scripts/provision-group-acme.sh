@@ -64,6 +64,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 # shellcheck disable=SC1091 # resolves at runtime from this script's directory
 . "$script_dir/lib.sh"
 acme_d=${ACME_D:-/etc/acme-client.d}
+tls_dirs
 public_root=${PUBLIC_ROOT:-/home/www}
 acme_queue=${ACME_QUEUE:-/root/bin/acme-queue.sh}
 # The mail table whose first line is the platform's own domain, read the way
@@ -93,24 +94,20 @@ die() {
 # order for the platform's own name. The name is the first line of mail_domains,
 # and kyriakon.com is refused for the reason remove-group.sh gives.
 domain_ok() {
-	typeset name="$1"
-	[ "${#name}" -le 253 ] || return 1
-	case "$name" in
-	*.*) ;;
-	*) return 1 ;;
-	esac
-	printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' || return 1
+	valid_domain "$1" || return 1
 	# The platform's own names are the operator's, the rule the drain applies
 	# before it runs this lane; lib.sh holds the rule and its `kyriakon.com`
 	# clause so a hand-run does not need a second copy.
-	domain_is_platform "$name" "$mail_domains" && return 1
+	domain_is_platform "$1" "$mail_domains" && return 1
 	return 0
 }
 
 # The paths, as functions so the self-test rebinds the directory once.
 group_conf() { printf '%s/%s.conf' "$acme_d" "$domain"; }
-cert_file() { printf '/etc/ssl/%s.fullchain.pem' "$domain"; }
-key_file() { printf '/etc/ssl/private/%s.key' "$domain"; }
+# shellcheck disable=SC2154 # ssl_dir and ssl_private are set by tls_dirs
+cert_file() { printf '%s/%s.fullchain.pem' "$ssl_dir" "$domain"; }
+# shellcheck disable=SC2154 # ssl_dir and ssl_private are set by tls_dirs
+key_file() { printf '%s/%s.key' "$ssl_private" "$domain"; }
 site_public() { printf '%s/%s.kyriakon.net' "$public_root" "$account"; }
 
 # The file body. The comment says where it came from, because this is the one
@@ -183,9 +180,13 @@ self_test() {
 	tree=$self_test_work
 
 	acme_d="$tree/etc/acme-client.d"
+	SSL_DIR="$tree/etc/ssl"
+	SSL_PRIVATE_DIR="$tree/etc/ssl/private"
+	tls_dirs
 	public_root="$tree/home/www"
 	mail_domains="$tree/etc/mail/mail_domains"
-	install -d -m 0755 "$acme_d" "$public_root/parish-secretary.kyriakon.net" "$tree/etc/mail"
+	install -d -m 0755 "$acme_d" "$SSL_DIR" "$SSL_PRIVATE_DIR" \
+		"$public_root/parish-secretary.kyriakon.net" "$tree/etc/mail"
 	# The platform's own domain is the table's first line, as on the box.
 	printf 'kyriakon.net\n' > "$mail_domains"
 	conf_owner="$(id -un):$(stat -f '%Sg' "$acme_d")"
@@ -212,9 +213,9 @@ self_test() {
 	check "the challenge directory is the httpd one" \
 		"$(grep -c 'challengedir "/home/www/acme"' "$conf")" 1
 	check "the domain key is the pair's private half" \
-		"$(grep -c 'domain key "/etc/ssl/private/parish.example.key"' "$conf")" 1
+		"$(grep -cF "domain key \"$ssl_private/parish.example.key\"" "$conf")" 1
 	check "the full chain is the name relayd links from" \
-		"$(grep -c 'domain full chain certificate "/etc/ssl/parish.example.fullchain.pem"' "$conf")" 1
+		"$(grep -cF "domain full chain certificate \"$ssl_dir/parish.example.fullchain.pem\"" "$conf")" 1
 	check "the authority is the tracked one" "$(grep -c 'sign with letsencrypt' "$conf")" 1
 	check "and there is one block, not two" "$(grep -c '^domain ' "$conf")" 1
 	check "the file is mode 644 and the writer's" "$(stat -f '%Su:%Sg %Lp' "$conf")" "$conf_owner 644"
@@ -247,6 +248,9 @@ self_test() {
 	check "a domain is accepted" "$(domain_ok parish.example && printf yes || printf no)" yes
 	check "a single label is refused" "$(domain_ok parish && printf yes || printf no)" no
 	check "a path is refused" "$(domain_ok ../parish.example && printf yes || printf no)" no
+	# #895: a valid first line must not carry a second one through grep.
+	check "a newline is refused" \
+		"$(domain_ok "$(printf 'parish.example\n--san evil.example')" && printf yes || printf no)" no
 
 	# 5. the platform's own names are refused, the rule the drain applies before
 	# this lane runs: a hand-run order here would queue a certificate for the

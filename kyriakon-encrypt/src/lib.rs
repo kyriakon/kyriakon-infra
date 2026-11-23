@@ -27,6 +27,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use kyriakon_mailparse::{boundary_param, headers, lines, split_message, walk_multipart, Part};
+
 /// On-box keyring location - sync of the git-tracked published key set.
 pub const DEFAULT_KEYRING: &str = "/etc/kyriakon/keys";
 /// Default gpg homedir for a check run by hand. gpg writes pubring.kbx and
@@ -44,6 +46,10 @@ pub enum Error {
     MissingKey(String),
     /// gpg failed (bad key file, expired/revoked key, ...).
     Gpg(String),
+    /// The message has no empty line this parser accepts, and its header block
+    /// is not all headers. Reading it as headers could copy text from an
+    /// unrecognised body into the clear wrapper, so the save is refused.
+    Malformed(String),
     Io(io::Error),
 }
 
@@ -53,6 +59,7 @@ impl fmt::Display for Error {
             Error::InvalidUser(u) => write!(f, "invalid recipient localpart: {u:?}"),
             Error::MissingKey(b) => write!(f, "no public key for {b:?} in keyring"),
             Error::Gpg(e) => write!(f, "gpg failed: {e}"),
+            Error::Malformed(e) => write!(f, "refusing malformed message: {e}"),
             Error::Io(e) => write!(f, "io error: {e}"),
         }
     }
@@ -63,6 +70,12 @@ impl std::error::Error for Error {}
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         Error::Io(e)
+    }
+}
+
+impl From<kyriakon_mailparse::Malformed> for Error {
+    fn from(e: kyriakon_mailparse::Malformed) -> Self {
+        Error::Malformed(e.reason().to_string())
     }
 }
 
@@ -98,12 +111,14 @@ pub fn encrypt(
     if !key.is_file() {
         return Err(Error::MissingKey(base.to_string()));
     }
+    let message = split_message(input)?;
+    let (block, sep, body) = (message.headers, message.separator, message.body);
     if let Some(armor) = already_encrypted(input, &key, gpg_home) {
-        return Ok(rfc3156_envelope(&make_boundary(), armor, input));
+        return Ok(rfc3156_envelope(&make_boundary(), armor, block));
     }
-    let payload = protected_payload(input);
+    let payload = protected_payload(block, sep, body);
     let armor = armored_ciphertext(&key, gpg_home, &payload)?;
-    Ok(rfc3156_envelope(&make_boundary(), &armor, input))
+    Ok(rfc3156_envelope(&make_boundary(), &armor, block))
 }
 
 fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u8>, Error> {
@@ -223,135 +238,74 @@ fn already_encrypted<'a>(input: &'a [u8], cert: &Path, gpg_home: &Path) -> Optio
 /// ASCII-armoured PGP message. Anything else is not ciphertext to keep: a
 /// message that merely mentions the wrapper is a message to encrypt.
 fn envelope_ciphertext(input: &[u8]) -> Option<&[u8]> {
-    let (block, sep, body) = split_message(input);
-    if sep.is_empty() {
+    let message = split_message(input).ok()?;
+    if message.separator.is_empty() {
         return None;
     }
-    let (_, start, end) = header_spans(block)
+    let header = headers(message.headers)
         .into_iter()
-        .find(|(name, _, _)| name == "content-type")?;
-    let header = &block[start..end];
-    if media_type(header)? != "multipart/encrypted" {
+        .find(|header| header.is("content-type"))?;
+    let value = header.value(message.headers);
+    if media_type(value)? != "multipart/encrypted" {
         return None;
     }
-    let boundary = boundary_param(header)?;
-    let (version, ciphertext) = two_parts(body, &boundary)?;
+    let boundary = boundary_param(value)?;
+    let multipart = walk_multipart(message.body, &boundary).ok()?;
+    // The builder ends at the closing delimiter. An epilogue is readable text
+    // the store would keep in the clear, so it is not this wrapper's shape.
+    if multipart
+        .epilogue
+        .iter()
+        .any(|byte| !matches!(byte, b'\n' | b'\r'))
+    {
+        return None;
+    }
+    let [version, ciphertext] = multipart.parts.as_slice() else {
+        return None;
+    };
     if !is_version_part(version) {
         return None;
     }
     armored_message(part_body(ciphertext)?)
 }
 
-/// The `boundary` parameter of a Content-Type header, unquoted.
-fn boundary_param(header: &[u8]) -> Option<String> {
-    let value = header_value(header)?;
-    value.split(';').skip(1).find_map(|param| {
-        let (name, value) = param.split_once('=')?;
-        if !name.trim().eq_ignore_ascii_case("boundary") {
-            return None;
-        }
-        let value = value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .unwrap_or(value);
-        (!value.is_empty()).then(|| value.to_string())
-    })
-}
-
-/// The value of a header span, from after the colon.
-fn header_value(header: &[u8]) -> Option<&str> {
-    let colon = header.iter().position(|&b| b == b':')?;
-    std::str::from_utf8(&header[colon + 1..]).ok()
-}
-
-/// The type/subtype of a Content-Type header, lowercased and without
+/// The type/subtype of a Content-Type value, lowercased and without
 /// parameters.
-fn media_type(header: &[u8]) -> Option<String> {
-    let value = header_value(header)?.trim_start();
+fn media_type(value: &[u8]) -> Option<String> {
+    let value = std::str::from_utf8(value).ok()?.trim_start();
     let end = value
         .find(|c: char| c == ';' || c.is_ascii_whitespace())
         .unwrap_or(value.len());
     Some(value[..end].to_ascii_lowercase())
 }
 
-/// The two parts of a multipart body that starts at the opening delimiter and
-/// ends at the closing one, with nothing after it. Anything before the opening
-/// delimiter is the RFC 3156 preamble, which is a readable notice rather than
-/// message content and is discarded by the rebuild.
-fn two_parts<'a>(body: &'a [u8], boundary: &str) -> Option<(&'a [u8], &'a [u8])> {
-    let delim = format!("--{boundary}");
-    let close = format!("--{boundary}--");
-    let (delim, close) = (delim.as_bytes(), close.as_bytes());
-
-    let mut pos = 0;
-    loop {
-        let (line, next) = next_line(body, pos)?;
-        if line == close {
-            return None;
-        }
-        if line == delim {
-            pos = next;
-            break;
-        }
-        pos = next;
-    }
-    let first_start = pos;
-    let mut first_end = None;
-    let mut second_start = 0;
-    let mut parts = 0;
-    while let Some((line, next)) = next_line(body, pos) {
-        if line == delim {
-            parts += 1;
-            if parts > 1 {
-                return None; // a third part
-            }
-            first_end = Some(pos);
-            second_start = next;
-        } else if line == close {
-            parts += 1;
-            if parts != 2 {
-                return None;
-            }
-            if body[next..].iter().any(|b| !matches!(b, b'\n' | b'\r')) {
-                return None;
-            }
-            return Some((&body[first_start..first_end?], &body[second_start..pos]));
-        }
-        pos = next;
-    }
-    None
-}
-
 /// Whether a part is the RFC 3156 version part: `application/pgp-encrypted`
 /// with exactly `Version: 1` as its body.
-fn is_version_part(part: &[u8]) -> bool {
-    let (block, sep, body) = split_message(part);
-    if sep.is_empty() {
+fn is_version_part(part: &Part<'_>) -> bool {
+    if part.separator.is_empty() {
         return false;
     }
-    let Some((_, start, end)) = header_spans(block)
+    let Some(header) = headers(part.headers)
         .into_iter()
-        .find(|(name, _, _)| name == "content-type")
+        .find(|header| header.is("content-type"))
     else {
         return false;
     };
-    let Some(media_type) = media_type(&block[start..end]) else {
+    let Some(media_type) = media_type(header.value(part.headers)) else {
         return false;
     };
-    media_type == "application/pgp-encrypted" && body.trim_ascii_end() == b"Version: 1"
+    media_type == "application/pgp-encrypted" && part.body.trim_ascii_end() == b"Version: 1"
 }
 
-/// The body of a MIME part whose Content-Type is `application/octet-stream`.
-fn part_body(part: &[u8]) -> Option<&[u8]> {
-    let (block, sep, body) = split_message(part);
-    if sep.is_empty() {
-        return None;
-    }
-    let (_, start, end) = header_spans(block)
+/// The bytes of a MIME part whose Content-Type is `application/octet-stream`,
+/// including the line ending before the closing delimiter. The armour ends with
+/// that newline, and gpg will not parse an armour that lacks it.
+fn part_body<'a>(part: &Part<'a>) -> Option<&'a [u8]> {
+    let header = headers(part.headers)
         .into_iter()
-        .find(|(name, _, _)| name == "content-type")?;
-    (media_type(&block[start..end])?.as_str() == "application/octet-stream").then_some(body)
+        .find(|header| header.is("content-type"))?;
+    (media_type(header.value(part.headers))?.as_str() == "application/octet-stream")
+        .then_some(part.body_with_ending)
 }
 
 /// The bare ASCII-armoured PGP message in a MIME part body, when the body is
@@ -364,61 +318,39 @@ fn armored_message(body: &[u8]) -> Option<&[u8]> {
     const BEGIN: &str = "-----BEGIN PGP MESSAGE-----";
     const END: &str = "-----END PGP MESSAGE-----";
 
-    let mut pos = 0;
-    let (begin, after_begin) = loop {
-        let (line, next) = next_line(body, pos)?;
-        if line.is_empty() {
-            pos = next;
-        } else if line == BEGIN.as_bytes() {
-            break (pos, next);
-        } else {
-            return None;
+    let mut body_lines = lines(body);
+    let begin = loop {
+        let line = body_lines.next()?;
+        if line.text.is_empty() {
+            continue;
         }
+        if line.text == BEGIN.as_bytes() {
+            break line.start;
+        }
+        return None;
     };
     // The line after BEGIN must be blank: a header comment belongs to the
     // clear text the store must not keep.
-    let (line, next) = next_line(body, after_begin)?;
-    if !line.is_empty() {
+    if !body_lines.next()?.text.is_empty() {
         return None;
     }
-    pos = next;
     let mut data = false;
     loop {
-        let (line, next) = next_line(body, pos)?;
-        if line == END.as_bytes() {
-            if !data || body[next..].iter().any(|b| !b.is_ascii_whitespace()) {
+        let line = body_lines.next()?;
+        if line.text == END.as_bytes() {
+            if !data || body[line.next..].iter().any(|b| !b.is_ascii_whitespace()) {
                 return None;
             }
-            return Some(&body[begin..next]);
+            return Some(&body[begin..line.next]);
         }
         let base64 = line
+            .text
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
-        if line.is_empty() || !base64 {
+        if line.text.is_empty() || !base64 {
             return None;
         }
         data = true;
-        pos = next;
-    }
-}
-
-/// One line of `block` from `pos`, without its line ending, and the offset of
-/// the line after it. `None` past the end.
-fn next_line(block: &[u8], pos: usize) -> Option<(&[u8], usize)> {
-    if pos >= block.len() {
-        return None;
-    }
-    match block[pos..].iter().position(|&b| b == b'\n') {
-        Some(off) => {
-            let nl = pos + off;
-            let end = if nl > pos && block[nl - 1] == b'\r' {
-                nl - 1
-            } else {
-                nl
-            };
-            Some((&block[pos..end], nl + 1))
-        }
-        None => Some((&block[pos..], block.len())),
     }
 }
 
@@ -583,84 +515,6 @@ fn ensure_gpg_home(gpg_home: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// (headers, separator, body) of an RFC 5322 message: the header block without
-/// its terminating empty line, that empty line itself, and everything after it.
-/// A message with no empty line has no body.
-fn split_message(msg: &[u8]) -> (&[u8], &[u8], &[u8]) {
-    let mut pos = 0;
-    while pos < msg.len() {
-        let Some(off) = msg[pos..].iter().position(|&b| b == b'\n') else {
-            break;
-        };
-        let nl = pos + off;
-        let line_end = if nl > pos && msg[nl - 1] == b'\r' {
-            nl - 1
-        } else {
-            nl
-        };
-        if line_end == pos {
-            return (&msg[..pos], &msg[pos..=nl], &msg[nl + 1..]);
-        }
-        pos = nl + 1;
-    }
-    (msg, b"", b"")
-}
-
-/// The span of every header in a block: its lowercase name, and the byte range
-/// covering it plus its folded continuation lines, excluding the final line
-/// ending.
-///
-/// Only a line beginning with a space or tab continues the header above it. A
-/// line that is neither a header nor a continuation belongs to no span:
-/// `rfc3156_envelope` copies exposed spans into the unencrypted wrapper, so
-/// folding arbitrary text in would put it outside the ciphertext. The payload
-/// copies the whole block regardless, so no bytes are lost.
-fn header_spans(block: &[u8]) -> Vec<(String, usize, usize)> {
-    let mut spans: Vec<(String, usize, usize)> = Vec::new();
-    // The previous line was a header or one of its continuations.
-    let mut open = false;
-    let mut pos = 0;
-    while pos < block.len() {
-        // A bare CR ends a line too: a message that never reached LF
-        // normalisation must not be read as one enormous header.
-        let (line_end, next) = match block[pos..].iter().position(|&b| b == b'\n' || b == b'\r') {
-            Some(off) => {
-                let end = pos + off;
-                let next = if block[end] == b'\r' && block.get(end + 1) == Some(&b'\n') {
-                    end + 2
-                } else {
-                    end + 1
-                };
-                (end, next)
-            }
-            None => (block.len(), block.len()),
-        };
-        let line = &block[pos..line_end];
-        let continuation = matches!(line.first(), Some(b' ' | b'\t'));
-        let name = if continuation {
-            None
-        } else {
-            line.iter()
-                .position(|&b| b == b':')
-                .map(|c| String::from_utf8_lossy(&line[..c]).to_ascii_lowercase())
-        };
-        match name {
-            Some(name) => {
-                spans.push((name, pos, line_end));
-                open = true;
-            }
-            None if continuation && open => {
-                if let Some(last) = spans.last_mut() {
-                    last.2 = line_end;
-                }
-            }
-            None => open = false,
-        }
-        pos = next;
-    }
-    spans
-}
-
 /// Line ending to synthesize with, matching the message rather than guessing.
 fn nl_style(msg: &[u8]) -> &'static [u8] {
     if msg.contains(&b'\r') {
@@ -679,15 +533,18 @@ fn nl_style(msg: &[u8]) -> &'static [u8] {
 /// instead of the wrapper's placeholder (Protected Headers for Cryptographic
 /// E-mail, draft-autocrypt-lamps-protected-headers). Without it the placeholder
 /// is all a client can show for every message.
-fn protected_payload(msg: &[u8]) -> Vec<u8> {
-    let (block, sep, body) = split_message(msg);
-    let mut out = Vec::with_capacity(msg.len() + 64);
+///
+/// Takes the one `split_message` result the caller already holds, so the
+/// payload and the wrapper cannot be built from different header blocks.
+fn protected_payload(block: &[u8], sep: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(block.len() + sep.len() + body.len() + 64);
 
-    match header_spans(block)
+    match headers(block)
         .into_iter()
-        .find(|(name, _, _)| name == "content-type")
+        .find(|header| header.is("content-type"))
     {
-        Some((_, _, end)) => {
+        Some(header) => {
+            let end = header.end();
             out.extend_from_slice(&block[..end]);
             // A parameter list that already ends in ';' must not gain an empty
             // parameter, so add the separator only when it is missing.
@@ -737,14 +594,14 @@ const EXPOSED_HEADERS: [&str; 6] = ["from", "to", "cc", "reply-to", "date", "mes
 /// real subject: the mail store holds this in the clear and must not reveal
 /// correspondence content. The placeholder keeps a client from showing an empty
 /// subject before it decrypts, and `protected_payload` is what lets it replace
-/// the placeholder with the real one afterwards.
-fn rfc3156_envelope(boundary: &str, armor: &[u8], msg: &[u8]) -> Vec<u8> {
-    let (block, _, _) = split_message(msg);
-    let mut out = Vec::with_capacity(armor.len() + msg.len().min(4096) + 512);
+/// the placeholder with the real one afterwards. `block` is the header block
+/// from the same `split_message` call that produced the payload.
+fn rfc3156_envelope(boundary: &str, armor: &[u8], block: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(armor.len() + block.len().min(4096) + 512);
     out.extend_from_slice(format!("{ENVELOPE_MARKER}\n\tboundary=\"{boundary}\"\n").as_bytes());
-    for (name, start, end) in header_spans(block) {
-        if EXPOSED_HEADERS.contains(&name.as_str()) {
-            out.extend_from_slice(&block[start..end]);
+    for header in headers(block) {
+        if EXPOSED_HEADERS.iter().any(|name| header.is(name)) {
+            out.extend_from_slice(&block[header.start()..header.end()]);
             out.push(b'\n');
         }
     }
@@ -794,12 +651,16 @@ pub mod fuzz {
     /// spans, the payload rewrite, the gate that decides a re-uploaded message
     /// is already ciphertext, and the recipient guard on the save path.
     pub fn message(input: &[u8]) {
-        let (block, _, _) = split_message(input);
-        let _ = header_spans(block);
         let _ = nl_style(input);
-        let payload = protected_payload(input);
         let _ = envelope_ciphertext(input);
-        let _ = rfc3156_envelope("fuzz-boundary", &[], &payload);
+        if let Ok(message) = split_message(input) {
+            let _ = headers(message.headers);
+            let payload = protected_payload(message.headers, message.separator, message.body);
+            let _ = rfc3156_envelope("fuzz-boundary", &[], message.headers);
+            if let Ok(payload) = split_message(&payload) {
+                let _ = rfc3156_envelope("fuzz-boundary", &[], payload.headers);
+            }
+        }
         let _ = base_localpart(&String::from_utf8_lossy(input));
     }
 
@@ -807,7 +668,10 @@ pub mod fuzz {
     /// whatever the message was. The build and the gate have to agree, or a
     /// re-uploaded message is encrypted a second time.
     pub fn envelope(input: &[u8]) {
-        let wrapper = rfc3156_envelope("fuzz-boundary", ARMOR, input);
+        let Ok(message) = split_message(input) else {
+            return;
+        };
+        let wrapper = rfc3156_envelope("fuzz-boundary", ARMOR, message.headers);
         assert_eq!(envelope_ciphertext(&wrapper), Some(ARMOR));
     }
 }
@@ -825,7 +689,24 @@ mod tests {
         body line\n";
 
     fn payload(msg: &[u8]) -> String {
-        String::from_utf8_lossy(&protected_payload(msg)).into_owned()
+        let message = split_message(msg).expect("test message splits");
+        String::from_utf8_lossy(&protected_payload(
+            message.headers,
+            message.separator,
+            message.body,
+        ))
+        .into_owned()
+    }
+
+    /// The wrapper the save path builds around `armor` for `msg`, from the same
+    /// split that produces the payload.
+    fn built_with(boundary: &str, armor: &[u8], msg: &[u8]) -> Vec<u8> {
+        let message = split_message(msg).expect("test message splits");
+        rfc3156_envelope(boundary, armor, message.headers)
+    }
+
+    fn built(armor: &[u8], msg: &[u8]) -> Vec<u8> {
+        built_with("b", armor, msg)
     }
 
     #[test]
@@ -927,7 +808,7 @@ mod tests {
 
     #[test]
     fn envelope_exposes_transport_metadata_only() {
-        let env = String::from_utf8_lossy(&rfc3156_envelope("b", ARMOR, MESSAGE)).into_owned();
+        let env = String::from_utf8_lossy(&built(ARMOR, MESSAGE)).into_owned();
         assert!(
             env.starts_with("Content-Type: multipart/encrypted;"),
             "{env}"
@@ -960,7 +841,7 @@ mod tests {
             Date: Mon, 1 Jan 2024 00:00:00 +0000\n\
             \n\
             body\n";
-        let env = String::from_utf8_lossy(&rfc3156_envelope("b", ARMOR, msg)).into_owned();
+        let env = String::from_utf8_lossy(&built(ARMOR, msg)).into_owned();
         assert!(!env.contains("smuggled plaintext"), "{env}");
         assert!(
             env.contains("To: bob@example.invalid,\n\tcarol@example.invalid\n"),
@@ -999,7 +880,7 @@ mod tests {
     }
 
     fn envelope() -> Vec<u8> {
-        rfc3156_envelope("b", ARMOR, MESSAGE)
+        built(ARMOR, MESSAGE)
     }
 
     /// A 618-byte armoured message: a compressed packet (algo 1, raw deflate)
@@ -1072,7 +953,7 @@ mod tests {
             list_packets(bomb, &home).is_none(),
             "an over-cap listing must not be read"
         );
-        let envelope = rfc3156_envelope("b", bomb, MESSAGE);
+        let envelope = built(bomb, MESSAGE);
         assert!(
             already_encrypted(&envelope, Path::new("no-such-cert"), &home).is_none(),
             "a packet bomb is encrypted, not kept as ciphertext"
@@ -1128,9 +1009,7 @@ mod tests {
                 }
                 msg.push_str(&format!("{blank}body {SENTINEL}-body{sep}"));
 
-                let wrapper =
-                    String::from_utf8_lossy(&rfc3156_envelope("b", ARMOR, msg.as_bytes()))
-                        .into_owned();
+                let wrapper = String::from_utf8_lossy(&built(ARMOR, msg.as_bytes())).into_owned();
                 for (name, value) in &exposed {
                     assert!(
                         wrapper.contains(&format!("{name}: {value}")),
@@ -1151,6 +1030,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_bare_cr_separator_does_not_leak_a_colon_bearing_body_line() {
+        // The separator is a bare CR. An LF-only split left the whole message in
+        // the header block, so `header_spans` read this body line as a second
+        // From and copied it into the clear wrapper.
+        let msg = b"From: a@b\rSubject: s\r\rFrom: SECRET-BODY-TEXT\r\n";
+        let env = String::from_utf8_lossy(&built(ARMOR, msg)).into_owned();
+        assert!(!env.contains("SECRET-BODY-TEXT"), "the body leaked:\n{env}");
+        assert!(env.contains("From: a@b\n"), "{env}");
+        let p = payload(msg);
+        assert!(p.contains("From: SECRET-BODY-TEXT\r\n"), "{p}");
+    }
+
+    #[test]
+    fn a_cr_only_message_does_not_leak_a_colon_bearing_body_line() {
+        // A whole message with no LF at all: the old split saw one line, so the
+        // From after the empty CR line counted as a header and was exposed.
+        let msg = b"From: a@b\rSubject: s\r\rFrom: CR-ONLY-SECRET\rbody text\r";
+        let env = String::from_utf8_lossy(&built(ARMOR, msg)).into_owned();
+        assert!(!env.contains("CR-ONLY-SECRET"), "the body leaked:\n{env}");
+        assert!(env.contains("From: a@b\n"), "{env}");
+        let p = payload(msg);
+        assert!(p.contains("From: CR-ONLY-SECRET\rbody text\r"), "{p}");
+    }
+
+    #[test]
+    fn a_message_whose_only_separator_is_unrecognised_is_refused() {
+        // No empty line this rule accepts, and not every line is a header: the
+        // From may be body text behind a separator the parser cannot see.
+        // Reading it as headers would copy that span outside the ciphertext, so
+        // the save fails closed instead.
+        let msg = b"not a header\rFrom: SECRET-BODY-TEXT\r";
+        assert!(matches!(
+            split_message(msg).map_err(Error::from),
+            Err(Error::Malformed(_))
+        ));
+        // A message that ends in its header block is still encrypted as before.
+        assert!(split_message(b"From: a@b\rSubject: s\r").is_ok());
     }
 
     #[test]
@@ -1226,7 +1145,7 @@ mod tests {
         // Saving it rebuilds the outer message around that ciphertext, so the
         // transport headers, the sender's subject and its preamble are gone and
         // the ciphertext is untouched.
-        let saved = rfc3156_envelope("n", ARMOR, msg.as_bytes());
+        let saved = built_with("n", ARMOR, msg.as_bytes());
         let text = String::from_utf8_lossy(&saved);
         assert!(text.starts_with(ENVELOPE_MARKER), "{text}");
         assert!(text.contains("Subject: ...\n"), "{text}");
@@ -1241,6 +1160,35 @@ mod tests {
         assert!(
             text.contains(String::from_utf8_lossy(ARMOR).as_ref()),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn an_envelope_with_only_bare_cr_line_endings_is_recognised() {
+        // The armour scan must use the same line rule as the header split, or
+        // an all-CR envelope is encrypted a second time.
+        let lf = format!(
+            "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";\n\
+             \tboundary=\"b\"\n\
+             MIME-Version: 1.0\n\
+             \n\
+             --b\n\
+             Content-Type: application/pgp-encrypted\n\
+             \n\
+             Version: 1\n\
+             \n\
+             --b\n\
+             Content-Type: application/octet-stream\n\
+             \n\
+             {}\n\
+             --b--\n",
+            String::from_utf8_lossy(ARMOR)
+        );
+        let bare_cr = lf.replace('\n', "\r");
+        let armor_cr = String::from_utf8_lossy(ARMOR).replace('\n', "\r");
+        assert_eq!(
+            envelope_ciphertext(bare_cr.as_bytes()),
+            Some(armor_cr.as_bytes())
         );
     }
 
@@ -1277,7 +1225,7 @@ mod tests {
         let ciphertext = envelope_ciphertext(msg.as_bytes()).expect("recognised");
         assert_eq!(ciphertext, ARMOR);
 
-        let saved = rfc3156_envelope("n", ciphertext, msg.as_bytes());
+        let saved = built_with("n", ciphertext, msg.as_bytes());
         let text = String::from_utf8_lossy(&saved);
         assert!(text.contains("Subject: ...\n"), "{text}");
         for leaked in [

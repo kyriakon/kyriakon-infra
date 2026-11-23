@@ -37,7 +37,6 @@ deploy-nsd.sh
 gen-finger-page.sh
 rehearsal.sh
 rekey-mail-key.sh
-renew-acme.sh
 restore-standup.sh
 "
 

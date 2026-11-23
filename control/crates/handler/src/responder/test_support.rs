@@ -90,16 +90,19 @@ pub(crate) async fn ask(app: &App, bytes: &[u8]) -> (u16, String) {
         .expect("the fixture is a request")
         .expect("the fixture is one request");
     let outcome = respond(app, &request).await;
-    let (body, last) = fixture::reply(&fastcgi::reply_bytes(&outcome.reply, request.id()));
+    let code = outcome.reply.code();
+    let mut out = Vec::new();
+    fastcgi::Answer::Reply(outcome.reply)
+        .write_to(&mut out, request.id(), None)
+        .await
+        .expect("the reply is written");
+    let (body, last) = fixture::reply(&out);
     assert_eq!(
         last,
         fixture::END,
         "the reply is finished rather than truncated"
     );
-    (
-        outcome.reply.code(),
-        String::from_utf8_lossy(&body).into_owned(),
-    )
+    (code, String::from_utf8_lossy(&body).into_owned())
 }
 
 /// The request httpd builds for a GET, with the address relayd set.

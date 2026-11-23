@@ -174,7 +174,7 @@ classify_script() {
 classify() {
 	case "$1" in
 	control/*) needs_control=yes ;;
-	kyriakon-encrypt/* | dovecot-plugin/*) needs_mail=yes ;;
+	kyriakon-encrypt/* | mailparse/* | dovecot-plugin/*) needs_mail=yes ;;
 	openbsd/dovecot/*) needs_mail=yes ;;
 	# Both deploys read the package table, and either side's rows can change.
 	openbsd/packages.tsv) needs_mail=yes; needs_control=yes ;;
@@ -652,6 +652,9 @@ self_test() {
 	reset_plan
 	classify 'scripts/deploy-mail.sh'
 	check 'the mail deploy plans itself' "$needs_mail" yes
+	reset_plan
+	classify 'mailparse/src/lib.rs'
+	check 'a shared parser change plans deploy-mail' "$needs_mail" yes
 	reset_plan
 	classify 'scripts/deploy-relayd.sh'
 	check 'the relay deploy plans itself' "$needs_relayd" yes

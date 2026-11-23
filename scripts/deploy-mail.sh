@@ -266,7 +266,7 @@ install_keyring_key() {
 			return 0
 		fi
 	fi
-	install -m 0644 "$1" "$keyring_dir/$name"
+	write_atomic "$keyring_dir/$name" "" 0644 "$1" || return 1
 	printf 'installed %s\n' "$name"
 	warn_aead "$1"
 }
@@ -933,9 +933,10 @@ self_test() {
 
 	# --- the auto-merge guard ---
 	# A key's name is not the key. The pull request's file list carries no mode, so
-	# the workflow reads what the blob is from the contents API; the snippet is run
-	# here from the workflow's own bytes, with gh stubbed, because it is the only
-	# check standing between a symlink pushed as keys/x.asc and the install above.
+	# the workflow reads each blob's mode from the head commit's tree; the snippet
+	# is run here from the workflow's own bytes, with gh stubbed, because it is the
+	# only check standing between a symlink pushed as keys/x.asc and the install
+	# above.
 	workflow="$repo_dir/.github/workflows/auto-merge-key.yml"
 	guard=$(awk '/# --- added key blob guard: run by/ { found = 1 }
 		found { print }
@@ -950,8 +951,19 @@ self_test() {
 	export HEAD_SHA=0123456789abcdef0123456789abcdef01234567
 	gh() {
 		case "$*" in
-		*keys/link.asc*) printf 'symlink\n' ;;
-		*keys/absent.asc*) return 1 ;;
+		*git/trees/*)
+			printf '%s\n' \
+				'100644 keys/good.asc' \
+				'120000 keys/link.asc' \
+				'120000 keys/oliver.asc?x=.asc'
+			;;
+		# A contents URL read the old way: GitHub takes the path up to the first
+		# ?, so the injected query answers for the plain key on the default
+		# branch. Stubbed so this case fails against that guard.
+		*contents/keys/link.asc*) printf 'symlink\n' ;;
+		*contents/keys/absent.asc*) return 1 ;;
+		*contents/keys/oliver.asc*) printf 'file\n' ;;
+		*contents/*) printf 'file\n' ;;
 		*) printf 'file\n' ;;
 		esac
 	}
@@ -964,8 +976,13 @@ self_test() {
 	check "and the guard names it and what it is" \
 		"$(grep -c '^keys/link.asc is not a regular file (symlink)$' "$tree/guard.out")" 1
 	code=0
+	( keys_regular 'keys/oliver.asc?x=.asc' ) > "$tree/guard-inject.out" 2>&1 || code=$?
+	check "a name that injects a contents query is not merged" "$code" 1
+	check "and the guard names it and what it is" \
+		"$(grep -c '^keys/oliver.asc?x=.asc is not a regular file (symlink)$' "$tree/guard-inject.out")" 1
+	code=0
 	( keys_regular keys/absent.asc ) > "$tree/guard-absent.out" 2>&1 || code=$?
-	check "a blob the contents API cannot answer for is not merged" "$code" 1
+	check "a blob the tree cannot answer for is not merged" "$code" 1
 	code=0
 	( keys_regular ) >/dev/null 2>&1 || code=$?
 	check "a removal with no added key passes the guard" "$code" 0
@@ -1024,7 +1041,8 @@ for f in openbsd/etc/smtpd.conf openbsd/etc/httpd.conf openbsd/etc/gmid.conf \
 	openbsd/dovecot/dovecot.conf \
 	openbsd/etc/spamd.alloweddomains openbsd/etc/spamd.conf openbsd/etc/nospamd \
 	openbsd/etc/kyriakon.env openbsd/etc/newsyslog.conf \
-	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml keys scripts/setup-env.sh; do
+	dovecot-plugin/Makefile kyriakon-encrypt/Cargo.toml mailparse/Cargo.toml \
+	keys scripts/setup-env.sh; do
 	[ -e "$repo_dir/$f" ] || { printf 'missing from repo_dir: %s\n' "$f" >&2; exit 1; }
 done
 
@@ -1829,6 +1847,7 @@ fi
 # install with "install: /root/bin/INS@...: No such file or directory".
 # 0755 inside /root, which is already 0700 root.
 install -d -m 0755 /root/bin
+install -d -m 0755 /root/bin/lib
 # The scripts themselves, from the table's /root/bin rows. Nothing used to put
 # them there, so every box had them copied by hand from the repo and each crontab
 # line pasted by hand too, which is how the monitor spent a week unscheduled.

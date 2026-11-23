@@ -8,10 +8,12 @@
 //! request, and the reply is a CGI header block, so the pages above this module
 //! are the same pages they were.
 //!
-//! Only the responder side is here: read the parameters and the body, write the
-//! reply. That is what the two front-ends on this box send and accept, and nothing
-//! more is implemented, because a protocol implemented further than its peers need
-//! is a protocol with untested paths.
+//! The responder side of the wire, and the server that drives it: bind the unix
+//! socket, take a bounded number of connections, read the parameters and the
+//! body under a deadline, write the reply under the same deadline. That is what
+//! the two front-ends on this box send and accept, and nothing more is
+//! implemented, because a protocol implemented further than its peers need is a
+//! protocol with untested paths.
 //!
 //! Three details of the wire are worth stating where the code can be read against
 //! them.
@@ -32,9 +34,16 @@
 //! one where it fits, so both are read.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::ErrorKind;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::UnixStream;
+
+use crate::socket;
 
 /// The version byte of the FastCGI specification this speaks. A record that does
 /// not carry it is not a record this responder can read, so the connection fails
@@ -68,9 +77,9 @@ pub struct Request {
     /// The request body, from the `FCGI_STDIN` records. Empty for every gemini
     /// request, which has no body at all, and the form post for the web's.
     pub body: Vec<u8>,
-    /// Whether the body ran past the cap the caller set. The body is still read to
-    /// its end, so the request can be answered rather than the connection dropped,
-    /// and the answer is a refusal.
+    /// Whether the body ran past the cap the caller set. The body stops at the
+    /// first record that would cross it, so the connection must be closed after
+    /// the refusal rather than read again.
     pub body_too_large: bool,
     /// Whether the front-end asked for the connection to stay open.
     pub keep_conn: bool,
@@ -159,17 +168,18 @@ impl Error {
 /// Read one request, or `None` when the peer closed between requests, which is how
 /// both front-ends finish a connection.
 ///
-/// `body_cap` is the most of a body the caller will accept. A body over it is
-/// still read to its end and reported through `body_too_large`, because the
-/// front-end is mid-request: dropping the connection there would leave the client
-/// with a reset rather than with the refusal the caller can still send.
+/// `body_cap` is the most of a body the caller will accept. A record that would
+/// cross it is not read to its end: the request comes back with `body_too_large`
+/// and the connection must be closed after the refusal. Draining an unbounded
+/// slow POST to find its terminator is what lets a stranger pin a task and a
+/// descriptor, and a front-end that is refused the body has nothing left to say
+/// on the connection.
 pub async fn read_request<R: AsyncRead + Unpin>(
     reader: &mut R,
     body_cap: usize,
 ) -> Result<Option<Request>, Error> {
     let mut env_buf = Vec::new();
     let mut body = Vec::new();
-    let mut body_too_large = false;
     let mut keep_conn = false;
     let mut id = 0u16;
     let mut begun = false;
@@ -257,10 +267,18 @@ pub async fn read_request<R: AsyncRead + Unpin>(
                     break;
                 }
                 if body.len() + content.len() > body_cap {
-                    body_too_large = true;
-                } else {
-                    body.extend_from_slice(&content);
+                    // Stop reading here rather than draining the body: the rest
+                    // of it may never arrive, and the connection is closed after
+                    // the refusal below.
+                    return Ok(Some(Request {
+                        env: params(&env_buf)?,
+                        body,
+                        body_too_large: true,
+                        keep_conn,
+                        id,
+                    }));
                 }
+                body.extend_from_slice(&content);
             }
             ABORT_REQUEST => {
                 return Err(Error::Malformed(
@@ -274,7 +292,7 @@ pub async fn read_request<R: AsyncRead + Unpin>(
     Ok(Some(Request {
         env: params(&env_buf)?,
         body,
-        body_too_large,
+        body_too_large: false,
         keep_conn,
         id,
     }))
@@ -546,7 +564,11 @@ pub enum Body<'a> {
     /// A file read as it is written. A member's upload costs one buffer here
     /// rather than one whole file per in-flight request, and both front-ends
     /// take the body into their own buffer anyway, so a copy here would double
-    /// what one download costs.
+    /// what one download costs. A file shorter than the announced length is an
+    /// error, not a short reply: the end marker is never sent for a body the
+    /// front-end would take as complete ([#913]).
+    ///
+    /// [#913]: https://github.com/kyriakon/kyriakon-infra/issues/913
     File(&'a mut tokio::fs::File, u64),
 }
 
@@ -559,14 +581,15 @@ pub async fn write_reply<W: AsyncWrite + Unpin>(
     head: &[u8],
     body: Body<'_>,
     id: u16,
+    deadline: Option<Duration>,
 ) -> std::io::Result<()> {
     for chunk in head.chunks(MAX_CONTENT) {
-        put_record(writer, STDOUT, id, chunk).await?;
+        put_record(writer, STDOUT, id, chunk, deadline).await?;
     }
     match body {
         Body::Bytes(bytes) => {
             for chunk in bytes.chunks(MAX_CONTENT) {
-                put_record(writer, STDOUT, id, chunk).await?;
+                put_record(writer, STDOUT, id, chunk, deadline).await?;
             }
         }
         Body::File(file, len) => {
@@ -578,68 +601,195 @@ pub async fn write_reply<W: AsyncWrite + Unpin>(
                 let want = (buf.len() as u64).min(left) as usize;
                 let read = file.read(&mut buf[..want]).await?;
                 if read == 0 {
-                    break;
+                    // The file shrank after its length was taken. Ending here
+                    // would send a shorter body under a length the front-end
+                    // already accepted, which is a truncation presented as a
+                    // complete answer.
+                    return Err(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "the file ended before the length it was announced with",
+                    ));
                 }
                 left -= read as u64;
-                put_record(writer, STDOUT, id, &buf[..read]).await?;
+                put_record(writer, STDOUT, id, &buf[..read], deadline).await?;
             }
         }
     }
-    put_record(writer, END_REQUEST, id, &[0; 8]).await?;
-    writer.flush().await
+    put_record(writer, END_REQUEST, id, &[0; 8], deadline).await?;
+    match deadline {
+        Some(limit) => tokio::time::timeout(limit, writer.flush())
+            .await
+            .map_err(|_| {
+                std::io::Error::new(ErrorKind::TimedOut, "the reply was not sent in time")
+            })?,
+        None => writer.flush().await,
+    }
 }
 
 /// One record, written header then content: the bytes go straight to the socket
 /// rather than through a buffer the size of the chunk, so streaming a file costs
 /// the read buffer and nothing else.
+///
+/// `deadline` bounds this record's write. It is applied per record rather than to
+/// the whole reply, so a client that keeps accepting records is not dropped for
+/// being slow overall; a client that stops accepting one is.
 async fn put_record<W: AsyncWrite + Unpin>(
     writer: &mut W,
     kind: u8,
     id: u16,
     content: &[u8],
+    deadline: Option<Duration>,
 ) -> std::io::Result<()> {
     let mut header = [0u8; HEADER];
     header[0] = VERSION;
     header[1] = kind;
     header[2..4].copy_from_slice(&id.to_be_bytes());
     header[4..6].copy_from_slice(&(content.len() as u16).to_be_bytes());
-    writer.write_all(&header).await?;
-    if !content.is_empty() {
-        writer.write_all(content).await?;
+    let record = async {
+        writer.write_all(&header).await?;
+        if !content.is_empty() {
+            writer.write_all(content).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    match deadline {
+        Some(limit) => tokio::time::timeout(limit, record).await.map_err(|_| {
+            std::io::Error::new(ErrorKind::TimedOut, "the record was not sent in time")
+        })?,
+        None => record.await,
     }
-    Ok(())
 }
 
-/// The reply as the front-end reads it: the header block and the body across as
-/// many `FCGI_STDOUT` records as they need, then the end marker.
+/// One request's answer: a reply already in memory, or a member's file streamed
+/// behind its header block.
+pub enum Answer {
+    Reply(Reply),
+    /// A file whose bytes are written as they are read.
+    File {
+        head: Vec<u8>,
+        file: tokio::fs::File,
+        len: u64,
+        code: u16,
+    },
+}
+
+impl Answer {
+    /// The status this answer carries, for a log line.
+    pub fn code(&self) -> u16 {
+        match self {
+            Answer::Reply(reply) => reply.code(),
+            Answer::File { code, .. } => *code,
+        }
+    }
+
+    /// Write the answer, end marker included, to one front-end. `deadline` is the
+    /// longest one record may take to be accepted; a streamed file resets it for
+    /// each record, so a slow client that keeps reading is served.
+    pub async fn write_to<W: AsyncWrite + Unpin>(
+        self,
+        writer: &mut W,
+        id: u16,
+        deadline: Option<Duration>,
+    ) -> std::io::Result<()> {
+        match self {
+            Answer::Reply(reply) => {
+                let head = reply.head_block();
+                write_reply(writer, &head, Body::Bytes(reply.body()), id, deadline).await
+            }
+            Answer::File {
+                head,
+                mut file,
+                len,
+                ..
+            } => write_reply(writer, &head, Body::File(&mut file, len), id, deadline).await,
+        }
+    }
+}
+
+/// Bind the socket `path` names and answer FastCGI requests until the listener
+/// fails. The socket bind, accept loop and permit count are `socket`'s; the wire
+/// and a body cap are this module's.
 ///
-/// The end marker is what tells both front-ends the response is complete, and gmid
-/// refuses one whose body is not exactly eight bytes, so it is written in full.
-pub fn reply_bytes(reply: &Reply, id: u16) -> Vec<u8> {
-    let content = reply.head();
-    let mut out = Vec::with_capacity(content.len() + 2 * HEADER + 8);
-    // Every reply carries a header block, so the first record is never empty,
-    // which matters: httpd aborts a request whose first stdout record is empty
-    // ("empty stdout", server_fcgi.c), and gmid waits for a header it would then
-    // never see.
-    for chunk in content.chunks(MAX_CONTENT) {
-        push_record(&mut out, STDOUT, id, chunk);
-    }
-    // appStatus and protocolStatus, both zero: the application finished and the
-    // protocol had no trouble. A protocol status is not an HTTP or gemini status
-    // and cannot carry one, which is why a refusal is the reply header above.
-    push_record(&mut out, END_REQUEST, id, &[0; 8]);
-    out
+/// The deadline is applied per operation rather than to the connection as a
+/// whole: each request read and each record written must finish within it. A
+/// streamed file is therefore dropped only when the client stops accepting
+/// records, not when the whole transfer is slower than one deadline.
+pub async fn serve<F, Fut>(
+    path: &Path,
+    limits: socket::Limits,
+    body_cap: usize,
+    answer: F,
+) -> std::io::Result<()>
+where
+    F: Fn(Request) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Answer> + Send + 'static,
+{
+    let listener = socket::bind(path)?;
+    let answer = Arc::new(answer);
+    let deadline = limits.deadline;
+    let program = limits.program;
+    socket::accept(listener, limits, "front-end", move |stream| {
+        let answer = answer.clone();
+        async move {
+            if let Err(error) = connection(stream, body_cap, deadline, &*answer).await {
+                crate::util::log(&format!(
+                    "{program}: the fastcgi connection failed: {error}"
+                ));
+            }
+        }
+    })
+    .await
 }
 
-fn push_record(out: &mut Vec<u8>, kind: u8, id: u16, content: &[u8]) {
-    let len = content.len() as u16;
-    out.extend_from_slice(&[VERSION, kind]);
-    out.extend_from_slice(&id.to_be_bytes());
-    out.extend_from_slice(&len.to_be_bytes());
-    out.push(0); // no padding: the response is written whole, so none is needed
-    out.push(0); // reserved
-    out.extend_from_slice(content);
+/// Answer the requests on one connection. Both front-ends connect for one
+/// request and close, and gmid asks for the connection to be kept in case it has
+/// another, so the loop runs until the peer closes, the request is refused for
+/// its body, or a record cannot be read.
+async fn connection<F, Fut>(
+    stream: UnixStream,
+    body_cap: usize,
+    deadline: Duration,
+    answer: &F,
+) -> Result<(), Error>
+where
+    F: Fn(Request) -> Fut,
+    Fut: Future<Output = Answer>,
+{
+    let (mut reader, mut writer) = stream.into_split();
+    loop {
+        let request =
+            match tokio::time::timeout(deadline, read_request(&mut reader, body_cap)).await {
+                Ok(result) => match result? {
+                    Some(request) => request,
+                    None => return Ok(()),
+                },
+                Err(_) => {
+                    return Err(Error::Io {
+                        what: "read a request",
+                        source: std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            "the request was not read in time",
+                        ),
+                    })
+                }
+            };
+        let id = request.id();
+        let keep_conn = request.keep_conn;
+        // The body was not read to its end, so the bytes still on the socket
+        // belong to a request that is already refused: answer once and close.
+        let refused = request.body_too_large;
+        answer(request)
+            .await
+            .write_to(&mut writer, id, Some(deadline))
+            .await
+            .map_err(|source| Error::Io {
+                what: "write the reply",
+                source,
+            })?;
+        if refused || !keep_conn {
+            return Ok(());
+        }
+    }
 }
 
 /// The reason phrase for a status, in httpd's own table's spelling so the two
@@ -788,8 +938,16 @@ mod tests {
 
     /// One record, for the tests that build a stream by hand.
     fn record(kind: u8, id: u16, content: &[u8]) -> Vec<u8> {
+        fixture::raw(id, kind, content)
+    }
+
+    /// A reply as the front-end reads it.
+    async fn wire(reply: Reply, id: u16) -> Vec<u8> {
         let mut out = Vec::new();
-        push_record(&mut out, kind, id, content);
+        Answer::Reply(reply)
+            .write_to(&mut out, id, None)
+            .await
+            .unwrap();
         out
     }
 
@@ -895,17 +1053,17 @@ mod tests {
         assert!(read_request(&mut &buf[..], 1024).await.is_err());
     }
 
-    #[test]
-    fn a_gemini_reply_is_the_header_the_body_and_the_end_marker() {
-        let bytes = reply_bytes(&Reply::gemini(20, "text/gemini", "# hello\n"), 1);
+    #[tokio::test]
+    async fn a_gemini_reply_is_the_header_the_body_and_the_end_marker() {
+        let bytes = wire(Reply::gemini(20, "text/gemini", "# hello\n"), 1).await;
         let (body, last) = fixture::reply(&bytes);
         assert_eq!(last, END, "the reply is finished, not truncated");
         assert_eq!(body, b"20 text/gemini\r\n# hello\n");
     }
 
-    #[test]
-    fn an_http_reply_carries_the_status_the_headers_and_the_body() {
-        let bytes = reply_bytes(&Reply::capability(422, "<p>no</p>".into()), 1);
+    #[tokio::test]
+    async fn an_http_reply_carries_the_status_the_headers_and_the_body() {
+        let bytes = wire(Reply::capability(422, "<p>no</p>".into()), 1).await;
         let (body, last) = fixture::reply(&bytes);
         assert_eq!(last, END);
         let text = String::from_utf8(body).unwrap();
@@ -919,15 +1077,15 @@ mod tests {
 
     /// Every HTML reply carries the policy, including the bare error and refusal
     /// pages a caller answers with no body.
-    #[test]
-    fn every_html_reply_carries_the_content_security_policy() {
+    #[tokio::test]
+    async fn every_html_reply_carries_the_content_security_policy() {
         for reply in [
             Reply::html(200, "<p>page</p>".into()),
             Reply::html(404, String::new()),
             Reply::capability(200, "<p>page</p>".into()),
             Reply::Http(Http::redirect("/account")),
         ] {
-            let bytes = reply_bytes(&reply, 1);
+            let bytes = wire(reply, 1).await;
             let (body, _) = fixture::reply(&bytes);
             let text = String::from_utf8(body).unwrap();
             assert!(
@@ -939,10 +1097,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_page_larger_than_one_record_goes_out_as_several() {
+    #[tokio::test]
+    async fn a_page_larger_than_one_record_goes_out_as_several() {
         let body = "x".repeat(MAX_CONTENT + 10);
-        let bytes = reply_bytes(&Reply::html(200, body), 1);
+        let bytes = wire(Reply::html(200, body), 1).await;
         let mut at = 0;
         let mut stdout = 0;
         while at < bytes.len() {
@@ -960,6 +1118,233 @@ mod tests {
             }
             at += HEADER + len;
         }
-        assert_eq!(stdout, 2, "the header block and the body over two records");
+        assert_eq!(
+            stdout, 3,
+            "the header block and the body over two more records"
+        );
+    }
+
+    /// A directory with a socket path of its own, so each test's listener cannot
+    /// collide with another's.
+    fn temp_socket(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kyriakon-fastcgi-{}-{name}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.sock");
+        (dir, path)
+    }
+
+    fn spawn_server<F, Fut>(
+        path: std::path::PathBuf,
+        limits: socket::Limits,
+        body_cap: usize,
+        answer: F,
+    ) -> tokio::task::JoinHandle<std::io::Result<()>>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Answer> + Send + 'static,
+    {
+        tokio::spawn(async move { serve(&path, limits, body_cap, answer).await })
+    }
+    /// Wait until the listener's path exists. `serve` binds before its first
+    /// await, and the wait yields so its task runs.
+    async fn wait_for(path: &Path) {
+        for _ in 0..400 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the server did not bind {}", path.display());
+    }
+
+    /// One request over a socket, read to the reply's end.
+    async fn round_trip(path: &Path, bytes: &[u8]) -> Vec<u8> {
+        let mut stream = UnixStream::connect(path).await.unwrap();
+        stream.write_all(bytes).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        out
+    }
+
+    /// A slow POST against a listener with no body budget is refused on its
+    /// first body record, not after a terminator the client may never send, and
+    /// its permit is free again by the time the reply is read.
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_refused_without_waiting_or_holding_a_permit() {
+        let (_dir, path) = temp_socket("body-cap");
+        let server = spawn_server(
+            path.clone(),
+            socket::Limits {
+                connections: 1,
+                deadline: Duration::from_secs(5),
+                program: "kyriakon-control",
+            },
+            0,
+            |_request| async { Answer::Reply(Reply::html(413, String::new())) },
+        );
+        wait_for(&path).await;
+
+        let mut first = UnixStream::connect(&path).await.unwrap();
+        let mut partial = fixture::raw(1, BEGIN_REQUEST, &[0, 1, 0, 0, 0, 0, 0, 0]);
+        partial.extend(fixture::raw(1, PARAMS, &[]));
+        partial.extend(fixture::raw(1, STDIN, b"x"));
+        first.write_all(&partial).await.unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), first.read_to_end(&mut reply))
+            .await
+            .expect("the refusal arrives without the body's terminator")
+            .unwrap();
+        assert_eq!(fixture::reply(&reply).1, END, "the refusal is complete");
+
+        // The single permit was released: the next request is answered.
+        let second = round_trip(&path, &fixture::httpd(&[], b"")).await;
+        assert_eq!(fixture::reply(&second).1, END);
+        server.abort();
+    }
+
+    /// A file truncated after its length was taken never gets the end marker,
+    /// so the front-end cannot read a short body as a complete reply.
+    #[tokio::test]
+    async fn a_file_truncated_mid_stream_does_not_emit_the_end_marker() {
+        let (_dir, path) = temp_socket("truncated");
+        let file_path = path.with_extension("body");
+        std::fs::write(&file_path, b"0123456789").unwrap();
+
+        let server = spawn_server(
+            path.clone(),
+            socket::Limits {
+                connections: 1,
+                deadline: Duration::from_secs(5),
+                program: "kyriakon-control",
+            },
+            0,
+            move |_request| {
+                let file_path = file_path.clone();
+                async move {
+                    let file = tokio::fs::File::open(&file_path).await.unwrap();
+                    let head =
+                        Reply::file(200, "application/octet-stream", Vec::new()).head_block();
+                    Answer::File {
+                        head,
+                        file,
+                        len: 1000,
+                        code: 200,
+                    }
+                }
+            },
+        );
+        wait_for(&path).await;
+
+        let bytes = round_trip(&path, &fixture::httpd(&[("REQUEST_URI", "/file.bin")], b"")).await;
+        let (_, last) = fixture::reply(&bytes);
+        assert_ne!(
+            last, END,
+            "a body shorter than its length is not a complete reply"
+        );
+        server.abort();
+    }
+
+    /// A GET whose reply the client does not read hits the write deadline and
+    /// frees the only permit for the next request.
+    #[tokio::test]
+    async fn a_slow_reading_get_hits_the_write_deadline_and_frees_the_permit() {
+        let (_dir, path) = temp_socket("slow-get");
+        let file_path = path.with_extension("body");
+        // A sparse file: long enough that the socket buffer cannot hold it, and
+        // no blocks are written for it.
+        std::fs::File::create(&file_path)
+            .unwrap()
+            .set_len(4 * 1024 * 1024)
+            .unwrap();
+
+        let server = spawn_server(
+            path.clone(),
+            socket::Limits {
+                connections: 1,
+                deadline: Duration::from_millis(150),
+                program: "kyriakon-control",
+            },
+            0,
+            move |request| {
+                let file_path = file_path.clone();
+                async move {
+                    if request.value("REQUEST_URI") == "/small" {
+                        return Answer::Reply(Reply::html(200, "small".into()));
+                    }
+                    let file = tokio::fs::File::open(&file_path).await.unwrap();
+                    let head =
+                        Reply::file(200, "application/octet-stream", Vec::new()).head_block();
+                    Answer::File {
+                        head,
+                        file,
+                        len: 4 * 1024 * 1024,
+                        code: 200,
+                    }
+                }
+            },
+        );
+        wait_for(&path).await;
+
+        let mut stalled = UnixStream::connect(&path).await.unwrap();
+        stalled
+            .write_all(&fixture::httpd(&[("REQUEST_URI", "/big")], b""))
+            .await
+            .unwrap();
+        // No read: the server's write fills the socket buffer and waits.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let served = tokio::time::timeout(
+            Duration::from_secs(2),
+            round_trip(&path, &fixture::httpd(&[("REQUEST_URI", "/small")], b"")),
+        )
+        .await
+        .expect("the stalled connection's permit was released");
+        assert_eq!(fixture::reply(&served).1, END);
+        drop(stalled);
+        server.abort();
+    }
+
+    /// Each listener has its own permit pool, so a stalled request on one cannot
+    /// stop the other from serving.
+    #[tokio::test]
+    async fn each_listener_spends_its_own_permits() {
+        let (_dir_a, first_path) = temp_socket("permits-a");
+        let (_dir_b, second_path) = temp_socket("permits-b");
+        let limits = socket::Limits {
+            connections: 1,
+            deadline: Duration::from_secs(30),
+            program: "kyriakon-control",
+        };
+        let answer = |_request: Request| async { Answer::Reply(Reply::html(200, "ok".into())) };
+        let first = spawn_server(first_path.clone(), limits, 0, answer);
+        let second = spawn_server(second_path.clone(), limits, 0, answer);
+        wait_for(&first_path).await;
+        wait_for(&second_path).await;
+
+        // A connection that never finishes its request holds the only permit on
+        // the first listener.
+        let mut held = UnixStream::connect(&first_path).await.unwrap();
+        held.write_all(&fixture::raw(1, BEGIN_REQUEST, &[0, 1, 0, 0, 0, 0, 0, 0]))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let served = tokio::time::timeout(
+            Duration::from_secs(2),
+            round_trip(&second_path, &fixture::httpd(&[], b"")),
+        )
+        .await
+        .expect("the second listener is not blocked by the first");
+        assert_eq!(fixture::reply(&served).1, END);
+        drop(held);
+        first.abort();
+        second.abort();
     }
 }

@@ -201,7 +201,16 @@ deployed_drift() {
 	for name in $names; do
 		if [ ! -f "$dir/$name" ]; then
 			printf '%s: not installed, and %s names it\n' "$dir/$name" "$table"
+			continue
 		fi
+		# The *.sh glob below cannot see a nested row such as lib/atomic-fs.sh,
+		# so a stale module would otherwise pass on existence alone.
+		case "$name" in
+		*/*)
+			cmp -s "$dir/$name" "$checkout/$name" \
+				|| printf '%s differs from %s\n' "$dir/$name" "$checkout/$name"
+			;;
+		esac
 	done
 	if [ "$token" = drain ]; then
 		if [ ! -f "$dir/install-set.tsv" ]; then
@@ -614,13 +623,16 @@ EOF
 	mkdir -p "$dir/checkout" "$dir/deployed" "$dir/store"
 	# The table names three scripts for /root/bin; one is installed and matches,
 	# one is installed and older than the checkout, one is not installed at all.
-	printf 'one.sh\t/root/bin\t-\ntwo.sh\t/root/bin\t-\nthree.sh\t/root/bin\t-\n' \
+	printf 'one.sh\t/root/bin\t-\ntwo.sh\t/root/bin\t-\nthree.sh\t/root/bin\t-\nlib/mod.sh\t/root/bin\t-\n' \
 		>"$dir/table"
 	printf 'same\n' > "$dir/checkout/one.sh"
 	printf 'same\n' > "$dir/deployed/one.sh"
 	printf 'old\n' > "$dir/deployed/two.sh"
 	printf 'new\n' > "$dir/checkout/two.sh"
 	printf 'new\n' > "$dir/checkout/three.sh"
+	mkdir -p "$dir/checkout/lib" "$dir/deployed/lib"
+	printf 'new\n' > "$dir/checkout/lib/mod.sh"
+	printf 'old\n' > "$dir/deployed/lib/mod.sh"
 	out=$(deployed_drift "$dir/checkout" "$dir/table" /root/bin "$dir/deployed")
 	case "$out" in
 	*two.sh*) ;;
@@ -632,6 +644,17 @@ EOF
 	case "$out" in
 	*three.sh*) ;;
 	*) printf 'FAIL: a table row with nothing installed is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+	# A nested row is outside the *.sh glob, so only the row comparison can see
+	# a stale module.
+	case "$out" in
+	*lib/mod.sh*) ;;
+	*) printf 'FAIL: a stale nested module is a finding; got [%s]\n' "$out" >&2; exit 1 ;;
+	esac
+	printf 'new\n' > "$dir/deployed/lib/mod.sh"
+	out=$(deployed_drift "$dir/checkout" "$dir/table" /root/bin "$dir/deployed")
+	case "$out" in
+	*lib/mod.sh*) printf 'FAIL: a matching nested module is not a finding; got [%s]\n' "$out" >&2; exit 1 ;;
 	esac
 	out=$(deployed_drift "$dir/checkout" "$dir/table" /root/bin "$dir/gone")
 	case "$out" in

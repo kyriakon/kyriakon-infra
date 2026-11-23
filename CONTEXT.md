@@ -38,6 +38,30 @@ hostname, generated once with a ten-year life; an own-domain capsule gets its ow
 key is held in the backup set because nothing reissues a self-signed pair.
 _Avoid_: gemini certificate, TOFU certificate
 
+**Atomic write**:
+A file change that creates a sibling candidate under `umask 077`, checks it
+(an optional daemon parse, and a `cmp` against the installed file), sets its
+mode and owner, then renames it into place. A reader sees the old file or the
+whole new one, never a truncated file. `scripts/lib/atomic-fs.sh` holds the one
+`write_atomic`; a symlinked or hard-linked destination is refused.
+_Avoid_: staged write (the helper's old name), temp-file copy
+
+**Lock directory**:
+The shell-side exclusion on this box: `mkdir` a directory, write the owner's pid
+inside, and remove it when done. OpenBSD has no `flock(1)` or `lockf(1)`, so
+`scripts/lib/atomic-fs.sh`'s `lock_dir` is the one scheme. A stale lock is
+reaped by renaming it to a unique sibling and comparing the pid it held, so two
+reapers cannot delete each other's fresh lock.
+_Avoid_: file lock, flock
+
+**Member account**:
+An OS account that passes `require_member`: uid above 0, a Maildir in its home,
+`accounts/<user>/account.json` under the store, and a `$home/.ssh` that is not a
+symlink. The localpart charset is checked first, but it cannot tell a member
+from root or the operator's account, so a destructive lane reads the full
+predicate.
+_Avoid_: valid user, localpart (the name shape alone)
+
 **The control plane**:
 The subsystem under `control/`: the handler that serves the web form and the capsule,
 the member content responder both front-ends hand a member's site to, the ssh portal,
@@ -66,6 +90,13 @@ from the same files. It chooses between its two modes, the drawing and the plain
 one, from the session's own terminal rather than from a flag, so a session with no
 terminal and a screen reader both get the plain one.
 _Avoid_: terminal wizard (the ksh program it replaced, gone from the repository in #373)
+
+**Line-ending rule**:
+The rule the shared message parsers use: a line ends at LF, CRLF, or a bare CR.
+A bare CR is a real line end, so the header split, the header spans, and the
+multipart walk cannot disagree about where the body starts. It lives in
+`mailparse/`, and the encryptor reads every message through it.
+_Avoid_: LF-only split, normalise then parse
 
 ## Conventions that have already bitten
 

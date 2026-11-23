@@ -60,6 +60,11 @@ struct save_fixture {
 	unsigned int pull_calls;
 	size_t bulk_remaining;
 
+	/* The istream-limit model: literal bytes already exposed to the save. */
+	const unsigned char *limit_data;
+	size_t limit_len;
+	size_t limit_pos;
+
 	const char *fake;
 	unsigned int encrypt_calls;
 	unsigned char plain[4096];
@@ -169,6 +174,103 @@ error_after_data_pull(void *context, const unsigned char **data_r,
 		return KYRIAKON_SAVE_PULL_DATA;
 	}
 	return kyriakon_save_pull(-1, "connection reset", error, error_size);
+}
+
+/* An istream-limit over a literal core has already exposed: read reports -1
+ * (EOF) while the bytes are still buffered, which is the shape
+ * cmd_append_continue_message() hands the plugin. */
+static int
+limit_read(void *context)
+{
+	struct save_fixture *f = context;
+
+	f->pull_calls++;
+	return -1;
+}
+
+static const unsigned char *
+limit_data(void *context, size_t *size_r)
+{
+	struct save_fixture *f = context;
+
+	*size_r = f->limit_len - f->limit_pos;
+	return f->limit_data + f->limit_pos;
+}
+
+static void
+limit_skip(void *context, size_t size)
+{
+	struct save_fixture *f = context;
+
+	f->limit_pos += size;
+}
+
+static const char *
+limit_error(void *context)
+{
+	(void)context;
+	return NULL;
+}
+
+static int
+limit_pull(void *context, const unsigned char **data_r, size_t *size_r,
+	   char *error, size_t error_size)
+{
+	static const struct kyriakon_pull_stream stream = {
+		.read = limit_read,
+		.data = limit_data,
+		.skip = limit_skip,
+		.error = limit_error,
+	};
+
+	return kyriakon_save_pull_stream(&stream, context, data_r, size_r,
+					 error, error_size);
+}
+
+/* A stream that reports a positive read without exposing any bytes. Nothing is
+ * available to hand the pump. */
+static int
+phantom_read(void *context)
+{
+	(void)context;
+	return 1;
+}
+
+static const unsigned char *
+phantom_data(void *context, size_t *size_r)
+{
+	(void)context;
+	*size_r = 0;
+	return NULL;
+}
+
+static void
+phantom_skip(void *context, size_t size)
+{
+	(void)context;
+	(void)size;
+}
+
+static const char *
+phantom_error(void *context)
+{
+	(void)context;
+	return NULL;
+}
+
+static int
+phantom_pull(void *context, const unsigned char **data_r, size_t *size_r,
+	     char *error, size_t error_size)
+{
+	static const struct kyriakon_pull_stream stream = {
+		.read = phantom_read,
+		.data = phantom_data,
+		.skip = phantom_skip,
+		.error = phantom_error,
+	};
+
+	return kyriakon_save_pull_stream(&stream, context, data_r, size_r,
+					 error, error_size);
 }
 
 static bool
@@ -352,6 +454,55 @@ test_pull_error_after_data(const char *fake)
 	kyriakon_save_deinit(&save);
 }
 
+/* A synchronizing APPEND hands the pull an istream-limit whose whole literal
+ * is already buffered, and whose read reports -1. The buffered bytes must
+ * reach the encryptor: reading that -1 as EOF encrypted an empty message. */
+static void
+test_pull_limit_eof_with_buffered_data(const char *fake)
+{
+	static const unsigned char message[] = "hello from append";
+	struct kyriakon_save save;
+	struct save_fixture f;
+
+	memset(&save, 0, sizeof(save));
+	memset(&f, 0, sizeof(f));
+	f.fake = fake;
+	f.limit_data = message;
+	f.limit_len = sizeof(message) - 1;
+	f.ops.save_begin = fixture_save_begin;
+	f.ops.save_continue = fixture_save_continue;
+	f.ops.save_finish = fixture_save_finish;
+	f.ops.save_cancel = fixture_save_cancel;
+	kyriakon_save_begin(&save, &f.ops, &f, limit_pull, fixture_encrypt);
+	expect(kyriakon_save_continue(&save) == 0,
+	       "a buffered literal completes the save");
+	expect(f.encrypt_calls == 1, "the buffered literal is encrypted once");
+	expect(f.plain_len == sizeof(message) - 1 &&
+		       memcmp(f.plain, message, sizeof(message) - 1) == 0,
+	       "the whole buffered literal reaches the encryptor");
+	expect(f.begin_calls == 1, "the backend starts on that ciphertext");
+	expect(f.cipher_len == sizeof(message) - 1 + 3,
+	       "the whole ciphertext reaches the backend");
+	kyriakon_save_deinit(&save);
+}
+
+/* A positive read means bytes were added. If the buffer is empty anyway,
+ * reporting DATA would pass the pump an unset pointer and length; the pull
+ * must wait. */
+static void
+test_pull_positive_read_with_empty_buffer(void)
+{
+	const unsigned char *data = NULL;
+	size_t size = 0;
+	char error[256];
+	int ret;
+
+	error[0] = '\0';
+	ret = phantom_pull(NULL, &data, &size, error, sizeof(error));
+	expect(ret == KYRIAKON_SAVE_PULL_WAIT,
+	       "a positive read with an empty buffer waits");
+}
+
 /* A backend save_begin that fails leaves the save failed even though the
  * backend was half-started: the next continue must not call its
  * save_continue on the failed context. */
@@ -521,6 +672,8 @@ main(int argc, char **argv)
 
 	test_pull_status();
 	test_pull_error_after_data(fake);
+	test_pull_limit_eof_with_buffered_data(fake);
+	test_pull_positive_read_with_empty_buffer();
 	test_save_ordering(fake);
 	test_backend_begin_failure(fake);
 	test_plaintext_cap(fake);
