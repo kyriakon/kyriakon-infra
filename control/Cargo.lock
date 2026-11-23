@@ -914,6 +914,7 @@ dependencies = [
  "bcrypt",
  "hmac",
  "keygen-spike",
+ "kyriakon-mailparse",
  "libc",
  "serde",
  "serde_json",

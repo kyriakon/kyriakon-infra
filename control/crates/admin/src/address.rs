@@ -69,7 +69,7 @@ pub(crate) async fn address(
             // submission cannot file a mailbox the pages would have refused:
             // the refusal and the verdict are the check's, never "unchecked"
             // for something that is not a key.
-            let checked = keycheck::pgp_public_key(&material)
+            let checked = pgp::public_key(&material)
                 .map_err(|why| Error::Failed(format!("the mail key {path}: {why}")))?;
             if let Some(why) = checked.refusal() {
                 return Err(Error::Failed(format!(

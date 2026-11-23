@@ -4,3 +4,4 @@
 pub mod bounce;
 pub mod keycheck;
 pub mod notice;
+pub mod pgp;

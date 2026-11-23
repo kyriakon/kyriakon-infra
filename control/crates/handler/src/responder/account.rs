@@ -18,7 +18,7 @@ use kyriakon_control_core::{
     account::session,
     flow::validate,
     intent,
-    mail::{keycheck, notice},
+    mail::{keycheck, notice, pgp},
 };
 
 /// The account page, which each front end renders for the identity it has: the
@@ -659,7 +659,7 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
     match form.get("action").map(String::as_str) {
         Some("replace") => {
             let material = form.get("key").map(String::as_str).unwrap_or("").trim();
-            let checked = match keycheck::pgp_public_key(material) {
+            let checked = match pgp::public_key(material) {
                 Ok(checked) => checked,
                 Err(why) => return refused(&why.to_string()),
             };
@@ -671,7 +671,7 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
                 return refused(why);
             }
             let advisory = (!checked.inspected).then_some(checked.verdict.as_str());
-            let Some(fingerprint) = keycheck::pgp_fingerprint(material) else {
+            let Some(fingerprint) = pgp::fingerprint(material) else {
                 return refused("That block carries no public key packet.");
             };
             if account.mail_key.as_deref() == Some(fingerprint.as_str()) {

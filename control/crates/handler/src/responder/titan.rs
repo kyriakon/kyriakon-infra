@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::fastcgi::Reply;
 use kyriakon_control_core::config::HOST;
-use kyriakon_control_core::{flow::rate, mail::keycheck, store::draft};
+use kyriakon_control_core::{flow::rate, mail::keycheck, mail::pgp, store::draft};
 
 /// How long the accept loop waits for a concurrency permit before closing a
 /// connection it cannot serve. Short, so the loop keeps draining the backlog.
@@ -227,7 +227,7 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
     // The checks run again under the draft lock before anything is written, so
     // two uploads that both read a keyless draft cannot both file a key. The
     // lock is held across the read-modify-write and not across the body read.
-    let blocks = keycheck::blocks(&String::from_utf8_lossy(&body));
+    let blocks = pgp::blocks(&String::from_utf8_lossy(&body));
     let outcome = match app
         .store
         .update_draft(token, |record| {

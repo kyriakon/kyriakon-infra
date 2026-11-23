@@ -68,7 +68,7 @@ use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::validate;
 use kyriakon_control_core::intent;
 use kyriakon_control_core::intent::Decision;
-use kyriakon_control_core::mail::keycheck;
+use kyriakon_control_core::mail::{keycheck, pgp};
 use kyriakon_control_core::payments::ledger::{Ledger, LedgerLine};
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{self, free_account_count, Record, Store};
