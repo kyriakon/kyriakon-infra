@@ -216,7 +216,7 @@ The capsule renders the platform's service catalogue as one gemtext link list, r
 
 ## Limits
 
-The handler keeps two counters in memory, keyed on `REMOTE_ADDR`: 60 requests a minute and five new drafts a day per address, with a draft counted where it is created. Exceeding either answers 44 slow down rather than a failure, which the specification defines as "The server is requesting the client to slow down requests, and SHOULD use an exponential back off". A shared address has to stay workable, since a monastery applying for six mailboxes sits behind one; five drafts a day and 60 requests a minute do that, and the limits are a starting point rather than a settled number.
+The handler keeps two counters in memory, keyed on the client's IPv4 address or IPv6 /48 rather than the raw `REMOTE_ADDR`: 60 requests a minute and five new drafts a day per bucket, with a draft counted where it is created. Exceeding either answers 44 slow down rather than a failure, which the specification defines as "The server is requesting the client to slow down requests, and SHOULD use an exponential back off". A draft map whose every bucket is at its cap answers a temporary failure (40) instead, because that limit belongs to the service and the caller spent none of it. A shared address has to stay workable, since a monastery applying for six mailboxes sits behind one; five drafts a day and 60 requests a minute do that, and the limits are a starting point rather than a settled number.
 
 No CAPTCHA is used, because it is a third-party script and the refusal list rules those out. The human approval is the real gate. The counters reset when the process restarts, which is an accepted ceiling: a restart is rare and the gate does not depend on them.
 

@@ -45,7 +45,7 @@ pub fn clean(text: &str) -> String {
 /// let a stored name display as another account's, and Unicode's line and
 /// paragraph separators would break a record's one line into two. The set is
 /// the Cf, Zl and Zp categories.
-fn terminal_safe(c: char) -> bool {
+pub fn terminal_safe(c: char) -> bool {
     !c.is_control()
         && !matches!(c,
             '\u{00ad}'

@@ -82,6 +82,16 @@ fn a_form_field_is_decoded_and_a_plus_is_a_space() {
     assert!(fields("").is_empty());
 }
 
+/// A browser posts a textarea's line breaks as CRLF, and a pasted lone CR comes
+/// through the same encoding: both read as the LF every other front end uses.
+#[test]
+fn a_textarea_line_break_is_normalised_to_lf() {
+    let f = fields("intended_use=one%0D%0Atwo&anything_else=a%0Db&vat=c%0A%0Ad");
+    assert_eq!(f.get("intended_use").unwrap(), "one\ntwo");
+    assert_eq!(f.get("anything_else").unwrap(), "a\nb");
+    assert_eq!(f.get("vat").unwrap(), "c\n\nd");
+}
+
 // The routes the service carried before the transport changed.
 
 #[tokio::test]

@@ -50,12 +50,12 @@ queue_key_file=/etc/mail/queue.key
 # usr.sbin/smtpd/crypto.c) and uses them verbatim as the AES-256 key.
 queue_key_len=32
 dkim_key=/etc/mail/dkim/private.rsa.key
-keyring_dir=/etc/kyriakon/keys
+keyring_dir=$KYRIAKON_KEYRING_DIR
 # The store root the drain owns, read here for the one fact the keyring install
 # needs: which mail key an account record says the box is delivering with. A
 # rotation changes it without changing the tracked key, and the install below
 # leaves the rotated key alone.
-store_root=/var/db/onboard
+store_root=$KYRIAKON_STORE_ROOT
 encrypt_bin=/usr/local/sbin/kyriakon-encrypt
 
 say() { printf '== %s\n' "$*"; }
@@ -67,22 +67,13 @@ say() { printf '== %s\n' "$*"; }
 # checks the copies, and deploy.sh routes a changed script by its row.
 install_set="$script_dir/install-set.tsv"
 
-# stale_copies <installed names>: the pre-split copies in /root/bin that this
-# deploy still sweeps away, less every name the table installs. Before the
-# control plane split out of this deploy, the drain's scripts were installed
-# here too, and a box from that time keeps them; they are stale copies of scripts
-# that now run from the drain's directory, and check-hygiene's section 9 reports
-# every one of them for ever otherwise. The installed set is excluded so a row
-# added later for one of these cannot be installed and removed in the same run.
-stale_copies() {
-	for s in add-user.sh check-hygiene.sh cron-apply.sh delete-user.sh deploy-mail.sh \
-		deploy-onboard.sh deploy-relayd.sh onboard-store.sh provision-member.sh \
-		provision-member-capsule.sh provision-member-web.sh quota-apply.sh restore-test.sh; do
-		case " $(printf '%s\n' "$1" | tr '\n' ' ') " in
-		*" $s "*) continue ;;
-		esac
-		printf '%s\n' "$s"
-	done
+# retired_copies <destination>: the installed names the manifest marks retired,
+# which this deploy removes. Before the control plane split out of this deploy
+# the drain's scripts lived in /root/bin too, and a box from that time keeps
+# them; the retired rows are that history, so the sweep is data rather than a
+# second list that can drift from the table.
+retired_copies() {
+	manifest_retired_names "$install_set" "$1"
 }
 
 start_service() {
@@ -678,7 +669,7 @@ self_test() {
 	check "and the From filter reads the mapping the listeners bind" \
 		"$(grep -c '^filter "fromcheck" proc-exec "/usr/local/libexec/filter-fromcheck.sh' "$tree/smtpd.conf")" 1
 	check "and it is a command this deploy installs" \
-		"$(grep -cx 'filter-fromcheck.sh	/usr/local/libexec	-' "$install_set")" 1
+		"$(grep -cx "$(printf 'filter-fromcheck.sh\t/usr/local/libexec\t-\t\tmail\t-\tactive')" "$install_set")" 1
 	check "no unauthenticated TCP loopback listener is left" \
 		"$(grep -c '^listen on lo0' "$tree/smtpd.conf" || true)" 0
 
@@ -1006,12 +997,26 @@ EOF
 		"$([ "$got" -ne 0 ] && printf yes || printf no)" yes
 	check "the checkout's table names lib.sh for /root/bin" \
 		"$(install_rows "$script_dir/install-set.tsv" /root/bin | grep -c '^lib\.sh$')" 1
-	# The sweep removes the pre-split copies, but never a name the table installs:
-	# that would install a new row and delete it in the same run.
-	check "a table row is not swept away" \
-		"$(stale_copies 'add-user.sh' | grep -c '^add-user\.sh$')" 0
-	check "and a script the table does not install still is" \
-		"$(stale_copies 'add-user.sh' | grep -c '^restore-test\.sh$')" 1
+	# The sweep is the manifest's retired rows, so a retired name is removed and
+	# an active one is installed, never both in the same run.
+	printf 'add-user.sh\t/root/bin\t-\t\tmail\t-\tretired\nlib.sh\t/root/bin\t-\t\tmail\t-\tactive\n' \
+		> "$tree/retired.tsv"
+	install_set="$tree/retired.tsv"
+	check "a retired row is swept" \
+		"$(retired_copies /root/bin | grep -c '^add-user\.sh$')" 1
+	check "and an active row is not" \
+		"$(retired_copies /root/bin | grep -c '^lib\.sh$')" 0
+	install_set="$script_dir/install-set.tsv"
+	check "the checkout's manifest retires the pre-split copies" \
+		"$(retired_copies /root/bin | grep -c '^restore-test\.sh$')" 1
+	check "and names the suffixless login checker's install" \
+		"$(manifest_installed_name "$install_set" kyriakon-authcheck.sh /usr/local/libexec)" \
+		kyriakon-authcheck
+	# The login checker and the modules it sources are the control deploy's, so
+	# this deploy must not install them just because they share its directory.
+	check "the mail libexec set excludes the control rows" \
+		"$(manifest_targets_route "$install_set" /usr/local/libexec mail |
+			grep -cE '^(kyriakon-authcheck\.sh|lib\.sh|lib/)' || true)" 0
 
 	self_test_end
 }
@@ -1615,14 +1620,16 @@ printf 'mail_from: %s entries\n' "$(grep -c . "$mail_from_table" || true)"
 # the command when the filter starts, so a missing one is a filter that never
 # registers). root:wheel 0755, which a member can read and execute and cannot
 # write, and which is not in the PATH a member session is handed.
-libexec_scripts=$(install_rows "$install_set" /usr/local/libexec) \
+libexec_targets=$(manifest_targets_route "$install_set" /usr/local/libexec mail) \
 	|| { printf 'cannot read %s\n' "$install_set" >&2; exit 1; }
-[ -n "$libexec_scripts" ] \
+[ -n "$libexec_targets" ] \
 	|| { printf '%s names no /usr/local/libexec script\n' "$install_set" >&2; exit 1; }
 install -d -m 0755 /usr/local/libexec
-for s in $libexec_scripts; do
-	install_staged "$repo_dir/scripts/$s" "/usr/local/libexec/$s" -m 0755 -o root -g wheel
-done
+while IFS="$(printf '\t')" read -r s installed; do
+	install_staged "$repo_dir/scripts/$s" "/usr/local/libexec/$installed" -m 0755
+done <<EOF
+$libexec_targets
+EOF
 printf 'member session shell and the From-header filter installed into /usr/local/libexec\n'
 
 # The shipped template with both placeholders still in it, installed beside the
@@ -1853,19 +1860,26 @@ install -d -m 0755 /root/bin/lib
 # line pasted by hand too, which is how the monitor spent a week unscheduled.
 # cron-apply.sh puts the lines in; it can only do that if the files it names are
 # deployed first.
-root_bin=$(install_rows "$install_set" /root/bin) \
+root_bin=$(manifest_targets_route "$install_set" /root/bin mail) \
 	|| { printf 'cannot read %s\n' "$install_set" >&2; exit 1; }
 [ -n "$root_bin" ] \
 	|| { printf '%s names no /root/bin script\n' "$install_set" >&2; exit 1; }
-for s in $root_bin; do
-	install_staged "$repo_dir/scripts/$s" "/root/bin/$s" -m 0755
-done
-# The stale copies a box from before the onboarding split still holds; the list
-# and why it excludes the installed set are stale_copies' own comment.
-for s in $(stale_copies "$root_bin"); do
+while IFS="$(printf '\t')" read -r s installed; do
+	install_staged "$repo_dir/scripts/$s" "/root/bin/$installed" -m 0755
+done <<EOF
+$root_bin
+EOF
+# The pre-split copies the manifest marks retired. The installed set is active,
+# so a name cannot be installed and removed in the same run.
+for s in $(retired_copies /root/bin); do
 	[ -e "/root/bin/$s" ] || continue
 	rm -f "/root/bin/$s"
 	printf 'removed the stale copy /root/bin/%s\n' "$s"
+done
+for s in $(retired_copies /usr/local/libexec); do
+	[ -e "/usr/local/libexec/$s" ] || continue
+	rm -f "/usr/local/libexec/$s"
+	printf 'removed the stale copy /usr/local/libexec/%s\n' "$s"
 done
 printf 'cron scripts installed into /root/bin\n'
 

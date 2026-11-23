@@ -122,11 +122,17 @@ pub(super) async fn portal_file(app: &App, address: &str, body: &str) -> String 
     if !errors.is_empty() {
         return ipc::file_answer(None, &errors.join(" "));
     }
-    if !app.counter.allow_draft(key) {
-        return ipc::file_answer(
-            None,
-            "Too many applications have been started from this address today. Try again tomorrow.",
-        );
+    match app.counter.allow_draft(key) {
+        rate::Admission::Allowed => {}
+        rate::Admission::Denied => {
+            return ipc::file_answer(
+                None,
+                "Too many applications have been started from this address today. Try again tomorrow.",
+            );
+        }
+        rate::Admission::Unavailable => {
+            return ipc::file_answer(None, "Temporary failure. Try again in a moment.");
+        }
     }
     let token = match store::status_token().await {
         Ok(token) => token,

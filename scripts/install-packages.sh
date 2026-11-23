@@ -79,16 +79,26 @@ check_calls() {
 				line = substr(line, RSTART + RLENGTH)
 			}
 		}' "$dir"/*.sh 2>/dev/null | grep -v -E '^(present|absent)\.sh$|^versioned$' | sort -u)
-	[ -n "$calls" ] || return 0
-	calls_file=$(mktemp "${TMPDIR:-/tmp}/need-pkg-calls.XXXXXX") || return 1
-	listed_file=$(mktemp "${TMPDIR:-/tmp}/listed-packages.XXXXXX") || {
-		rm -f "$calls_file"
-		return 1
-	}
-	printf '%s\n' "$calls" >"$calls_file"
-	printf '%s\n' "$listed" >"$listed_file"
-	missing=$(comm -23 "$calls_file" "$listed_file")
-	rm -f "$calls_file" "$listed_file"
+	missing=''
+	if [ -n "$calls" ]; then
+		calls_file=$(mktemp "${TMPDIR:-/tmp}/need-pkg-calls.XXXXXX") || return 1
+		listed_file=$(mktemp "${TMPDIR:-/tmp}/listed-packages.XXXXXX") || {
+			rm -f "$calls_file"
+			return 1
+		}
+		printf '%s\n' "$calls" >"$calls_file"
+		printf '%s\n' "$listed" >"$listed_file"
+		missing=$(comm -23 "$calls_file" "$listed_file")
+		rm -f "$calls_file" "$listed_file"
+	fi
+	# deploy.sh runs git before any deploy has installed a package, so its own
+	# row has to be what installs it. A `box` owner installs nothing at all.
+	if [ -f "$dir/deploy.sh" ] &&
+		grep -qE '(^|[^[:alnum:]_])git([[:space:]]|$)' "$dir/deploy.sh"; then
+		if ! select_packages owner deploy.sh | grep -qx git; then
+			missing=$(printf '%s\ngit\n' "$missing" | grep -v '^$')
+		fi
+	fi
 	if [ -n "$missing" ]; then
 		printf 'packages missing from %s:\n%s\n' "$packages" "$missing" >&2
 		return 1
@@ -147,6 +157,19 @@ STUB
 	else
 		check "an unlisted direct need_pkg is a finding" "$(grep -c -E '^(missing|fake\.sh)$' "$work/check.out")" "2"
 	fi
+	# deploy.sh runs git before any deploy has installed anything, so a table
+	# that leaves git to `box` is a finding rather than a fresh-box failure.
+	rm -f "$work/scripts/a.sh" "$work/scripts/b.sh" "$work/scripts/c.sh"
+	printf 'git -C /srv checkout main\n' > "$work/scripts/deploy.sh"
+	if CHECK_SCRIPTS_DIR="$work/scripts" check_calls >"$work/git.out" 2>&1; then
+		check "an unowned bootstrap git is a finding" "passed" "failed"
+	else
+		check "an unowned bootstrap git is a finding" "$(grep -c '^git$' "$work/git.out")" 1
+	fi
+	printf 'git\tdeploy.sh\tyes\n' >> "$work/packages.tsv"
+	CHECK_SCRIPTS_DIR="$work/scripts" check_calls >"$work/git-owned.out" 2>&1 || {
+		check "a deploy-owned git clears the finding" "passed" "failed"
+	}
 	self_test_end
 }
 

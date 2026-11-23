@@ -729,3 +729,43 @@ async fn a_failed_intent_write_leaves_no_application_record() {
         "the record outlived the intent it was filed with"
     );
 }
+
+/// A source at its own cap gets the day message, which is the answer the
+/// unavailable case must not borrow.
+#[tokio::test]
+async fn the_sixth_draft_from_one_source_answers_the_day_message() {
+    let (app, _dir) = handler("gmid-draft-cap").await;
+    for i in 0..kyriakon_control_core::flow::rate::DRAFTS_PER_DAY {
+        let (code, page) = ask(&app, &gmid_get("apply", "")).await;
+        assert_eq!(code, 30, "draft {i} was not opened: {page}");
+    }
+    let (code, body) = ask(&app, &gmid_get("apply", "")).await;
+    assert_eq!(code, 44, "the sixth draft is the source's own cap: {body}");
+    assert!(body.starts_with("44 Too many applications"), "{body}");
+}
+
+/// A draft map full of sources at their cap is a service-wide limit. The capsule
+/// answers a temporary failure, not the day message that would blame this client
+/// for drafts it never started.
+#[tokio::test]
+async fn a_full_draft_map_answers_the_capsule_temporarily() {
+    use kyriakon_control_core::flow::rate::{Admission, DRAFTS_PER_DAY, MAX_KEYS};
+
+    let (app, _dir) = handler("gmid-draft-map-full").await;
+    // Fill every bucket to its cap. The capsule's own address, 203.0.113.10, is
+    // not among them.
+    for i in 0..MAX_KEYS {
+        let key = kyriakon_control_core::flow::rate::key(
+            None,
+            Some(&format!("10.7.{}.{}", i >> 8, i & 0xff)),
+        );
+        for _ in 0..DRAFTS_PER_DAY {
+            assert_eq!(app.counter.allow_draft(key), Admission::Allowed);
+        }
+    }
+
+    let (code, body) = ask(&app, &gmid_get("apply", "")).await;
+    assert_eq!(code, 40, "a full map is a temporary failure");
+    assert!(body.starts_with("40 Temporary failure"), "{body}");
+    assert!(!body.contains("Too many applications"), "{body}");
+}

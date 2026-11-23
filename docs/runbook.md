@@ -18,7 +18,7 @@ Three paths appear throughout:
 		doas mv /root/src/kyriakon-infra /usr/local/src/kyriakon-infra
 		doas chown -R root:wheel /usr/local/src/kyriakon-infra
 		ls /usr/local/src/kyriakon-infra   # as the operator, this should list
-- `/root/bin` holds the copies that cron runs. `scripts/deploy-mail.sh` installs the `/root/bin` rows of `scripts/install-set.tsv` there, and `scripts/cron-apply.sh` writes the crontab lines that call them. Two rows have the `checkout` destination instead and are run from `/usr/local/src/kyriakon-infra/scripts`: `check-hygiene.sh` and `self-test-all.sh`, which both read the tree they are in and so have no installed copy.
+- `/root/bin` holds the copies that cron runs. `scripts/deploy-mail.sh` installs the `/root/bin` rows of `scripts/install-set.tsv` there, and `scripts/cron-apply.sh` writes the crontab lines that call them. Four rows have the `checkout` destination instead and are run from `/usr/local/src/kyriakon-infra/scripts`: `check-hygiene.sh`, `self-test-all.sh`, `gen-finger-page.sh` and `render-docs.sh`, which read the tree they are in and so have no installed copy. The compiled programs live at `/usr/local/sbin`, and the drain binary there is the scheduled row that cron runs every minute.
 - `/root/.kyriakon-env` holds the box's values, mode 0600, one `export VAR=value` per line. `scripts/setup-env.sh` installs and merges it, and every cron line sources it, so no value is typed twice.
 
 Deploy the configuration with `doas ksh /usr/local/src/kyriakon-infra/scripts/deploy-mail.sh`. It is idempotent, it installs the mail and web configuration, it rebuilds the Dovecot plugin and the encryptor, it installs every `keys/*.asc` into the keyring, and it restarts the daemons. It prints the firewall and `sshd_config` steps instead of taking them, because both are propose-only changes that a human applies.
@@ -116,6 +116,8 @@ From the workstation, one command updates the checkout and prints the plan:
 
 	ssh -t kyriakon 'cd /usr/local/src/kyriakon-infra && doas git pull --ff-only && doas ksh scripts/deploy.sh --check'
 
+The gold image installs `git` and `openbsd/packages.tsv` assigns it to `deploy.sh` and `deploy-control.sh`. A box built before that change needs `doas pkg_add git` once, because the pull above cannot run without it. `scripts/deploy.sh` installs its own row when it starts without `git`, so a checkout that already exists recovers without the manual step.
+
 Run the same command without `--check` to apply the plan. A later run can be
 narrowed with `--since <commit>`. The first run on a box with no marker is
 `--all`, which runs every script and does not record, because with no diff it
@@ -124,9 +126,7 @@ it:
 
 	ssh -t kyriakon 'cd /usr/local/src/kyriakon-infra && doas ksh scripts/deploy.sh --record'
 
-The script never applies `pf.conf`, `sshd_config` or a login class. It prints
-the commands for each, and it does not advance the marker while one of them
-remains in the range. Apply the diff by hand, then run `--record`. A
+The script never applies `pf.conf`, `sshd_config`, a login class or the control rule in `openbsd/etc/doas.conf.control`. It prints the commands for each, and it does not advance the marker while one of them remains in the range. Apply the diff by hand, then run `--record`. A
 `kyriakon.env` change also needs `doas ksh scripts/setup-env.sh` to merge the new
 value, a `cron-apply.sh` change needs `doas ksh scripts/cron-apply.sh`, and a
 terraform change needs the plan and apply you already run from the workstation.
@@ -179,6 +179,8 @@ is both the cash-by-post address and the published trading address, by decision
 (#397), so the two cannot disagree: `scripts/deploy-control.sh` writes the same
 value into `postal_address` in both the drain's config and the handler's, which
 are the two copies the approval email and the account page read it from.
+
+The card rail needs two live Stripe Payment Link URLs, one for a person's year and one for an own-domain group's year. `scripts/setup-env.sh --stripe-payment-link` and `--stripe-group-payment-link` write them, or fill `STRIPE_PAYMENT_LINK` and `STRIPE_GROUP_PAYMENT_LINK` in `/root/.kyriakon-env` by hand. `deploy-control.sh` refuses an unset or placeholder value.
 
 The same deploy writes the public DNS values every body's recipe is generated
 from. `KYRIAKON_IPV4` and `KYRIAKON_IPV6` come from `/root/.kyriakon-env`, and
@@ -260,7 +262,7 @@ Provisioning is manual today. The service that will take it over is covered in t
 
 		doas ksh scripts/provision-member.sh <username> /path/to/their-upload-key.pub
 
-   It builds the public root at `/home/www/<username>.kyriakon.net`, hands `www/` and `gemini/` to the member, creates `/home/<username>/repos`, installs `/usr/local/libexec/member-git-shell.sh` and the login class that runs it on port 2222 (so the password entry keeps `/sbin/nologin`), and writes the upload key to `/etc/ssh/authorized_keys/<username>` (root:wheel 0644) and to `.ssh/authorized_keys` (root:<group> 0640 inside a `root:<group>` 0750 `.ssh`). The managed copy is the one sshd reads for members once the `AuthorizedKeysFile /etc/ssh/authorized_keys/%u` line is applied to the `Match Group members` block of `/etc/ssh/sshd_config`; see the PR for that diff and the `sshd -t` and reload steps. The home copy keeps the session working until then, and after it is defence in depth only, because `/home/<username>` stays member-owned and the member can rename `.ssh` away. The shell accepts only the three git commands, only a repository under `/home/<username>/repos/<name>.git`, and passes `core.hooksPath=/dev/null`, `core.fsmonitor=false` and `GIT_CONFIG_GLOBAL=/dev/null`, so neither a repository uploaded through sftp nor a `~/.gitconfig` can run a command on a push or fetch. It then runs three lanes: `scripts/provision-member-web.sh` writes the member's `httpd` file, `scripts/provision-member-capsule.sh` writes the member's `gmid` file and generates the platform's self-signed capsule pair the first time it runs, and `scripts/provision-member-acme.sh` writes the member's `acme-client` block and files the certificate request with the queue.
+   It builds the public root at `/home/www/<username>.kyriakon.net`, hands `www/` and `gemini/` to the member, creates `/home/<username>/repos` and the bare `pass.git` repository inside it, installs `/usr/local/libexec/member-git-shell.sh` and the login class that runs it on port 2222 (so the password entry keeps `/sbin/nologin`), and writes the upload key to `/etc/ssh/authorized_keys/<username>` (root:wheel 0644) and to `.ssh/authorized_keys` (root:<group> 0640 inside a `root:<group>` 0750 `.ssh`). The managed copy is the one sshd reads for members once the `AuthorizedKeysFile /etc/ssh/authorized_keys/%u` line is applied to the `Match Group members` block of `/etc/ssh/sshd_config`; see the PR for that diff and the `sshd -t` and reload steps. The home copy keeps the session working until then, and after it is defence in depth only, because `/home/<username>` stays member-owned and the member can rename `.ssh` away. The shell accepts only the three git commands, only a repository under `/home/<username>/repos/<name>.git`, and passes `core.hooksPath=/dev/null`, `core.fsmonitor=false` and `GIT_CONFIG_GLOBAL=/dev/null`, so neither a repository uploaded through sftp nor a `~/.gitconfig` can run a command on a push or fetch. It then runs three lanes: `scripts/provision-member-web.sh` writes the member's `httpd` file, `scripts/provision-member-capsule.sh` writes the member's `gmid` file and generates the platform's self-signed capsule pair the first time it runs, and `scripts/provision-member-acme.sh` writes the member's `acme-client` block and files the certificate request with the queue.
 
    The upload key is the applicant's, so it is a file and only the public half goes in: pass it as the second argument. With none, the script reads `/var/db/onboard/keys/<username>.pub`, where the drain will put it, and stops before building anything when nothing is there.
 
@@ -277,7 +279,7 @@ Provisioning is manual today. The service that will take it over is covered in t
 
 		sftp -P 2222 <username>@mail.kyriakon.net
 
-   It prints the wrapper's `kyriakon git shell: refusing a command that is not git-receive-pack, git-upload-pack or git-upload-archive` line and `Connection closed`, then exits non-zero. A prompt or a directory listing means the session is not going through the wrapper. The attempt cannot by itself show whether the ForceCommand landed, because sshd runs an external subsystem request through the login shell either way; the `sshd -T ... lport=2222` output above is what reports it. `httpd -n -f /etc/httpd.conf`, `gmid -n -c /etc/gmid.conf` and `relayd -n -f /etc/relayd.conf` are silent. An sftp session as the member on 22 puts a file into `www/`.
+   It prints the wrapper's `kyriakon git shell: refusing a command that is not git-receive-pack or git-upload-pack` line and `Connection closed`, then exits non-zero. A prompt or a directory listing means the session is not going through the wrapper. The attempt cannot by itself show whether the ForceCommand landed, because sshd runs an external subsystem request through the login shell either way; the `sshd -T ... lport=2222` output above is what reports it. `httpd -n -f /etc/httpd.conf`, `gmid -n -c /etc/gmid.conf` and `relayd -n -f /etc/relayd.conf` are silent. An sftp session as the member on 22 puts a file into `www/`.
 
 Do not give the account a shell. `chsh -s /bin/ksh <username>` undoes the platform's central safety property. The operator account is the one exception, and `deploy-mail.sh` flips it back to `/bin/ksh` on every run.
 
@@ -1072,6 +1074,29 @@ The record published today carries no `t=` flag, so adding `t=s` is part of the 
 
 `scripts/deploy-mail.sh` compares the on-box public key with the record under the filter's current selector on every run and prints the correct record when the two disagree, which is the check to run after either step.
 
+## Verify an OpenBSD release image
+
+The release directory holds the image, `SHA256`, and `SHA256.sig`. `SHA256` catches a corrupted download. `SHA256.sig` is the release checksum list signed with the release key, and checking it catches a substituted image. That signature is what makes the hash in `openbsd/restore-template/prepare-disk.sh` a trust anchor.
+
+`signify` and its keyring are part of the OpenBSD base system. The Hetzner rescue shell is Debian and has neither, so run this on an OpenBSD 8.0 host you already trust. The first build uses a local OpenBSD 8.0 VM, because the mail box is provisioned from the snapshot built here; a rebuild can use the mail box instead. On 8.0 the release key is `/etc/signify/openbsd-80-base.pub`. The release root also publishes the same key as `openbsd-80-base.pub`. Use that copy only after comparing it with the copy on a trusted OpenBSD system.
+
+Download the three files into one directory and verify the image:
+
+	mkdir -p /tmp/openbsd-80
+	cd /tmp/openbsd-80
+	ftp https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/miniroot80.img
+	ftp https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/SHA256
+	ftp https://cdn.openbsd.org/pub/OpenBSD/8.0/amd64/SHA256.sig
+	signify -Cp /etc/signify/openbsd-80-base.pub -x SHA256.sig miniroot80.img
+
+A good run prints `Signature Verified` and then `miniroot80.img: OK`, and exits with status 0. Any other result stops the build. Do not write that image to a disk.
+
+Record the hash to give the rescue host:
+
+	sha256 -q miniroot80.img
+
+For the 8.0 release this prints `fe268f373dacf249b36306096404aa578e0ceb950d08c19c5a1117806997399a`, which is the default in `prepare-disk.sh`. A different value means the download is not the image that was verified, and `prepare-disk.sh` refuses to write it.
+
 ## Keep the base system and the packages current
 
 The base system and the packages move on different clocks. `syspatch` carries base system security fixes, `sysupgrade` moves between releases, and `pkg_add -u` updates the packages, which follow their own upstream releases. Track the two separately, and record the date of each, because a snapshot freezes both at once.
@@ -1093,14 +1118,20 @@ The base system and the packages move on different clocks. `syspatch` carries ba
 
 		doas rcctl check smtpd dovecot spamd spamlogd httpd gmid inetd nsd
 
-4. Re-snapshot after a patch cycle, because a stale provisioning image reintroduces what the patch removed. Do not snapshot the live mail box for this: its root disk holds member mail and the DKIM key, and a `kind=gold` image is the source of every future box. Build the new gold image on a throwaway box instead. The image carries its own root `authorized_keys`, so reach the new box with the key it holds.
+4. Re-snapshot after a patch cycle, because a stale provisioning image reintroduces what the patch removed. Do not snapshot the live mail box for this: its root disk holds member mail and the DKIM key, and the pinned image is the source of every future box. Build the new image on a throwaway box instead, based on the image recorded in the table below.
+
+   Take that ID from the table, not from a label. A label can be moved onto any snapshot, including a copy of the live box, so selecting by `kind=gold` here would rebuild the next image from whatever the label last pointed at. If the table still says `none`, stop; the first image is built by `terraform/README.md` section 1.
 
 		. /root/.kyriakon-env
-		image_id=$(hcloud image list -t snapshot -l kind=gold -o noheader -o columns=id | tail -1)
+		image_id=REPLACE_WITH_RECORDED_IMAGE_ID
+		if [ "$image_id" = REPLACE_WITH_RECORDED_IMAGE_ID ]; then
+			echo "no pinned image recorded; build the first image by terraform/README.md section 1" >&2
+			exit 1
+		fi
 		hcloud server create --name kyriakon-gold --type "${RESTORE_TEST_SERVER_TYPE:-cx23}" \
 			--image "$image_id" --location "${RESTORE_TEST_LOCATION:-fsn1}" -o json | jq -r '.server.id'
 
-   Match the type and the location to the live box in `terraform/terraform.tfvars` so the image is built on the same footing the box runs on.
+   Match the type and the location to the live box in `terraform/terraform.tfvars` so the image is built on the same footing the box runs on. The image carries its own root `authorized_keys`, so reach the new box with the key it holds.
 
    On that box, apply the patches and shut it down, because a snapshot of a running filesystem can capture a write in progress.
 
@@ -1111,7 +1142,15 @@ The base system and the packages move on different clocks. `syspatch` carries ba
 		hcloud server create-image --type snapshot --label kind=gold --description "kyriakon-openbsd-<rev>" <gold-server-id>
 		hcloud server delete <gold-server-id>
 
-   `terraform/variables.tf` fixes the label convention: provisioning images carry `kind=gold` and point-in-time copies of the live box carry `kind=dr`, so a copy of the live box can never be picked up for provisioning. The terraform data source reads the newest image matching `kind=gold` (`terraform/main.tf`), and the weekly restore test reads the snapshot labelled `kind=restore`. Each label must name exactly one snapshot, and the standup refuses to run when two snapshots carry its label, because which one boots the test would otherwise be decided by the order of an API reply. Remove or relabel the snapshot that a newer one replaces.
+   Then pin the snapshot Terraform provisions from. `terraform/main.tf` reads `image_id`, not a label, and a precondition on the server refuses the plan when the image's description does not match `image_description`, or when the image is not x86. Set both in `terraform/terraform.tfvars` and record them here.
+
+   | Image ID | Description | Recorded |
+   | -------- | ----------- | -------- |
+   | none     | none        | no reviewed image pinned yet |
+
+   Until that pair is set, no image is pinned, and the image the live server was created from (425837263, `kyriakon-live-20260829-213209`) is a snapshot of the live box: never use it for provisioning. Build the first pinned image by `terraform/README.md` section 1 on a throwaway box.
+
+   Labels remain an operator aid. Provisioning images carry `kind=gold` and point-in-time copies of the live box carry `kind=dr`, so `hcloud image list` can tell them apart, but a label grants no provisioning authority. The weekly restore test reads the snapshot labelled `kind=restore`, and the standup refuses to run when two snapshots carry that label, because which one boots the test would otherwise be decided by the order of an API reply. Remove or relabel the snapshot that a newer one replaces, and update the pinned pair with it.
 
 5. Audit the snapshot's age against both clocks.
 
@@ -1119,7 +1158,7 @@ The base system and the packages move on different clocks. `syspatch` carries ba
 		doas syspatch -l
 		uname -a
 
-   Compare the `created` value of the newest `kind=gold` image with the date of the last `syspatch` and `pkg_add -u` run on the box. A snapshot older than the last patch run reprovisions a box without that patch, which is the failure the re-snapshot in step 4 prevents.
+   Compare the `created` value of the image recorded in step 4's table with the date of the last `syspatch` and `pkg_add -u` run on the box. An image older than the last patch run reprovisions a box without that patch, which is the failure the re-snapshot in step 4 prevents. Also check that this is the ID and description `terraform/terraform.tfvars` names, since the table and the variables have to move together.
 
 ## Operator actions before the first payment
 
