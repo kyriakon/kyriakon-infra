@@ -251,8 +251,10 @@ full_run() {
 	wait "$hpid" 2>/dev/null || status=$?
 	assert_signal_only "$status" "the handler"
 
-	# 4. tui: a plain session reads its catalogue, locks a session, exits on q.
-	printf 'q\n' |
+	# 4. tui: a plain session reads its catalogue, locks a session, and leaves
+	# from its start screen. The start screen's word is "quit"; the menu's is
+	# "q", which this session never reaches.
+	printf 'quit\n' |
 		"$tui_bin" --plain --config "$tree/handler.toml" --state "$tree/state" \
 		> "$tree/logs/tui" 2>&1 ||
 		fail "the plain terminal session failed"
