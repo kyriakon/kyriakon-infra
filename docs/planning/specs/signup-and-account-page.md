@@ -59,7 +59,7 @@ One person reviews, and the whole application reaches them in one email so the d
 
 The decision is one of three: approve paid, approve without charge, or decline. The same person makes the free judgement at the same moment on the same evidence, on the applicant's own words, and the account records only that it is free and never why.
 
-**Declining** gives no reason and always offers the way back. The application is held for a week, then purged and the username released. A monastic decline is the one exception: its message names what is missing, because what is missing is a conversation.
+**Declining** gives no reason and always offers the way back. The status link answers for a week. The answers are held inside ADR 0005's ninety days and then cleared; the record and the username are released when the ninety days end, or a week after the decision if that is later. A monastic decline is the one exception: its message names what is missing, because what is missing is a conversation.
 
 **Approval provisions the account and opens the mailbox**, and payment follows. This is the sequence the tickets fixed against the proposal's older text: there is no waiting for an account to exist, because mail is what the account is for.
 

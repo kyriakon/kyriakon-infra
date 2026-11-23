@@ -6,8 +6,8 @@ use crate::Error;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Duration, OffsetDateTime};
 
-/// The hold after a decision, which is the drain's: it clears the application
-/// away seven days after it decides, and the status page stops with it.
+/// The status link's window after a decision: seven days, after which the page
+/// stops answering. The record itself follows ADR 0005's ninety days.
 const STATUS_WINDOW_DAYS: i64 = 7;
 
 /// The time an application was filed, RFC 3339 in UTC, second precision. Second

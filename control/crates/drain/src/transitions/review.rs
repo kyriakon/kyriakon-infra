@@ -1045,8 +1045,9 @@ async fn approve_group(
     ))
 }
 
-/// The decline: no reason, a message that offers the way back, the application
-/// held a week, and only a monastic decline says what is missing.
+/// The decline: no reason, a message that offers the way back, the record held
+/// inside ADR 0005's ninety days while the status link answers for a week, and
+/// only a monastic decline says what is missing.
 async fn decline(
     cfg: &DrainConfig,
     store: &Store,
@@ -1421,9 +1422,8 @@ fn decline_body(record: &Record) -> String {
     let monastic = questions::is_monastic(record.answers.get("orders").map(String::as_str));
     let mut out = format!(
         "Your application for {} was not accepted this time.\n\n\
-         We hold it for a week in case a word arrives, and then it is cleared away\n\
-         and the name is free again. To have us look again, reply if we wrote to you,\n\
-         or write to admin@kyriakon.net from anywhere.\n",
+         The status link answers for a week. To have us look again, reply if we wrote\n\
+         to you, or write to admin@kyriakon.net from anywhere.\n",
         record.username
     );
     if monastic {
