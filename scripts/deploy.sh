@@ -813,6 +813,21 @@ self_test() {
 	( plan "$repo" "$head" ) >/dev/null 2>&1 || got=$?
 	check 'an uninstalled script fails the plan' "$got" 1
 
+	# A range that only changes the hand-applied doas fragment must not record:
+	# the rule is copied into /etc/doas.conf by hand, and the marker says the
+	# release is applied.
+	doas_base=$(git -C "$repo" rev-parse HEAD)
+	printf 'permit nopass _onboard as root cmd /usr/local/libexec/kyriakon-authcheck\n' \
+		>"$repo/openbsd/etc/doas.conf.control"
+	git -C "$repo" add -A
+	git -C "$repo" commit -qm doas
+	all_scripts=no
+	plan "$repo" "$doas_base"
+	check 'a doas-only range plans deploy-control' "$needs_control" yes
+	check 'and marks the rule as manual' "$manual_doas" yes
+	check 'and does not advance the marker' \
+		"$(if gate; then printf yes; else printf no; fi)" no
+
 	self_test_end
 }
 
