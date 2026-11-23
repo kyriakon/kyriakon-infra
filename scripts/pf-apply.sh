@@ -105,11 +105,14 @@ remove_lo_skip() {
 	mv "$tmp" "$1"
 }
 
-# The signup hop: relayd runs as root, so an outbound rule limited to root is
-# the one thing a local unprivileged process cannot match. `flags S/SA` keeps
-# the block to connection setup, so replies ride the state the pass rule
-# creates and httpd's own answers are never blocked. Any other loopback service
-# keeps the stock `pass` above.
+# The signup hop: relayd's relay workers drop to _relayd (RELAYD_USER) before
+# they connect to a backend, so a pass limited to root never matches them and
+# the block silently drops every backend connection (#920). The kernel matches
+# `user` against the connecting socket's euid, which a local unprivileged
+# process cannot take. `root` stays because the deploy's direct 127.0.0.1:8080
+# check runs as root. `flags S/SA` keeps the block to connection setup, so
+# replies ride the state the pass rule creates and httpd's own answers are never
+# blocked. Any other loopback service keeps the stock `pass` above.
 append_signup_hop() {
 	if has_block_in "$1" "signup hop"; then
 		return 1
@@ -118,9 +121,36 @@ append_signup_hop() {
 
 # --- kyriakon: signup hop (#758, openbsd/etc/httpd.conf) ---
 block out on lo proto tcp to 127.0.0.1 port 8080 flags S/SA
-pass  out on lo proto tcp to 127.0.0.1 port 8080 user root keep state
+pass  out on lo proto tcp to 127.0.0.1 port 8080 user { root _relayd } keep state
 # --- end kyriakon: signup hop ---
 EOF
+}
+
+# The accounts the box's relayd processes run as. The relay workers that open
+# backend connections drop to _relayd, while the parent stays root, so every
+# account seen is returned, not just the first. The account record is the
+# fallback when relayd is installed but not running. Empty means the host has no
+# relayd at all (macOS), and the caller skips.
+relayd_users() {
+	typeset seen
+	seen=$(ps -axo user,command 2>/dev/null | awk 'NR > 1 && /[r]elayd/ { print $1 }' | sort -u)
+	if [ -n "$seen" ]; then
+		printf '%s\n' "$seen"
+	else
+		id -un _relayd 2>/dev/null || true
+	fi
+}
+
+# The accounts a fragment's loopback pass admits, one per line, from its `user`
+# clause. Handles both `user root` and `user { root _relayd }`.
+pass_users_in() {
+	awk '/^pass .* out on lo .* user / {
+		sub(/^.* user /, "")
+		sub(/ keep state.*$/, "")
+		gsub(/[{}]/, " ")
+		for (i = 1; i <= NF; i++) print $i
+		exit
+	}' "$1"
 }
 
 # One value from the box's values file, or the empty string. Sourced in a
@@ -219,7 +249,7 @@ END { if (inblk) printf "%s", buf }
 self_test() {
 	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
 	. "$(dirname "$0")/lib.sh"
-	typeset tree first second env
+	typeset tree first second env relayd_accounts account
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work
@@ -274,7 +304,23 @@ self_test() {
 	check "the hop block is written" "$(has_block_in "$hop" 'signup hop' && printf yes)" yes
 	check "the block precedes the pass" \
 		"$(awk '/^block out on lo/ { b = NR } /^pass  out on lo/ { p = NR } END { print (b && p && b < p) }' "$hop")" 1
-	check "the pass is limited to root" "$(grep -c 'user root keep state' "$hop")" 1
+	# The pass must name the accounts relayd actually connects as. Its relay
+	# workers drop to _relayd before relay_init, so a rule limited to root never
+	# matches and the block drops every backend connect (#920). The live box is
+	# the authority: the accounts come from the running relayd processes or its
+	# account record, never from the rule text being checked. A host with no
+	# relayd (macOS) skips the live check rather than asserting a guess.
+	relayd_accounts=$(relayd_users) || relayd_accounts=
+	if [ -z "$relayd_accounts" ]; then
+		printf 'skip: no relayd on this host; the live uid check needs a box with relayd\n'
+	else
+		for account in $relayd_accounts; do
+			check "the pass names ${account}, a user relayd runs as" \
+				"$(pass_users_in "$hop" | grep -cx "$account")" 1
+		done
+	fi
+	check "and still admits root for the deploy's direct probe" \
+		"$(pass_users_in "$hop" | grep -cx root)" 1
 	check "the block is limited to connection setup" "$(grep -c 'flags S/SA' "$hop")" 1
 	before=$(cksum "$hop")
 	if append_signup_hop "$hop"; then second=added; else second=quiet; fi
@@ -608,10 +654,11 @@ fi
 # --- signup hop -------------------------------------------------------------
 # httpd's signup vhost listens on loopback and the handler cannot tell relayd
 # from any other local process: both arrive from 127.0.0.1, and every header
-# relayd sets can be set by the caller. relayd runs as root, so the socket
-# owner is the one discriminator the kernel can make without a secret in the
-# handler (#758). Deliberately paired with the skip-line removal above: alone,
-# this block matches nothing.
+# relayd sets can be set by the caller. The socket owner is the one
+# discriminator the kernel can make without a secret in the handler, and
+# relayd's relay workers drop to _relayd before connecting, so the pass names
+# that account as well as root (#758, #920). Deliberately paired with the
+# skip-line removal above: alone, this block matches nothing.
 if has_block 'signup hop'; then
 	printf 'signup hop:   already in %s\n' "$pf_conf"
 else
