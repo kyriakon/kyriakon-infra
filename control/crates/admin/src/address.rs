@@ -3,19 +3,30 @@
 use crate::Error;
 use crate::*;
 
-/// File one address change in a group. The signature is the console's, over
-/// every field the drain acts on: an address intent creates a root account or
-/// removes one, and `intents/` is writable by the unprivileged handler.
-///
-/// `--key-file` is the new mailbox's armored public key, read here and carried
-/// in the intent so the drain installs it in the keyring and publishes it.
-pub(crate) async fn address(
-    cfg: &DrainConfig,
-    store: &Store,
-    args: &[String],
-) -> Result<(), Error> {
+/// The flags one address change takes, after every check that needs no key and
+/// no store. A removal names its mailbox and nothing else, so an `--address`
+/// beside it is refused rather than silently discarded.
+#[derive(Debug)]
+pub(crate) struct AddressArgs {
+    pub domain: String,
+    pub action: String,
+    pub address: String,
+    pub mailbox: String,
+    pub site_owner: Option<String>,
+    pub key_file: Option<String>,
+}
+
+/// Parse and check the flags for [`address`]. `--confirm-remove` is a bare
+/// switch, which the pair reader does not take, so it is lifted out first.
+pub(crate) fn address_args(args: &[String]) -> Result<AddressArgs, Error> {
+    let confirm_remove = args.iter().any(|a| a == "--confirm-remove");
+    let paired: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--confirm-remove")
+        .cloned()
+        .collect();
     let flags = flags(
-        args,
+        &paired,
         &[
             "domain",
             "action",
@@ -42,7 +53,26 @@ pub(crate) async fn address(
         return Err(Error::Failed(format!("the mailbox {mailbox:?}: {why}")));
     }
     let address = flags.get("address").map(String::as_str).unwrap_or("");
-    if action != "remove" {
+    if action == "remove" {
+        if !address.is_empty() {
+            return Err(Error::Failed(format!(
+                "--address cannot be given with --action remove: the removal closes the mailbox \
+                 {mailbox}@{domain}, not the address {address}@{domain}, which would be ignored"
+            )));
+        }
+        if !confirm_remove {
+            return Err(Error::Failed(format!(
+                "removing {mailbox}@{domain} deletes its account, home and Maildir, quota \
+                 record, git repositories, published tree and store record; give \
+                 --confirm-remove to file it"
+            )));
+        }
+    } else {
+        if confirm_remove {
+            return Err(Error::Failed(
+                "--confirm-remove is only for --action remove".to_string(),
+            ));
+        }
         if address.is_empty() {
             return Err(Error::Failed(
                 "--address is needed for this change".to_string(),
@@ -52,15 +82,42 @@ pub(crate) async fn address(
             return Err(Error::Failed(format!("the address {address:?}: {why}")));
         }
     }
-    let site_owner = flags.get("site-owner").map(String::as_str);
-    if let Some(owner) = site_owner {
+    let site_owner = flags.get("site-owner").cloned();
+    if let Some(owner) = &site_owner {
         if let Some(why) = validate::username_shape(owner) {
             return Err(Error::Failed(format!("the site owner {owner:?}: {why}")));
         }
     }
-    let mail_key = match flags.get("key-file") {
+    Ok(AddressArgs {
+        domain: domain.to_string(),
+        action: action.to_string(),
+        address: address.to_string(),
+        mailbox: mailbox.to_string(),
+        site_owner,
+        key_file: flags.get("key-file").cloned(),
+    })
+}
+
+/// File one address change in a group. The signature is the console's, over
+/// every field the drain acts on: an address intent creates a root account or
+/// removes one, and `intents/` is writable by the unprivileged handler.
+///
+/// `--key-file` is the new mailbox's armored public key, read here and carried
+/// in the intent so the drain installs it in the keyring and publishes it.
+pub(crate) async fn address(
+    cfg: &DrainConfig,
+    store: &Store,
+    args: &[String],
+) -> Result<(), Error> {
+    let parsed = address_args(args)?;
+    let domain = parsed.domain.as_str();
+    let action = parsed.action.as_str();
+    let address = parsed.address.as_str();
+    let mailbox = parsed.mailbox.as_str();
+    let site_owner = parsed.site_owner.as_deref();
+    let mail_key = match parsed.key_file {
         Some(path) => {
-            let material = std::fs::read_to_string(path)
+            let material = std::fs::read_to_string(&path)
                 .map_err(|e| Error::context(format!("cannot read the mail key {path}"), e))?;
             if material.trim().is_empty() {
                 return Err(Error::Failed(format!("the mail key {path} is empty")));
@@ -116,7 +173,14 @@ pub(crate) async fn address(
     })
     .file(store)
     .await?;
-    println!("filed {action} for {domain} as intent {id}");
+    if action == "remove" {
+        println!(
+            "filed remove of {mailbox}@{domain} as intent {id}: it deletes the account, home \
+             and Maildir, quota record, git repositories, published tree and store record"
+        );
+    } else {
+        println!("filed {action} for {domain} as intent {id}");
+    }
     if matches!(action, "add-mailbox" | "upgrade") {
         println!(
             "the drain writes a one-time password link onto {mailbox} when the intent applies \
