@@ -60,7 +60,7 @@ Networking: Hetzner Cloud uses virtio NICs, so the installed system gets `vio0`/
 
 ### 1.4 Verify the image before trusting it
 
-The FAQ requires cryptographic verification, not just checksums: `signify -Cp /etc/signify/openbsd-7X-base.pub -x SHA256.sig miniroot*.img` (SHA256 only catches accidental corruption; `signify` catches tampering) ([OpenBSD FAQ 4, "Downloading OpenBSD"](https://www.openbsd.org/faq/faq4.html)). This matters here because the snapshot later becomes the source of every real user's mail and keys — a substituted install image is a compromised platform from the first boot.
+OpenBSD FAQ 4, "Downloading OpenBSD", requires cryptographic verification, not just checksums. On an OpenBSD 8.0 host the command is `signify -Cp /etc/signify/openbsd-80-base.pub -x SHA256.sig miniroot*.img` ([OpenBSD FAQ 4](https://www.openbsd.org/faq/faq4.html)). The command needs `SHA256.sig` beside the image, and the Debian rescue shell has neither `signify` nor the keyring. A checksum catches accidental corruption, while `signify` catches tampering. This matters here because the snapshot later becomes the source of every real user's mail and keys, and a substituted install image compromises the platform from the first boot.
 
 ### 1.5 Post-install before snapshotting
 
