@@ -15,6 +15,7 @@ use super::groups::{
 use super::payments::{resolve_payment, token_join};
 use super::Error;
 use super::{due, report_failure, write_journal, Settlement};
+use kyriakon_control_core::account::state::{Standing, WindowState};
 use kyriakon_control_core::account::{dns, export, session};
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::validate;
@@ -26,10 +27,11 @@ use kyriakon_control_core::intent::{
 use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::payments::ledger::Ledger;
 use kyriakon_control_core::payments::rails::rail_instructions;
+use kyriakon_control_core::payments::target::PaymentTarget;
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{
-    self, Account, ApplicationRef, GroupPayment, GroupRecord, PasswordLink, Payment, Record, Store,
-    UploadKey, Window,
+    self, Account, ApplicationRef, GroupRecord, PasswordLink, Payment, Record, Store, UploadKey,
+    Window,
 };
 use kyriakon_control_core::util;
 use serde_json::json;
@@ -430,45 +432,64 @@ pub async fn window_extend(store: &Store, intent: WindowExtendIntent) -> Result<
         Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
-        return extend_group_window(store, intent, &domain).await;
+        let Some(mut group) = group_record(store, &domain).await? else {
+            return Ok(Settlement::refused(
+                "the token resolves to a group that is gone",
+            ));
+        };
+        let new_close = {
+            let mut target = PaymentTarget::group(&mut group);
+            match target.extend_window(intent.days) {
+                Ok(close) => close,
+                Err(problem) => return Ok(Settlement::refused(problem.to_string())),
+            }
+        };
+        let payment = group.payment.clone();
+        let domain_key = group.domain.clone();
+        store
+            .update_group(&domain_key, move |current| {
+                if let Some(group) = current.as_mut() {
+                    group.payment = payment.clone();
+                }
+                Ok::<(), Error>(())
+            })
+            .await?;
+        if let Some(token) = application_token(store, &group.site_owner).await {
+            store
+                .write_filed_payment(&token, &group.payment.as_payment())
+                .await?;
+        }
+        return Ok(Settlement::line(
+            "applied",
+            ApplicationRef::group(group.site_owner.clone(), domain.to_string()),
+            Some(format!(
+                "the group's window now closes on {}",
+                &new_close[..10.min(new_close.len())]
+            )),
+        ));
     }
-    let (username, _account, mut payment) = match resolve_payment(store, &intent.token).await {
+    let (username, mut account, _payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
         Err(problem) => return Ok(Settlement::refused(&problem)),
     };
-    let (paid_until, window) = (&payment.paid_until, &mut payment.window);
-    let Some(window) = window.as_mut() else {
-        return Ok(Settlement::refused(
-            "the account has no payment window to extend",
-        ));
+    let new_close = {
+        let mut target = PaymentTarget::account(&mut account);
+        match target.extend_window(intent.days) {
+            Ok(close) => close,
+            Err(problem) => return Ok(Settlement::refused(problem.to_string())),
+        }
     };
-    let new_close = match extend_open_window(paid_until.as_deref(), window, intent.days) {
-        Ok(close) => close,
-        Err(problem) => return Ok(Settlement::refused(&problem)),
-    };
-    // Read the join before the account is written: a token record that cannot
-    // be read fails here, with the window still unchanged for the retry.
-    let mut join = store.token(&intent.token).await?;
+    let payment = account.payment.clone();
     store
-        .update_account(&username, |current| {
+        .update_account(&username, move |current| {
             if let Some(account) = current.as_mut() {
-                account.payment = Some(payment.clone());
+                account.payment = payment.clone();
             }
             Ok::<(), Error>(())
         })
         .await?;
-    store.write_payment_copy(&username, &payment).await?;
-    // The token index carries the date the operator's list and any later lookup
-    // sees, so keep it beside the account.
-    if let Some(join) = join.as_mut() {
-        join.window_closes_at = new_close.clone();
-        let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Error::Json {
-            context: "encode the token record",
-            source,
-        })?;
-        store
-            .write_record("tokens", &format!("{}.json", intent.token), &bytes)
-            .await?;
+    if let Some(payment) = account.payment.as_ref() {
+        store.write_payment_copy(&username, payment).await?;
     }
     let application = store
         .account_application_text(&username)
@@ -489,86 +510,6 @@ pub async fn window_extend(store: &Store, intent: WindowExtendIntent) -> Result<
             &new_close[..10.min(new_close.len())]
         )),
     ))
-}
-
-/// `window extend` for a group's token: the same fourteen days, the same one
-/// extension, applied to the one window the whole body pays inside.
-async fn extend_group_window(
-    store: &Store,
-    intent: WindowExtendIntent,
-    domain: &str,
-) -> Result<Settlement, Error> {
-    let Some(mut group) = group_record(store, domain).await? else {
-        return Ok(Settlement::refused(
-            "the token resolves to a group that is gone",
-        ));
-    };
-    let GroupPayment {
-        paid_until, window, ..
-    } = &mut group.payment;
-    let Some(window) = window.as_mut() else {
-        return Ok(Settlement::refused(
-            "the group has no payment window to extend",
-        ));
-    };
-    let new_close = match extend_open_window(paid_until.as_deref(), window, intent.days) {
-        Ok(close) => close,
-        Err(problem) => return Ok(Settlement::refused(&problem)),
-    };
-    // Read the join before the group is written, as the person path does.
-    let mut join = store.token(&intent.token).await?;
-    store.write_group_record(&group).await?;
-    if let Some(join) = join.as_mut() {
-        join.window_closes_at = new_close.clone();
-        let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Error::Json {
-            context: "encode the token record",
-            source,
-        })?;
-        store
-            .write_record("tokens", &format!("{}.json", intent.token), &bytes)
-            .await?;
-    }
-    Ok(Settlement::line(
-        "applied",
-        ApplicationRef::group(group.site_owner.clone(), domain.to_string()),
-        Some(format!(
-            "the group's window now closes on {}",
-            &new_close[..10.min(new_close.len())]
-        )),
-    ))
-}
-
-/// Move one open window fourteen days on, once. Shared by an account's window
-/// and a group's, so the one-extension rule cannot differ between them.
-fn extend_open_window(
-    paid_until: Option<&str>,
-    window: &mut Window,
-    days: i64,
-) -> Result<String, Error> {
-    if paid_until.is_some() || window.state != "open" {
-        return Err(Error::Failed(
-            "the payment window is not open, so it has nothing to extend".to_string(),
-        ));
-    }
-    if window.extensions >= 1 {
-        return Err(Error::Failed(
-            "the payment window has already been extended once; a second extension is refused"
-                .to_string(),
-        ));
-    }
-    let Ok(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339) else {
-        return Err(Error::Failed(
-            "the window's close date cannot be read".to_string(),
-        ));
-    };
-    let closes = closes + Duration::days(days);
-    window.closes_at = closes
-        .replace_nanosecond(0)
-        .unwrap_or(closes)
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| window.closes_at.clone());
-    window.extensions += 1;
-    Ok(window.closes_at.clone())
 }
 
 /// Close every payment window whose day has passed. A window with a credit
@@ -596,20 +537,63 @@ pub async fn window_sweep(
         let Some(window) = payment.window.as_ref() else {
             continue;
         };
-        if window.state == "closed" {
-            // The account already lapsed; the notice is re-offered because the
-            // notice record, not the window, is what stops a duplicate.
-            if account.state == "lapsed" {
-                if let Err(e) = lapse_notice(cfg, store, &username, &account, &payment).await {
-                    e.report(&format!("the lapse notice for {username}"));
+        if window.state == WindowState::Closed {
+            match account.state {
+                // The account already lapsed; the notice is re-offered because
+                // the notice record, not the window, is what stops a duplicate.
+                Standing::Lapsed => {
+                    if let Err(e) = lapse_notice(cfg, store, &username, &account, &payment).await {
+                        e.report(&format!("the lapse notice for {username}"));
+                    }
                 }
+                // A closure cancelled after the window closed must not leave an
+                // active account with a closed window: the deletion clock would
+                // stop for good (#892). The record is re-lapsed from the grace
+                // it already held, so a late sweep does not restart the clock.
+                Standing::Active if payment.paid_until.is_none() => {
+                    if let Err(e) = run_script(cfg, "lapse-user.sh", &[username.as_str()]).await {
+                        Error::from(e).report(&format!("stopping access for {username}"));
+                        continue;
+                    }
+                    let grace = account
+                        .grace_until
+                        .clone()
+                        .unwrap_or_else(|| util::date_after_days(40));
+                    let account = store
+                        .update_account(&username, |current| {
+                            let Some(account) = current.as_mut() else {
+                                return Err(Error::Failed(format!("no account for {username}")));
+                            };
+                            if account.state == Standing::Active {
+                                account.lapse(grace.clone());
+                            }
+                            Ok(account.clone())
+                        })
+                        .await?;
+                    if let Err(e) = lapse_notice(cfg, store, &username, &account, &payment).await {
+                        e.report(&format!("the lapse notice for {username}"));
+                    }
+                }
+                _ => {}
             }
             continue;
         }
-        if window.state != "open" || account.state != "active" {
+        if window.state != WindowState::Open || account.state != Standing::Active {
             continue;
         }
-        let Ok(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339) else {
+        let Some(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339).ok() else {
+            report_record(
+                cfg,
+                store,
+                journal,
+                "account",
+                &username,
+                &Error::Failed(format!(
+                    "the payment window's close date {:?} cannot be read, so {username} was not swept",
+                    window.closes_at
+                )),
+            )
+            .await;
             continue;
         };
         if now < closes {
@@ -620,7 +604,7 @@ pub async fn window_sweep(
         // and the account stays active.
         if payment.paid_until.is_some() {
             if let Some(window) = payment.window.as_mut() {
-                window.state = "paid".to_string();
+                window.state = WindowState::Paid;
             }
             store
                 .update_account(&username, |current| {
@@ -643,7 +627,7 @@ pub async fn window_sweep(
         let Some(window) = payment.window.as_mut() else {
             continue;
         };
-        window.state = "closed".to_string();
+        window.state = WindowState::Closed;
         let grace = util::date_after_days(40);
         // A new date does not prove a channel works, so a stop set by a bounce
         // stays until an operator resends or the member pays.
@@ -654,7 +638,7 @@ pub async fn window_sweep(
                 let Some(account) = current.as_mut() else {
                     return Err(Error::Failed(format!("no account for {username}")));
                 };
-                account.state = "lapsed".to_string();
+                account.state = Standing::Lapsed;
                 account.grace_until = Some(grace.clone());
                 account.payment = Some(payment.clone());
                 Ok(account.clone())
@@ -679,7 +663,7 @@ pub async fn window_sweep(
         let Some(window) = group.payment.window.clone() else {
             continue;
         };
-        if window.state == "closed" {
+        if window.state == WindowState::Closed {
             // The group already lapsed; the notice is re-offered because the
             // notice record, not the window, is what stops a duplicate.
             if let Err(e) = group_lapse_notice(cfg, store, journal, &group, &window).await {
@@ -687,10 +671,22 @@ pub async fn window_sweep(
             }
             continue;
         }
-        if window.state != "open" {
+        if window.state != WindowState::Open {
             continue;
         }
-        let Ok(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339) else {
+        let Some(closes) = OffsetDateTime::parse(&window.closes_at, &Rfc3339).ok() else {
+            report_record(
+                cfg,
+                store,
+                journal,
+                "group",
+                &domain,
+                &Error::Failed(format!(
+                    "the group's payment window close date {:?} cannot be read, so {domain} was not swept",
+                    window.closes_at
+                )),
+            )
+            .await;
             continue;
         };
         if now < closes {
@@ -701,7 +697,7 @@ pub async fn window_sweep(
         // lapses.
         if group.payment.paid_until.is_some() {
             if let Some(window) = group.payment.window.as_mut() {
-                window.state = "paid".to_string();
+                window.state = WindowState::Paid;
             }
             store.write_group_record(&group).await?;
             continue;
@@ -738,14 +734,14 @@ pub async fn window_sweep(
             // lapse is not the decision that put it there. The check is repeated
             // under the lock, because a console suspension can land between the
             // read above and this write.
-            if account.state != "active" {
+            if account.state != Standing::Active {
                 continue;
             }
             store
                 .update_account(mailbox, |current| {
                     if let Some(account) = current.as_mut() {
-                        if account.state == "active" {
-                            account.state = "lapsed".to_string();
+                        if account.state == Standing::Active {
+                            account.state = Standing::Lapsed;
                             account.grace_until = Some(grace.clone());
                         }
                     }
@@ -757,7 +753,7 @@ pub async fn window_sweep(
             continue;
         }
         if let Some(window) = group.payment.window.as_mut() {
-            window.state = "closed".to_string();
+            window.state = WindowState::Closed;
         }
         group.grace_until = Some(grace.clone());
         store.write_group_record(&group).await?;
@@ -943,20 +939,31 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
         // body has no addressee, so the mailbox runs its own grace and its own
         // recorded notice instead.
         if account.group.is_some()
-            && account.state == "lapsed"
+            && account.state == Standing::Lapsed
             && group_mailbox_has_addressee(cfg, store, journal, &account).await
         {
             continue;
         }
         // A suspension runs the same clock as a lapse: the same final week and
         // the same deletion, with the reason carried into its final notice.
-        if account.state != "lapsed" && account.state != "suspended" {
+        if account.state != Standing::Lapsed && account.state != Standing::Suspended {
             continue;
         }
         let Some(grace_text) = account.grace_until.as_deref() else {
             continue;
         };
         let Some(grace) = util::parse_date(grace_text) else {
+            report_record(
+                cfg,
+                store,
+                journal,
+                "account",
+                &username,
+                &Error::Failed(format!(
+                    "the grace date {grace_text:?} cannot be read, so {username} was not swept"
+                )),
+            )
+            .await;
             continue;
         };
         if today >= grace {
@@ -977,7 +984,7 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
             // The final notice is sent, or found already recorded, before the
             // deletion: an enqueue that failed leaves no notice line, and the
             // account must not be erased without the warning it exists for.
-            let warned = if account.state == "suspended" {
+            let warned = if account.state == Standing::Suspended {
                 suspension_final_notice(cfg, store, &username, &account).await
             } else {
                 final_notice(cfg, store, &username, &account).await
@@ -1015,7 +1022,7 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
         }
         // The grace's own reminder, while a month of it is left. It is skipped
         // once the final notice's week has begun, which is behind this branch.
-        if account.state == "lapsed"
+        if account.state == Standing::Lapsed
             && today >= grace - Duration::days(30)
             && today < grace - Duration::days(7)
         {
@@ -1024,7 +1031,7 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
             }
         }
         if today >= grace - Duration::days(7) {
-            let sent = if account.state == "suspended" {
+            let sent = if account.state == Standing::Suspended {
                 suspension_final_notice(cfg, store, &username, &account).await
             } else {
                 final_notice(cfg, store, &username, &account).await
@@ -1054,7 +1061,7 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
             .payment
             .window
             .as_ref()
-            .is_none_or(|window| window.state != "closed")
+            .is_none_or(|window| window.state != WindowState::Closed)
         {
             continue;
         }
@@ -1062,6 +1069,18 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
         // field has no grace to run, and a sweep that ran late does not get to
         // shorten it by measuring from the old close date.
         let Some(grace) = group.grace_until.as_deref().and_then(util::parse_date) else {
+            report_record(
+                cfg,
+                store,
+                journal,
+                "group",
+                &domain,
+                &Error::Failed(format!(
+                    "the group's grace date {:?} cannot be read, so {domain} was not swept",
+                    group.grace_until.as_deref().unwrap_or("")
+                )),
+            )
+            .await;
             continue;
         };
         if today >= grace {
@@ -1433,7 +1452,7 @@ pub async fn resend_notice(
         }
         return resend_group(cfg, store, &account, username, domain, to).await;
     }
-    if account.state == "lapsed" || account.state == "suspended" {
+    if account.state == Standing::Lapsed || account.state == Standing::Suspended {
         return resend_account(cfg, store, account, username, to).await;
     }
     // An active site owner whose body's clock is stopped: the group is the
@@ -1449,7 +1468,7 @@ pub async fn resend_notice(
                 .payment
                 .window
                 .as_ref()
-                .is_none_or(|window| window.state != "closed")
+                .is_none_or(|window| window.state != WindowState::Closed)
             || record.grace_until.is_none()
         {
             continue;
@@ -1484,7 +1503,7 @@ async fn resend_account(
         .unwrap_or_default();
     let reason = account.suspension_reason.clone().unwrap_or_default();
     let grace = util::date_after_days(40);
-    let (kind, subject, body) = if account.state == "suspended" {
+    let (kind, subject, body) = if account.state == Standing::Suspended {
         (
             notice::ACCOUNT_SUSPENDED_FINAL,
             format!(
@@ -1563,7 +1582,7 @@ async fn resend_group(
         .payment
         .window
         .as_ref()
-        .is_none_or(|window| window.state != "closed")
+        .is_none_or(|window| window.state != WindowState::Closed)
     {
         return Err(Error::Failed(format!(
             "{domain}'s payment window is not closed, so it has no grace clock to restart"
@@ -1733,8 +1752,7 @@ pub async fn suspend(
             let Some(account) = current.as_mut() else {
                 return Err(Error::Failed(format!("no account for {username}")));
             };
-            account.state = "suspended".to_string();
-            account.suspension_reason = Some(reason.to_string());
+            account.suspend(reason);
             // The suspension enters the same forty-day grace as a lapse. A retry
             // keeps the date it first set, and a stop a bounce set stays with the
             // clock, because a new date does not prove a channel works.
@@ -1768,7 +1786,8 @@ pub async fn suspend(
         "The account {username} has been suspended: {reason}\n\n\
          Outbound mail has stopped, and uploading to your site and pushing to git with\n\
          it. Inbound mail keeps arriving and stays readable, and your account page stays\n\
-         open and shows this reason.\n\n\
+         open and shows this reason. The operator takes the published site and Gemini\n\
+         capsule down as part of the same step.\n\n\
          To answer it, reply to this message or write to admin@kyriakon.net. A suspension\n\
          that is not resolved enters the same forty-day grace as an unpaid account, and\n\
          that grace ends in deletion.\n"
@@ -1786,6 +1805,14 @@ pub async fn suspend(
     Ok(())
 }
 
+/// What a resume actually did, which the console prints and its exit status
+/// carries (#904). A resume is not always a restoration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resume {
+    Active,
+    LeftLapsed,
+}
+
 /// `kyriakon-admin resume`: the inverse of a suspension. A member whose payment
 /// is still in order returns to active: the three access paths come back
 /// through the shared lapse script, and the reason and the grace the suspension
@@ -1797,14 +1824,14 @@ pub async fn resume(
     store: &Store,
     journal: &Journal,
     username: &str,
-) -> Result<(), Error> {
+) -> Result<Resume, Error> {
     if let Some(why) = validate::username_shape(username) {
         return Err(Error::Failed(format!("the username {username:?}: {why}")));
     }
     let Some(account) = store.account(username).await? else {
         return Err(Error::Failed(format!("no account for {username}")));
     };
-    if account.state != "suspended" {
+    if account.state != Standing::Suspended {
         return Err(Error::Failed(format!(
             "{username} is not suspended, so there is nothing to resume"
         )));
@@ -1832,7 +1859,7 @@ pub async fn resume(
                     .payment
                     .window
                     .as_ref()
-                    .is_some_and(|window| window.state == "closed")
+                    .is_some_and(|window| window.state == WindowState::Closed)
         })
     } else {
         account.payment_state().is_some_and(|payment| {
@@ -1840,24 +1867,19 @@ pub async fn resume(
                 && payment
                     .window
                     .as_ref()
-                    .is_some_and(|window| window.state == "closed")
+                    .is_some_and(|window| window.state == WindowState::Closed)
         })
     };
     if !lapsed {
         run_script(cfg, "lapse-user.sh", &["--restore", username]).await?;
     }
-    store
+    let standing = store
         .update_account(username, |current| {
             let Some(account) = current.as_mut() else {
                 return Err(Error::Failed(format!("no account for {username}")));
             };
-            account.state = if lapsed { "lapsed" } else { "active" }.to_string();
-            account.suspension_reason = None;
-            if !lapsed {
-                account.grace_until = None;
-                account.notice_stopped = None;
-            }
-            Ok(())
+            let standing = account.resume(lapsed)?;
+            Ok(standing)
         })
         .await?;
     write_journal(
@@ -1868,10 +1890,14 @@ pub async fn resume(
         "resume",
         &application,
         "applied",
-        lapsed.then_some("left lapsed: the payment window is closed"),
+        (standing == Standing::Lapsed).then_some("left lapsed: the payment window is closed"),
     )
     .await?;
-    Ok(())
+    Ok(if standing == Standing::Active {
+        Resume::Active
+    } else {
+        Resume::LeftLapsed
+    })
 }
 
 /// The lifecycle's one deletion transition. `kyriakon-admin delete` calls it
@@ -2135,7 +2161,7 @@ pub async fn close_account(
             return Err(Error::from(e));
         }
     }
-    if account.state == "closing" {
+    if account.state == Standing::Closing {
         return Ok(Settlement::line(
             "applied",
             application,
@@ -2152,8 +2178,7 @@ pub async fn close_account(
             payment.stripe.cancel_at_period_end = true;
         }
     }
-    account.state = "closing".to_string();
-    account.closing_until = Some(util::date_after_days(7));
+    account.enter_closing(account.state, util::date_after_days(7));
     // A closing mailbox leaves its group's list with its closure, so the record
     // does not keep naming a mailbox the seven-day purge will delete. The lapse
     // sweep skips a name the box no longer has, but the two records agree here.
@@ -2170,12 +2195,15 @@ pub async fn close_account(
         }
     }
     let closing_until = account.closing_until.clone();
+    let prior = account.closing_prior_state;
     let payment = account.payment.clone();
     store
         .update_account(&intent.username, |current| {
             if let Some(account) = current.as_mut() {
-                account.state = "closing".to_string();
-                account.closing_until = closing_until.clone();
+                account.enter_closing(
+                    prior.unwrap_or(Standing::Active),
+                    closing_until.clone().unwrap_or_default(),
+                );
                 account.payment = payment.clone();
             }
             Ok::<(), Error>(())
@@ -2208,14 +2236,33 @@ pub async fn cancel_close(store: &Store, intent: CancelCloseIntent) -> Result<Se
             intent.username
         )));
     };
-    if account.state != "closing" || account.closing_until.is_none() {
-        return Ok(Settlement::refused(format!(
-            "{} is not closing, so there is no closure to cancel",
-            intent.username
-        )));
+    // A refund line is the authority only for a closure written before the
+    // prior state and flag existed. This release's closures carry both, and an
+    // excess refund before the close is not a reason to refuse the cancel.
+    if account.closing_prior_state.is_none() {
+        if let Some(token) = account
+            .payment_state()
+            .and_then(|payment| payment.token_ref)
+        {
+            if !Ledger::open(store).refunds(&token).await?.is_empty() {
+                return Ok(Settlement::refused(
+                    "the closure was paid out by a refund, so it cannot be cancelled",
+                ));
+            }
+        }
     }
-    account.state = "active".to_string();
-    account.closing_until = None;
+    // The state machine restores the standing the closure came from and refuses
+    // a closure a refund paid out. A caller cannot skip either rule.
+    let prior = match account.cancel_close() {
+        Ok(prior) => prior,
+        Err(e) => {
+            let reason = match &e {
+                kyriakon_control_core::Error::Failed(message) => message.clone(),
+                _ => e.to_string(),
+            };
+            return Ok(Settlement::refused(reason));
+        }
+    };
     // The closure took the mailbox out of its group's list, so a cancellation
     // puts it back: the group's address keeps delivering to it.
     if let Some(domain) = account.group.clone() {
@@ -2233,8 +2280,10 @@ pub async fn cancel_close(store: &Store, intent: CancelCloseIntent) -> Result<Se
     store
         .update_account(&intent.username, |current| {
             if let Some(account) = current.as_mut() {
-                account.state = "active".to_string();
+                account.state = prior;
                 account.closing_until = None;
+                account.closing_prior_state = None;
+                account.closing_refunded = false;
             }
             Ok::<(), Error>(())
         })
@@ -2242,7 +2291,9 @@ pub async fn cancel_close(store: &Store, intent: CancelCloseIntent) -> Result<Se
     Ok(Settlement::line(
         "applied",
         application,
-        Some("the closure is cancelled; the account is active again".to_string()),
+        Some(format!(
+            "the closure is cancelled; the account is {prior} again"
+        )),
     ))
 }
 
@@ -2322,7 +2373,7 @@ pub async fn upload_key(
             // upload session would assign the member class before the
             // provisioner sees the group the lapse emptied: the lapse would be
             // undone while the record still says lapsed. Nothing to rebuild.
-            if !matches!(account.state.as_str(), "active" | "closing") {
+            if !matches!(account.state, Standing::Active | Standing::Closing) {
                 return Ok(Settlement::refused(
                     "the account is not sending, so its upload session is not rebuilt",
                 ));
@@ -2485,6 +2536,15 @@ pub async fn set_serving(
     let Some(account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
+    // A suspended account's lanes are the operator's takedown. The masked
+    // serving() makes both read false, so a member ticking a box would look like
+    // turning a lane back on; that would republish the vhost the suspension
+    // removed. Refuse it and keep the mask for display.
+    if account.state == Standing::Suspended && (intent.http || intent.gemini) {
+        return Ok(Settlement::refused(
+            "a suspended account cannot turn a published lane on; resolve the suspension first",
+        ));
+    }
     // An unrecorded lane on a hosting member is serving: provision-member.sh
     // wrote it and nobody has turned it off. Comparing the effective value keeps
     // a save from removing a lane the page showed as on.
@@ -3600,7 +3660,7 @@ pub async fn prepaid_renewals(
         let Some(account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
         };
-        if account.state != "active" || account.group.is_some() {
+        if account.state != Standing::Active || account.group.is_some() {
             continue;
         }
         let Some(payment) = account.payment_state() else {
@@ -4226,7 +4286,7 @@ fn payment_window_open(payment: Option<&Payment>, today: time::Date) -> bool {
     };
     payment.paid_until.is_none()
         && payment.window.as_ref().is_some_and(|window| {
-            window.state == "open"
+            window.state == WindowState::Open
                 && OffsetDateTime::parse(&window.closes_at, &Rfc3339)
                     .ok()
                     .is_some_and(|closes| closes.date() >= today)
@@ -4651,7 +4711,7 @@ pub async fn purge_closing(
         let Some(account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
         };
-        if account.state != "closing" {
+        if account.state != Standing::Closing {
             continue;
         }
         // A closing record without a date is not a window this pass can close;

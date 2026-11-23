@@ -36,6 +36,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::account::state::{Standing, WindowState};
+
 /// The queue money with no token is held in, append-only except for the one
 /// line `reconcile` completes under its lock.
 pub const UNATTRIBUTED: &str = "ledger/unattributed.jsonl";
@@ -681,6 +683,30 @@ impl Store {
             self.write_filed_application(token, &merged).await?;
         }
         Ok(())
+    }
+
+    /// Merge a payment block into a filed application record, leaving every
+    /// other field the handler owns alone. A group's block is written by the
+    /// approval and every later renewal, so the status page cannot keep showing
+    /// the date it was approved at.
+    pub async fn write_filed_payment(&self, token: &str, payment: &Payment) -> Result<(), Error> {
+        let Some(text) = self.filed_application_text(token).await? else {
+            return Ok(());
+        };
+        let mut record: serde_json::Value =
+            serde_json::from_str(&text).map_err(|source| Error::Parse {
+                path: format!("applications/{token}.json").into(),
+                source,
+            })?;
+        record["payment"] = serde_json::to_value(payment).map_err(|source| Error::Encode {
+            what: "the payment block",
+            source,
+        })?;
+        let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Encode {
+            what: "the application record",
+            source,
+        })?;
+        self.write_filed_application(token, &bytes).await
     }
 
     /// Write an account's retained application copy, inside the account purge.
@@ -1965,8 +1991,10 @@ pub fn is_payment_token(token: &str) -> bool {
 pub struct Account {
     pub version: u32,
     pub username: String,
-    /// `active` after an approval; the lifecycle's other states are #153's.
-    pub state: String,
+    /// The word the lifecycle last wrote: `active` after an approval, and
+    /// `lapsed`, `suspended` or `closing` after the transitions that write
+    /// them. Typed, so no caller can store a fifth word.
+    pub state: Standing,
     /// `approve` or `decline`, and never why: an account the reviewer gave
     /// without charge records only that it is free.
     pub decision: String,
@@ -2045,6 +2073,16 @@ pub struct Account {
     /// excess refund and every other transition leave it absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closing_until: Option<String>,
+    /// The state the closure began from, written with it so a cancellation
+    /// restores a lapse rather than promoting it to active. Absent on a record
+    /// written before the field existed; [`Account::closing_prior_state`] reads
+    /// that record's own facts instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closing_prior_state: Option<Standing>,
+    /// Whether a `refund --close` paid the closure out. Present only on a
+    /// closure a refund made, and the page and the cancellation both refuse it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closing_refunded: bool,
     /// The last day of the 40-day grace after a lapse, `YYYY-MM-DD`. Written
     /// when a payment window closes with nothing recorded, so the grace and
     /// deletion sweeps measure from one date rather than from the lapse notice.
@@ -2164,6 +2202,33 @@ pub struct GroupPayment {
     /// or free group, and absent from a record written before the webhook pass.
     #[serde(default)]
     pub stripe: StripeBilling,
+    /// The Monero rail's subaddress, the operator's own wallet's, one per body.
+    /// A group's mailbox carries no payment block of its own, so the address is
+    /// recorded here and the console's `monero address` resolves a mailbox to
+    /// it (#905).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monero: Option<Monero>,
+}
+
+impl GroupPayment {
+    /// The group's payment block read as an account's, for the page, the
+    /// console printer and the one application-record copy. Every field is
+    /// named: a group has no token-issue date, no held balance and no card
+    /// application reference, and a field added to [`Payment`] fails here until
+    /// someone decides what a group's value is.
+    pub fn as_payment(&self) -> Payment {
+        Payment {
+            token_ref: self.token_ref.clone(),
+            token_issued_at: None,
+            application_ref: None,
+            paid_until: self.paid_until.clone(),
+            window: self.window.clone(),
+            rail: Some(self.rail.clone()),
+            balance_gbp: None,
+            stripe: self.stripe.clone(),
+            monero: self.monero.clone(),
+        }
+    }
 }
 
 /// `groups/<domain>/group.json`: one body's record. The name and kind are the
@@ -2441,6 +2506,13 @@ impl Account {
     /// member with an upload key is on, because provision-member.sh wrote it;
     /// a member with no upload key has no lane at all, so neither is served.
     pub fn serving(&self) -> (bool, bool) {
+        // A suspension takes the published lanes down. The vhost files are the
+        // operator's step (docs/terms.md, docs/aup.md), so this records what the
+        // account page and the capsule must say rather than leaving the form on
+        // while the site still answers (#891).
+        if self.state == Standing::Suspended {
+            return (false, false);
+        }
         let written = !self.upload_keys.is_empty();
         (
             self.site_served.unwrap_or(written),
@@ -2518,8 +2590,8 @@ impl FlatPayment {
 pub struct Window {
     pub opened_at: String,
     pub closes_at: String,
-    /// `open`, `closed` or `paid`; the window's own transitions are #302's.
-    pub state: String,
+    /// The window's own standing, as the record writes it.
+    pub state: WindowState,
     pub extensions: u32,
 }
 
@@ -2538,8 +2610,6 @@ pub struct TokenRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     pub issued_at: String,
-    pub window_closes_at: String,
-    pub state: String,
 }
 
 /// What a credit computed before it wrote the account: the date it was going to
@@ -2558,6 +2628,15 @@ pub struct CreditProgress {
     /// block can no longer tell a first credit from a renewal.
     #[serde(default)]
     pub quoted: bool,
+}
+
+/// The balance an excess refund is about to leave, recorded before the account
+/// write so a retry after a failed ledger append does not subtract it again
+/// (#872). Present only on a refund's `applying` line.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RefundProgress {
+    pub balance_before: Option<String>,
+    pub balance_after: Option<String>,
 }
 
 /// One line of `journal.jsonl`. Appended before a transition is carried out, so
@@ -2593,6 +2672,10 @@ pub struct JournalLine {
     /// other line and on a credit's own `applied` line.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit: Option<CreditProgress>,
+    /// The balance an excess refund computed before it wrote the account.
+    /// Absent on every other line and on a refund's own `applied` line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refund: Option<RefundProgress>,
 }
 
 /// One line of `ledger/unattributed.jsonl`: money that could not be joined to
@@ -2791,6 +2874,7 @@ mod tests {
             note: None,
             review: None,
             credit: None,
+            refund: None,
         };
         let text = serde_json::to_string(&line).unwrap();
         assert!(!text.contains("status_token"), "{text}");
@@ -3683,7 +3767,7 @@ mod tests {
                 release.send(()).unwrap();
                 store
                     .update_account("alice", |current| {
-                        current.as_mut().unwrap().state = "suspended".to_string();
+                        current.as_mut().unwrap().state = Standing::Suspended;
                         Ok::<(), Error>(())
                     })
                     .await
@@ -3697,7 +3781,11 @@ mod tests {
             account.notice_stopped.is_some(),
             "the bounce latch was dropped by the other writer"
         );
-        assert_eq!(account.state, "suspended", "the suspension was dropped");
+        assert_eq!(
+            account.state,
+            Standing::Suspended,
+            "the suspension was dropped"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3737,6 +3825,7 @@ mod tests {
             note: None,
             review: None,
             credit: None,
+            refund: None,
         }
     }
 

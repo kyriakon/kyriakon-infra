@@ -82,9 +82,9 @@ A new approval has a fourteen-day payment window, and that is the automatic case
 
 These are three different things, and it helps to keep them apart.
 
-Suspension is an enforcement step under the acceptable use policy. When an account is suspended, outbound mail stops at once and the website and capsule come down. Inbound mail keeps arriving and stays readable, and the account page stays open so you can see the reason and reply. A suspension that is not resolved starts the same forty-day grace and ends in deletion.
+Suspension is an enforcement step under the acceptable use policy. When an account is suspended, outbound mail stops at once, and the operator takes the published website and capsule down as part of the same step. Inbound mail keeps arriving and stays readable, and the account page stays open so you can see the reason and reply. A suspension that is not resolved starts the same forty-day grace and ends in deletion.
 
-Closing is what happens when you ask us to close the account, or when a refund is given. Closing runs for seven days. The account works normally throughout, so you can take everything with you, and you can cancel the closure from the account page. Delivery continues during the seven days. At the end of day seven the account is deleted and the address stops accepting mail.
+Closing is what happens when you ask us to close the account, or when a refund is given. Closing runs for seven days. The account works normally throughout, so you can take everything with you, and you can cancel the closure from the account page. A closure that a refund paid out cannot be cancelled, because the money and the year have both gone back. Delivery continues during the seven days. At the end of day seven the account is deleted and the address stops accepting mail.
 
 Deletion removes the account, the mailbox, the git repositories, and the web and gemini roots. Your username is held for ninety days and then released, so an old correspondent's mail does not land in a stranger's mailbox. A deleted account is not restored: if you come back you apply again as a new applicant, and the old mailbox, keys and settings are gone.
 

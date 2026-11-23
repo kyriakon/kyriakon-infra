@@ -4659,7 +4659,16 @@ fn resuming_a_lapsed_account_keeps_it_lapsed() {
     let out = fix.ctl(&["suspend", "secretary", "--reason", reason]);
     assert!(out.status.success(), "{}", body(&out));
     let out = fix.ctl(&["resume", "secretary"]);
-    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !out.status.success(),
+        "a resume that restored nothing reported success: {}",
+        body(&out)
+    );
+    assert!(
+        body(&out).contains("stays lapsed"),
+        "the console did not say what happened: {}",
+        body(&out)
+    );
 
     let account = fix.account("secretary");
     assert_eq!(
@@ -4743,6 +4752,47 @@ fn a_closure_can_be_cancelled_until_the_purge_runs() {
         !fix.dir.join(format!("store/intents/{id}.json")).exists(),
         "a page refusal left its intent file"
     );
+}
+
+/// A lapse cannot be escaped by closing and cancelling: the closure remembers
+/// the state it came from, so the cancel restores the lapse and the deletion
+/// clock keeps running (#892).
+#[test]
+fn cancelling_a_lapsed_accounts_closure_restores_the_lapse() {
+    let fix = Fix::new("cancel-close-lapsed");
+    approved_paid(&fix, "secretary", "cash");
+    fix.amend_account("secretary", |account| {
+        account["payment"]["window"]["closes_at"] = json!("2020-01-01T00:00:00Z");
+    });
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.account("secretary")["state"], json!("lapsed"));
+
+    fix.file_close("secretary");
+    assert!(fix.drain().status.success());
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("closing"), "{account}");
+    assert_eq!(
+        account["closing_prior_state"],
+        json!("lapsed"),
+        "the closure did not record the state it came from: {account}"
+    );
+
+    fix.file_page_action("cancel-close", "secretary", json!({}));
+    assert!(fix.drain().status.success());
+    let account = fix.account("secretary");
+    assert_eq!(
+        account["state"],
+        json!("lapsed"),
+        "the cancellation promoted a lapse to active: {account}"
+    );
+    assert!(
+        account.get("closing_until").is_none(),
+        "the closing window stayed: {account}"
+    );
+
+    // The next pass leaves it lapsed and the deletion clock is still its own.
+    assert!(fix.drain().status.success());
+    assert_eq!(fix.account("secretary")["state"], json!("lapsed"));
 }
 
 /// A group mailbox that closes leaves the group's list, so cancelling the

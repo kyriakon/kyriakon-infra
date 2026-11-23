@@ -1,6 +1,6 @@
 //! One job of the operator console.
 
-use crate::payments::{group_payment, print_payment};
+use crate::payments::print_payment;
 use crate::Error;
 use crate::*;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -101,7 +101,7 @@ pub(crate) async fn show(store: &Store, username: &str) -> Result<(), Error> {
     match account {
         Some(account) => {
             println!("account {username}");
-            println!("  state    {}", safe(&account.state));
+            println!("  state    {}", safe(account.state.word()));
             println!("  decision {}", safe(&account.decision));
             if let Some(stop) = &account.notice_stopped {
                 println!(
@@ -125,7 +125,7 @@ pub(crate) async fn show(store: &Store, username: &str) -> Result<(), Error> {
                     );
                     return Ok(());
                 };
-                let payment = group_payment(&record.payment);
+                let payment = record.payment.as_payment();
                 print_payment(&payment, record.payment.no_charge);
                 return Ok(());
             }
@@ -163,19 +163,30 @@ pub(crate) async fn suspend(
     let reason = need(&flags, "reason")?;
     let journal = Journal::load(store).await?;
     transitions::lifecycle::suspend(cfg, store, &journal, username, reason).await?;
-    println!("suspended {username}");
+    println!(
+        "suspended {username}: access stopped; take the published site and capsule down \
+         as the runbook's suspension step"
+    );
     Ok(())
 }
 
-/// `resume`: lift a suspension, the inverse of `suspend`. The three access
-/// paths come back, the state returns to active, and the reason and grace the
-/// suspension started are cleared.
+/// `resume`: lift a suspension, the inverse of `suspend`. With the payment in
+/// order the three access paths come back, the state returns to active, and the
+/// reason and grace the suspension started are cleared. A closed payment window
+/// leaves it lapsed, and the command fails with that outcome.
 pub(crate) async fn resume(cfg: &DrainConfig, store: &Store, rest: &[String]) -> Result<(), Error> {
     let username = one_username(rest)?;
     let journal = Journal::load(store).await?;
-    transitions::lifecycle::resume(cfg, store, &journal, username).await?;
-    println!("resumed {username}");
-    Ok(())
+    match transitions::lifecycle::resume(cfg, store, &journal, username).await? {
+        transitions::lifecycle::Resume::Active => {
+            println!("resumed {username}");
+            Ok(())
+        }
+        transitions::lifecycle::Resume::LeftLapsed => Err(Error::Failed(format!(
+            "{username} is no longer suspended but stays lapsed: the payment window is closed, so no \
+             access was restored. A payment or `kyriakon-admin window extend` is what brings it back"
+        ))),
+    }
 }
 
 /// `delete`: the lifecycle's one deletion transition, run now. The page's

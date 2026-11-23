@@ -71,7 +71,7 @@ pub(super) async fn account_web(app: &App, request: &Request) -> Reply {
     };
     let payment = block.map(|block| {
         page::payment(
-            &account.state,
+            account.state.word(),
             &account.rail,
             &block,
             &app.cfg.price_gbp,
@@ -291,8 +291,19 @@ pub(super) async fn account_cancel_close(app: &App, request: &Request) -> Reply 
         Ok(None) => return refused("Sign in to the account whose closure you want to cancel."),
         Err(e) => return respond(&e, FrontEnd::Httpd),
     };
-    if account.state != "closing" || account.closing_until.is_none() {
+    if account.state != kyriakon_control_core::account::state::Standing::Closing
+        || account.closing_until.is_none()
+    {
         return refused("This account is not closing, so there is no closure to cancel.");
+    }
+    // A closure a refund paid out cannot be cancelled: the money and the year
+    // both went back, so the page must not offer the control that would restore
+    // them without a payment (#871).
+    if account.closing_refunded {
+        return refused(
+            "This closure was paid out by a refund, so it cannot be cancelled. Write to \
+             admin@kyriakon.net if that is wrong.",
+        );
     }
     let Some(session_id) = session::id(&cookie) else {
         return refused("Sign in to the account whose closure you want to cancel.");

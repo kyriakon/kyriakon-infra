@@ -416,54 +416,79 @@ impl<'a> Ledger<'a> {
         Ok(out)
     }
 
-    /// Complete the newest unsettled refund line under the lock, and nothing
-    /// else on it. This is the ledger's one non-append write: `--settled` names
-    /// a line already recorded, and appending a second line would leave two
-    /// records of one refund. The returned `seq` is the line that was settled.
+    /// Complete the refund line at `seq` under the lock, and nothing else on
+    /// it. This is the ledger's one non-append write: `--settled` names a line
+    /// already recorded, and appending a second line would leave two records of
+    /// one refund. The sequence, not the newest unsettled line, is what the
+    /// settlement names, so a repeated settlement cannot walk backwards onto
+    /// another refund (#880).
     pub async fn settle_refund(
         &self,
         token: &str,
+        seq: u64,
         intent: &str,
         on: &str,
-    ) -> Result<Option<u64>, Error> {
+    ) -> Result<Settlement, Error> {
         let guard = self.log.lock().await?;
         let mut lines = self.log.raw_lines().await?;
-        let Some((index, settled)) = unsettled_index(&lines, token)? else {
-            return Ok(None);
+        let mut found = None;
+        for (index, raw) in lines.iter().enumerate() {
+            let line: LedgerLine =
+                serde_json::from_str(raw).map_err(|source| Error::ParseLine {
+                    path: PAYMENTS,
+                    line: index + 1,
+                    source,
+                })?;
+            // Every line is parsed, even past the one the settlement names: a
+            // settlement must not write a record back while a line it cannot
+            // read is in it.
+            if line.seq == seq {
+                found = Some((index, line));
+            }
+        }
+        let Some((index, line)) = found else {
+            return Ok(Settlement::NotFound);
         };
+        if line.token != token {
+            return Err(Error::Failed(format!(
+                "ledger seq {seq} belongs to another payment token"
+            )));
+        }
+        if line.kind != "refund" {
+            return Err(Error::Failed(format!(
+                "ledger seq {seq} is a {}, not a refund",
+                line.kind
+            )));
+        }
+        if let Some(on) = line.settled_on() {
+            return Ok(Settlement::AlreadySettled {
+                seq,
+                on: on.to_string(),
+            });
+        }
         // Only the settled line is re-encoded, through a `Value`, so fields this
         // build does not model survive the rewrite. Its key order is what the
         // value held, not the order this struct would declare.
-        let mut line: Value = serde_json::from_str(&lines[index])
+        let mut value: Value = serde_json::from_str(&lines[index])
             .map_err(|e| Error::context("the refund line does not parse", e))?;
-        line["settled_on"] = serde_json::json!(on);
-        line["settled_intent"] = serde_json::json!(intent);
-        lines[index] = serde_json::to_string(&line)
+        value["settled_on"] = serde_json::json!(on);
+        value["settled_intent"] = serde_json::json!(intent);
+        lines[index] = serde_json::to_string(&value)
             .map_err(|e| Error::context("cannot encode the ledger", e))?;
         let mut text = lines.join("\n");
         text.push('\n');
         self.store.rewrite_log(PAYMENTS, text.as_bytes()).await?;
         drop(guard);
-        Ok(Some(settled.seq))
+        Ok(Settlement::Settled { seq })
     }
 }
 
-/// The index and line of the newest refund for `token` without `settled_on`. A
-/// line that does not parse is an error: a settlement must not skip a line it
-/// cannot read and settle an older one in its place.
-fn unsettled_index(lines: &[String], token: &str) -> Result<Option<(usize, LedgerLine)>, Error> {
-    let mut found = None;
-    for (index, raw) in lines.iter().enumerate() {
-        let line: LedgerLine = serde_json::from_str(raw).map_err(|source| Error::ParseLine {
-            path: PAYMENTS,
-            line: index + 1,
-            source,
-        })?;
-        if line.token == token && line.kind == "refund" && line.settled_on().is_none() {
-            found = Some((index, line));
-        }
-    }
-    Ok(found)
+/// What a settlement found at the named ledger line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Settlement {
+    Settled { seq: u64 },
+    AlreadySettled { seq: u64, on: String },
+    NotFound,
 }
 
 #[cfg(test)]
@@ -578,7 +603,7 @@ mod tests {
         let exported = ledger.raw_lines_for("KYR-AAAA-BBBB-CCCC").await.unwrap();
         assert_eq!(exported.len(), 1, "{exported:?}");
         let error = ledger
-            .settle_refund("KYR-ZZZZ-ZZZZ-ZZZZ", "in_settle", "2026-11-05")
+            .settle_refund("KYR-ZZZZ-ZZZZ-ZZZZ", 2, "in_settle", "2026-11-05")
             .await
             .expect_err("a settlement must not skip a line it cannot read");
         assert!(

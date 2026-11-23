@@ -1270,3 +1270,39 @@ fn request_list_marks_a_legacy_line_unrecorded() {
     assert!(out.status.success(), "{}", body(&out));
     assert!(body(&out).contains("identity unrecorded"), "{}", body(&out));
 }
+
+/// A suspended account's lanes are the operator's takedown. The page shows both
+/// masked off, and a member cannot tick one back on to republish the vhost.
+#[test]
+fn a_suspended_account_cannot_turn_a_published_lane_on() {
+    let fix = Fix::new("account-serving-suspended");
+    fix.page_account(
+        "alice",
+        json!({"site_served": true, "capsule_served": true}),
+    );
+    logging_script(&fix, "lapse-user.sh");
+    logging_script(&fix, "provision-member-web.sh");
+    logging_script(&fix, "provision-member-capsule.sh");
+    logging_script(&fix, "cron-apply.sh");
+    let out = fix.ctl(&["suspend", "alice", "--reason", "test suspension"]);
+    assert!(out.status.success(), "{}", body(&out));
+
+    fix.file_page_action("serving", "alice", json!({"http": true, "gemini": false}));
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.journal().contains("cannot turn a published lane on"),
+        "{}",
+        fix.journal()
+    );
+    assert!(
+        !fix.scripts_log().contains("provision-member-web.sh alice"),
+        "the refusal republished the web lane: {}",
+        fix.scripts_log()
+    );
+    let account = fix.account("alice");
+    assert_eq!(
+        account["site_served"],
+        json!(true),
+        "the refused intent changed the record: {account}"
+    );
+}

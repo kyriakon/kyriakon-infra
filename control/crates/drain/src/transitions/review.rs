@@ -15,6 +15,7 @@ use super::Error;
 use super::{write_journal, write_review_journal, Settlement};
 use kyriakon_control_core::account::dns;
 use kyriakon_control_core::account::sign;
+use kyriakon_control_core::account::state::{Standing, WindowState};
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::questions;
 use kyriakon_control_core::flow::validate;
@@ -548,7 +549,7 @@ async fn approve(
                 Some(Window {
                     opened_at: now.clone(),
                     closes_at: util::after_days(14),
-                    state: "open".to_string(),
+                    state: WindowState::Open,
                     extensions: 0,
                 })
             })
@@ -630,7 +631,7 @@ async fn approve(
     let account = Account {
         version: 1,
         username: username.clone(),
-        state: "active".to_string(),
+        state: Standing::Active,
         decision: "approve".to_string(),
         decided_at: now.clone(),
         rail: if no_charge {
@@ -660,6 +661,8 @@ async fn approve(
         password_link: Some(account_password_link),
         group: None,
         closing_until: None,
+        closing_prior_state: None,
+        closing_refunded: false,
         grace_until: None,
         notice_stopped: None,
     };
@@ -675,6 +678,8 @@ async fn approve(
                 account.notice_stopped = existing.notice_stopped.clone();
                 account.grace_until = existing.grace_until.clone();
                 account.closing_until = existing.closing_until.clone();
+                account.closing_prior_state = existing.closing_prior_state;
+                account.closing_refunded = existing.closing_refunded;
                 account.space_used = existing.space_used;
             }
             *current = Some(account);
@@ -682,14 +687,12 @@ async fn approve(
         })
         .await?;
 
-    if let (Some(token), Some(window)) = (&token_ref, &window) {
+    if let Some(token) = &token_ref {
         let join = TokenRecord {
             token: token.clone(),
             username: username.clone(),
             group: None,
             issued_at: now.clone(),
-            window_closes_at: window.closes_at.clone(),
-            state: "issued".to_string(),
         };
         let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Error::Json {
             context: "encode the token record",
@@ -894,6 +897,7 @@ async fn approve_group(
             window: None,
             paid_until: None,
             stripe: Default::default(),
+            monero: None,
         },
         addresses,
         mailboxes: mailboxes.clone(),
@@ -947,7 +951,9 @@ async fn approve_group(
     // root-owned group record, so the block it shows is this copy in the
     // application record, as the person path writes the account's.
     if !written.payment.no_charge {
-        stamp_group_payment(store, &record.status_token, &written).await?;
+        store
+            .write_filed_payment(&record.status_token, &written.payment.as_payment())
+            .await?;
     }
     let price = cfg.group_price_gbp.as_str();
     // A group on a cash rail has no Stripe link, and asking for one would fail
@@ -1037,47 +1043,6 @@ async fn approve_group(
         intent.application.clone(),
         None,
     ))
-}
-
-/// Put the body's payment block on the application record the status page
-/// reads. The handler cannot read the root-owned group record, so the page
-/// shows this copy, as `approve` copies the account's block. A free group has
-/// no block anywhere, and its application record stays without one.
-async fn stamp_group_payment(
-    store: &Store,
-    token: &str,
-    group: &kyriakon_control_core::store::GroupRecord,
-) -> Result<(), Error> {
-    let text = store
-        .filed_application_text(token)
-        .await?
-        .ok_or_else(|| Error::Failed("the application record is gone".to_string()))?;
-    let mut record: Value =
-        serde_json::from_str(&text).map_err(|e| Error::context("the application record", e))?;
-    let block = Payment {
-        token_ref: group.payment.token_ref.clone(),
-        token_issued_at: Some(group.created_at.clone()),
-        paid_until: group.payment.paid_until.clone(),
-        window: group.payment.window.clone(),
-        rail: Some(group.payment.rail.clone()),
-        stripe: group.payment.stripe.clone(),
-        ..Default::default()
-    };
-    record["payment"] = serde_json::to_value(block).map_err(|source| Error::Json {
-        context: "encode the group payment block",
-        source,
-    })?;
-    let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
-        context: "encode the application record",
-        source,
-    })?;
-    // `applications/` belongs to the handler, so the drain hands the rewritten
-    // record back to that directory's owner. A root-owned file would read as
-    // missing to the process that renders the page.
-    store
-        .write_filed_application(token, &bytes)
-        .await
-        .map_err(Error::from)
 }
 
 /// The decline: no reason, a message that offers the way back, the application

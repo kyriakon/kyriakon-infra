@@ -141,7 +141,15 @@ fn the_export_prints_a_refund_as_a_negative_row_naming_its_seq() {
         "the unpaid refund is not listed apart: {csv}"
     );
 
-    let out = fix.ctl(&["refund", "--token", &token, "--settled", "2026-11-05"]);
+    let out = fix.ctl(&[
+        "refund",
+        "--token",
+        &token,
+        "--settled",
+        "2026-11-05",
+        "--seq",
+        &refund_seq.to_string(),
+    ]);
     assert!(out.status.success(), "{}", body(&out));
     assert!(fix.drain().status.success());
 

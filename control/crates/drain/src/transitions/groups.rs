@@ -17,6 +17,7 @@ use super::boxrun::{
 use super::lifecycle::dns_contact;
 use super::Error;
 use super::{write_journal, Settlement};
+use kyriakon_control_core::account::state::{Standing, WindowState};
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::questions;
 use kyriakon_control_core::flow::validate;
@@ -377,7 +378,7 @@ pub async fn provision_group(
                 None => Some(Window {
                     opened_at: now.clone(),
                     closes_at: util::after_days(14),
-                    state: "open".to_string(),
+                    state: WindowState::Open,
                     extensions: 0,
                 }),
             }
@@ -390,6 +391,10 @@ pub async fn provision_group(
             Some(g) if g.payment.stripe.subscription.is_some() => g.payment.stripe.clone(),
             _ => intent.payment.stripe.clone(),
         },
+        monero: record
+            .as_ref()
+            .and_then(|g| g.payment.monero.clone())
+            .or_else(|| intent.payment.monero.clone()),
     };
     let mut group = GroupRecord {
         version: 1,
@@ -494,14 +499,12 @@ pub async fn provision_group(
     // both write the one date every mailbox shares. A free group has neither a
     // token nor a ledger line. Both writes are idempotent, so a retry adds
     // nothing.
-    if let (Some(token), Some(window)) = (&payment.token_ref, &payment.window) {
+    if let Some(token) = &payment.token_ref {
         let join = TokenRecord {
             token: token.clone(),
             username: intent.site_owner.clone(),
             group: Some(intent.domain.clone()),
             issued_at: now.clone(),
-            window_closes_at: window.closes_at.clone(),
-            state: "issued".to_string(),
         };
         let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Error::Json {
             context: "encode the token record",
@@ -621,6 +624,13 @@ async fn write_group_account(
     store
         .update_account(mailbox, move |current| {
             let existing = current.as_ref();
+            // A second address or an upgrade aimed at a mailbox that already
+            // exists changes the group's tables, not the account: rewriting it
+            // here would clear a suspension, a closure, the certificate pins
+            // and the upload keys (#898).
+            if existing.is_some_and(|a| a.group.as_deref() == Some(domain.as_str())) {
+                return Ok(());
+            }
             let Some(password_link) = existing
                 .and_then(|a| a.password_link.clone())
                 .or_else(|| fresh.clone())
@@ -634,7 +644,7 @@ async fn write_group_account(
             let account = Account {
                 version: 1,
                 username: mailbox.to_string(),
-                state: "active".to_string(),
+                state: Standing::Active,
                 decision: "approve".to_string(),
                 decided_at: existing
                     .map(|a| a.decided_at.clone())
@@ -663,6 +673,8 @@ async fn write_group_account(
                 password_link: Some(password_link),
                 group: Some(domain.clone()),
                 closing_until: None,
+                closing_prior_state: None,
+                closing_refunded: false,
                 grace_until: None,
                 notice_stopped: None,
             };
@@ -1127,7 +1139,7 @@ pub(super) async fn name_held(store: &Store, username: &str) -> Result<Option<St
 /// The account's application status token from its retained application copy,
 /// where the copy is still there and readable. `None` leaves the journal prune
 /// keeping token-bearing lines rather than guessing whose they are.
-pub(super) async fn application_token(store: &Store, username: &str) -> Option<String> {
+pub async fn application_token(store: &Store, username: &str) -> Option<String> {
     let text = store
         .account_application_text(username)
         .await

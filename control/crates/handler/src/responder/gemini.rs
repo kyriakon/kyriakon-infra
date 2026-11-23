@@ -43,7 +43,7 @@ pub(super) async fn capsule_account(app: &App, incoming: &Incoming) -> Reply {
             };
             let payment = block.map(|block| {
                 page::payment(
-                    &account.state,
+                    account.state.word(),
                     &account.rail,
                     &block,
                     &app.cfg.price_gbp,

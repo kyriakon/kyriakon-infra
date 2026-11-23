@@ -150,6 +150,7 @@ fn journal_line(
         outcome: outcome.to_string(),
         note: note.map(str::to_string),
         credit: None,
+        refund: None,
         review: None,
     }
 }

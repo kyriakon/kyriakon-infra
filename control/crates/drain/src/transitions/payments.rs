@@ -6,24 +6,26 @@
 //! leaves the line, the after-line work and the remove to the seam.
 
 use super::boxrun::{cancel_stripe_if_active, run_script};
-use super::groups::group_record;
+use super::groups::{application_token, group_record};
 use super::lifecycle::dns_contact;
 use super::Error;
 use super::{AfterLine, Settlement};
+use kyriakon_control_core::account::state::Standing;
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::validate;
 use kyriakon_control_core::intent::{
     AttributeIntent, CreditIntent, RefundIntent, ReturnIntent, CREDIT_RAILS, REFUND_RAILS,
 };
 use kyriakon_control_core::mail::notice;
-use kyriakon_control_core::payments::ledger::Ledger;
 use kyriakon_control_core::payments::ledger::LedgerLine;
 use kyriakon_control_core::payments::ledger::RefundTail;
+use kyriakon_control_core::payments::ledger::{self, Ledger};
+use kyriakon_control_core::payments::target::PaymentTarget;
 use kyriakon_control_core::payments::xmr;
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{
     self, Account, ApplicationRef, CreditProgress, GroupRecord, JournalLine, Monero, Payment,
-    Store, TokenRecord,
+    RefundProgress, Store, TokenRecord,
 };
 use kyriakon_control_core::util;
 use serde_json::json;
@@ -87,23 +89,126 @@ pub async fn credit(
         Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
-        return group_credit(cfg, store, journal, &intent, &domain, None).await;
+        return credit_group(
+            cfg, store, journal, &intent, amount, received, &domain, None,
+        )
+        .await;
     }
+    credit_account(cfg, store, journal, &intent, amount, received, None).await
+}
 
-    let (username, account, payment) = match resolve_payment(store, &intent.token).await {
+/// A credit for a person's account. The token index has already said the token
+/// is not a group's.
+async fn credit_account(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    intent: &CreditIntent,
+    amount: i64,
+    received: time::Date,
+    attributed_item: Option<&str>,
+) -> Result<Settlement, Error> {
+    let (username, mut account, _payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
         Err(problem) => return Ok(Settlement::refused(&problem)),
     };
-    let app = PaymentApplication {
-        intent: &intent,
-        username: &username,
-        account,
-        payment,
+    let price = match util::pence(&cfg.price_gbp) {
+        Ok(price) if price > 0 => price,
+        Ok(_) => {
+            return Err(Error::Failed(
+                "the drain's configured price_gbp must be more than zero".to_string(),
+            ))
+        }
+        Err(e) => return Err(Error::context("the drain's configured price_gbp", e)),
+    };
+    let address = account.notice_address();
+    let party = CreditParty::Account {
+        username: username.clone(),
+        address,
+    };
+    let mut target = PaymentTarget::account(&mut account);
+    apply_credit(
+        cfg,
+        store,
+        journal,
+        &mut target,
+        &party,
+        intent,
         amount,
         received,
-        attributed_item: None,
+        price,
+        attributed_item,
+    )
+    .await
+}
+
+/// A credit for a body's one payment. Its fee covers every mailbox and the
+/// group holds no balance, so only a full year is accepted.
+#[allow(clippy::too_many_arguments)]
+async fn credit_group(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+    intent: &CreditIntent,
+    amount: i64,
+    received: time::Date,
+    domain: &str,
+    attributed_item: Option<&str>,
+) -> Result<Settlement, Error> {
+    if let Some(why) = validate::domain(domain) {
+        return Err(Error::Failed(format!(
+            "the token's group domain {domain:?}: {why}"
+        )));
+    }
+    let Some(mut group) = group_record(store, domain).await? else {
+        return Ok(Settlement::refused(
+            "the token resolves to a group that is gone",
+        ));
     };
-    apply_payment(cfg, store, journal, app).await
+    if group.payment.no_charge {
+        return Ok(Settlement::refused(
+            "the group was approved without charge, so it has no payment to record",
+        ));
+    }
+    if group.payment.token_ref.as_deref() != Some(intent.token.as_str()) {
+        return Ok(Settlement::refused(
+            "the token is not the one the group's payment block holds",
+        ));
+    }
+    let price = match util::pence(&cfg.group_price_gbp) {
+        Ok(price) if price > 0 => price,
+        Ok(_) => {
+            return Err(Error::Failed(
+                "the drain's configured group_price_gbp must be more than zero".to_string(),
+            ))
+        }
+        Err(e) => return Err(Error::context("the drain's configured group_price_gbp", e)),
+    };
+    let address = match dns_contact(store, &group).await {
+        Ok(address) => address,
+        Err(e) => return Err(e),
+    };
+    let domain = group.domain.clone();
+    let site_owner = group.site_owner.clone();
+    let party = CreditParty::Group {
+        domain: domain.clone(),
+        site_owner,
+        address,
+    };
+    let mut target = PaymentTarget::group(&mut group);
+    apply_credit(
+        cfg,
+        store,
+        journal,
+        &mut target,
+        &party,
+        intent,
+        amount,
+        received,
+        price,
+        attributed_item,
+    )
+    .await
 }
 
 /// The fields a credit's money arrives with, revalidated here because `intents/`
@@ -223,53 +328,75 @@ pub(super) async fn resolve_payment(
     Ok((username, account, payment))
 }
 
-/// One payment about to be applied to an account: the values a manual credit and
-/// a `reconcile attribute` both hold once the token has resolved. Passed as one
-/// value, so the two callers cannot disagree about any of them.
-struct PaymentApplication<'a> {
-    intent: &'a CreditIntent,
-    username: &'a str,
-    account: Account,
-    payment: Payment,
-    amount: i64,
-    received: time::Date,
-    /// The held item this payment came from, when the transition is a
-    /// `reconcile attribute`. Its own txid is the one in the queue, so that
-    /// item's held line is not a second sighting of the payment.
-    attributed_item: Option<&'a str>,
+/// Which record a credit pays for. The arithmetic and the ledger line are the
+/// same; only the owner, the price and the receipt's words differ.
+enum CreditParty {
+    Account {
+        username: String,
+        address: String,
+    },
+    Group {
+        domain: String,
+        site_owner: String,
+        address: String,
+    },
 }
 
-/// What a credit does to an account: the ceiling, the arithmetic, the account
-/// write, the payment copy, the ledger line and the receipt. Shared by the
-/// console's credit and `reconcile attribute`, so a held payment and a direct
-/// one are never applied differently.
-async fn apply_payment(
+impl CreditParty {
+    fn owner(&self) -> &str {
+        match self {
+            CreditParty::Account { username, .. } => username,
+            CreditParty::Group { site_owner, .. } => site_owner,
+        }
+    }
+
+    fn application(&self) -> ApplicationRef {
+        match self {
+            CreditParty::Account { username, .. } => ApplicationRef::account(username.clone()),
+            CreditParty::Group {
+                domain, site_owner, ..
+            } => ApplicationRef::group(site_owner.clone(), domain.clone()),
+        }
+    }
+}
+
+/// Apply a credit to whichever record holds the payment: one arithmetic, one
+/// ledger line, one receipt. A group's year is one payment with no balance; a
+/// person's may be part-paid and carries the difference.
+#[allow(clippy::too_many_arguments)]
+async fn apply_credit(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-    app: PaymentApplication<'_>,
+    target: &mut PaymentTarget<'_>,
+    party: &CreditParty,
+    intent: &CreditIntent,
+    amount: i64,
+    received: time::Date,
+    price: i64,
+    attributed_item: Option<&str>,
 ) -> Result<Settlement, Error> {
-    let PaymentApplication {
-        intent,
-        username,
-        account,
-        mut payment,
-        amount,
-        received,
-        attributed_item,
-    } = app;
-
-    // A pass that journaled `applying` and wrote the account but crashed before
+    // A pass that journaled `applying` and wrote the record but crashed before
     // the ledger append is finished here, from the values it recorded then. The
-    // account is the witness: its paid-until date (or, for a shortfall, its
-    // balance) is the one this credit computed, so nothing is extended again and
-    // no second notice is sent.
+    // record is the witness: its paid-until date (or, for a shortfall, its
+    // balance) is the one this credit computed, so nothing is extended again
+    // and no second notice is sent.
     let progress = journal.credit_progress(&intent.id);
     let written = progress.as_ref().is_some_and(|p| {
         if p.paid {
-            payment.paid_until.as_deref() == p.paid_until_after.as_deref()
+            target.paid_until() == p.paid_until_after.as_deref()
         } else {
-            payment.balance_gbp.as_deref() == p.balance_gbp.as_deref()
+            target.balance_is(p.balance_gbp.as_deref())
+        }
+    });
+    // A recovery's account already carries the date the first pass wrote, so
+    // the quote is taken from the block the journal said it recorded rather
+    // than from `payment_quote`, which only offers one before the date is set.
+    let quote = target.block().and_then(|payment| {
+        if progress.as_ref().is_some_and(|progress| progress.quoted) {
+            payment.monero
+        } else {
+            payment_quote(&payment).cloned()
         }
     });
     if let Some(progress) = progress.as_ref().filter(|_| written) {
@@ -278,7 +405,7 @@ async fn apply_payment(
                 cfg,
                 store,
                 intent,
-                payment.monero.as_ref().filter(|_| progress.quoted),
+                quote.as_ref(),
                 &util::date_string(received),
                 &util::gbp(amount),
                 &progress.applied_gbp,
@@ -286,30 +413,30 @@ async fn apply_payment(
             )
             .await?;
         }
-        // A crash between the account write and its copies leaves the status
-        // page behind; the account is the truth now, so rewrite them from it.
-        store.write_payment_copy(username, &payment).await?;
+        sync_payment_copy(store, target, party.owner(), target.is_group()).await?;
         return Ok(Settlement::applied(
-            ApplicationRef::account(username.to_string()),
+            party.application(),
             override_note(intent.override_reason.as_deref()),
         ));
     }
 
-    let before = match payment.paid_until.as_deref() {
+    let before = match target.paid_until() {
         Some(stamp) => match util::parse_date(stamp) {
             Some(date) => Some(date),
             None => {
-                return Ok(Settlement::refused(
-                    "the account's paid-until date cannot be read",
-                ))
+                return Ok(Settlement::refused(format!(
+                    "the {} paid-until date cannot be read",
+                    label(party)
+                )))
             }
         },
         None => None,
     };
     let Some(until) = util::paid_until_after(received, before) else {
-        return Ok(Settlement::refused(
-            "the account's paid-until date has no year in the calendar",
-        ));
+        return Ok(Settlement::refused(format!(
+            "the {} paid-until date has no year in the calendar",
+            label(party)
+        )));
     };
     let override_reason = intent
         .override_reason
@@ -318,28 +445,44 @@ async fn apply_payment(
     if util::credit_ceiling(received).is_some_and(|ceiling| until > ceiling)
         && override_reason.is_none()
     {
-        return Ok(Settlement::refused("the credit would put paid_until more than 24 months past --received; give --override <reason> to mean it"));
+        return Ok(Settlement::refused(format!(
+            "the credit would put the {} paid_until more than 24 months past --received; give --override <reason> to mean it",
+            label(party)
+        )));
     }
 
-    let price = util::pence(&cfg.price_gbp)
-        .map_err(|e| Error::context("the drain's configured price_gbp", e))?;
-    if price <= 0 {
-        return Err(Error::Failed(
-            "the drain's configured price_gbp must be more than zero".to_string(),
-        ));
-    }
-    let balance = match payment.balance_gbp.as_deref() {
-        Some(text) => match util::pence(text) {
+    let balance = match target.balance() {
+        Ok(Some(text)) => match util::pence(text) {
             Ok(pence) => pence,
             Err(e) => {
                 return Ok(Settlement::refused(format!(
-                    "the account's balance cannot be read: {e}"
+                    "the {} balance cannot be read: {e}",
+                    label(party)
                 )))
             }
         },
-        None => 0,
+        Ok(None) => 0,
+        Err(e) => return Err(Error::from(e)),
     };
     let applied = credit_money(price, balance, amount);
+    // A group's year is one payment and the fee covers every mailbox, so there
+    // is no balance to carry a shortfall or an excess into.
+    if target.is_group() {
+        if !applied.paid {
+            return Ok(Settlement::refused(format!(
+                "a group's year is one payment of GBP {}; GBP {} is not enough",
+                util::gbp(price),
+                util::gbp(amount)
+            )));
+        }
+        if applied.balance > 0 {
+            return Ok(Settlement::refused(format!(
+                "a group's year is one payment of GBP {}; GBP {} is more than the fee",
+                util::gbp(price),
+                util::gbp(amount)
+            )));
+        }
+    }
 
     // A transaction already in the ledger is the same payment seen again. It
     // must never extend a date, whatever else the intent says. The queue is
@@ -355,8 +498,8 @@ async fn apply_payment(
         if let Some((id, received_on)) = held_txid(store, txid).await? {
             if attributed_item != Some(id.as_str()) {
                 return Ok(Settlement::refused(format!(
-                        "transaction {txid} is already held as {id}, received on {received_on}; attribute that item instead"
-                    )));
+                    "transaction {txid} is already held as {id}, received on {received_on}; attribute that item instead"
+                )));
             }
         }
     }
@@ -364,14 +507,16 @@ async fn apply_payment(
     // operator to have said so: for cash the second envelope may be a
     // stranger's with a copied token. Held money is never a renewal, because it
     // was never joined to the token in the first place.
-    if let (Some(paid_until), false) = (payment.paid_until.as_deref(), intent.confirm_double) {
+    if let (Some(paid_until), false) = (target.paid_until(), intent.confirm_double) {
         let problem = if intent.kind == "credit" {
             format!(
-                "this token was already credited until {paid_until}; give --confirm-double for a renewal"
+                "the {} was already credited until {paid_until}; give --confirm-double for a renewal",
+                label(party)
             )
         } else {
             format!(
-                "the token was already credited until {paid_until}; record a renewal with `credit --confirm-double`"
+                "the {} was already credited until {paid_until}; record a renewal with `credit --confirm-double`",
+                label(party)
             )
         };
         return Ok(Settlement::refused(&problem));
@@ -384,20 +529,16 @@ async fn apply_payment(
         before.map(util::date_string)
     };
     let balance_text = (applied.balance > 0).then(|| util::gbp(applied.balance));
-    // Read before the write: a renewal's block still holds the year-one quote,
-    // and the row must not carry it into year two. The recovery branch reads
-    // the same decision back from the journal.
-    let quote = payment_quote(&payment).cloned();
 
-    // The values the account write is about to set, recorded before the write so
-    // a crash leaves enough to finish the ledger line.
+    // The values the write is about to set, recorded before it so a crash
+    // leaves enough to finish the ledger line.
     if progress.is_none() {
         journal_credit_applying(
             store,
             journal,
             &cfg.release,
             intent,
-            username,
+            party.owner(),
             &CreditProgress {
                 paid: applied.paid,
                 paid_until_after: paid_until_after.clone(),
@@ -413,38 +554,26 @@ async fn apply_payment(
     // restore runs before the record says active: a failure here leaves the
     // account lapsed, and the retry repeats an idempotent script rather than
     // reporting an active account whose sending and pushing are still stopped.
-    if applied.paid && account.state == "lapsed" {
-        run_script(cfg, "lapse-user.sh", &["--restore", username]).await?;
-    }
-    payment.rail = Some(intent.rail.clone());
-    payment.balance_gbp = balance_text;
     if applied.paid {
-        payment.paid_until = Some(until_text);
-        // The window closes with the credit; a null paid-until date is what
-        // shows the token, so setting the date is also what hides it.
-        if let Some(window) = payment.window.as_mut() {
-            window.state = "paid".to_string();
+        if target.is_lapsed() {
+            let username = party.owner().to_string();
+            run_script(cfg, "lapse-user.sh", &["--restore", &username]).await?;
+        }
+        if let Some(group) = target.group_ref() {
+            restore_group_mailboxes(cfg, store, group).await?;
+        }
+        target.restore_after_payment();
+        if target.is_active() {
+            target.clear_grace();
         }
     }
-    // Only a lapsed account is restored under the lock. A closing or suspended
-    // account keeps its state: the payment is recorded, and the decision that
-    // put it there is not the payment sweep's to overturn.
-    let paid = applied.paid;
-    let payment_for_record = payment.clone();
-    store
-        .update_account(username, |current| {
-            if let Some(account) = current.as_mut() {
-                account.payment = Some(payment_for_record.clone());
-                if paid && matches!(account.state.as_str(), "lapsed" | "active") {
-                    account.state = "active".to_string();
-                    account.grace_until = None;
-                    account.notice_stopped = None;
-                }
-            }
-            Ok::<(), Error>(())
-        })
-        .await?;
-    store.write_payment_copy(username, &payment).await?;
+    target.set_rail(&intent.rail);
+    target.set_balance(balance_text);
+    if applied.paid {
+        target.set_paid_until(until_text.clone())?;
+    }
+    target.save(store, applied.paid).await?;
+    sync_payment_copy(store, target, party.owner(), target.is_group()).await?;
     append_credit_ledger(
         cfg,
         store,
@@ -459,269 +588,103 @@ async fn apply_payment(
 
     // The receipt is for every payment, including a shortfall: the money
     // arrived, and the account page quotes what still does.
-    let to = account.notice_address();
-    let (subject, body) = if applied.paid {
-        let paid = util::date_string(until);
-        (
-            format!("Your payment to kyriakon.net was received (paid until {paid})"),
+    let (subject, body) = match party {
+        CreditParty::Account { .. } if applied.paid => (
+            format!(
+                "Your payment to kyriakon.net was received (paid until {until_text})"
+            ),
             format!(
                 "We have recorded a payment of GBP {} on {} by {}.\n\n\
-                 Your account is paid until {}.\n",
+                 Your account is paid until {until_text}.\n",
                 util::gbp(amount),
                 util::date_string(received),
                 intent.rail,
-                paid,
             ),
-        )
+        ),
+        CreditParty::Account { .. } => {
+            let remaining = util::gbp(price - applied.balance);
+            (
+                format!(
+                    "Your part payment to kyriakon.net was received (GBP {remaining} remains)"
+                ),
+                format!(
+                    "We have recorded a payment of GBP {} on {} by {}.\n\n\
+                     GBP {remaining} remains due for the year, and your account page quotes it.\n",
+                    util::gbp(amount),
+                    util::date_string(received),
+                    intent.rail,
+                ),
+            )
+        }
+        CreditParty::Group { domain, .. } => (
+            format!("Your payment to kyriakon.net was received (paid until {until_text})"),
+            format!(
+                "We have recorded a payment of GBP {} on {} by {} for {domain}.\n\n\
+                 The whole group is paid until {until_text}, and every mailbox in it shares that date.\n",
+                util::gbp(amount),
+                util::date_string(received),
+                intent.rail,
+            ),
+        ),
+    };
+    let kind = if target.is_group() {
+        "group.receipt"
     } else {
-        let remaining = util::gbp(price - applied.balance);
-        (
-            format!("Your part payment to kyriakon.net was received (GBP {remaining} remains)"),
-            format!(
-                "We have recorded a payment of GBP {} on {} by {}.\n\n\
-                 GBP {} remains due for the year, and your account page quotes it.\n",
-                util::gbp(amount),
-                util::date_string(received),
-                intent.rail,
-                remaining,
-            ),
-        )
+        "prepaid.receipt"
     };
     notice::send_account_notice(
         cfg,
         store,
-        username,
-        "prepaid.receipt",
+        party.owner(),
+        kind,
         &subject,
-        &to,
+        &party_address(party),
         &body,
     )
     .await?;
 
     Ok(Settlement::applied(
-        ApplicationRef::account(username.to_string()),
+        party.application(),
         override_note(override_reason),
     ))
 }
 
-/// Apply a prepaid credit to the group its token names. The arithmetic, the
-/// ceiling, the double-credit rule, the transaction check and the ledger line
-/// are the account path's; what differs is where the one date is written and
-/// who is told. One credit sets one date on the group, restores every mailbox in
-/// it that lapsed, and sends one receipt for the body.
-#[allow(clippy::too_many_arguments)]
-async fn group_credit(
-    cfg: &DrainConfig,
+/// The name the refusal text uses. A body's is its domain, not one mailbox.
+fn label(party: &CreditParty) -> &str {
+    match party {
+        CreditParty::Account { username, .. } => username,
+        CreditParty::Group { domain, .. } => domain,
+    }
+}
+
+fn party_address(party: &CreditParty) -> String {
+    match party {
+        CreditParty::Account { address, .. } => address.clone(),
+        CreditParty::Group { address, .. } => address.clone(),
+    }
+}
+
+/// Write the changed block into the record the page reads. An account's copy is
+/// its retained application; a group's is the filed application the handler
+/// renders, found through the site owner.
+async fn sync_payment_copy(
     store: &Store,
-    journal: &Journal,
-    intent: &CreditIntent,
-    domain: &str,
-    attributed_item: Option<&str>,
-) -> Result<Settlement, Error> {
-    let amount = match credit_fields(intent) {
-        Ok(amount) => amount,
-        Err(problem) => return Ok(Settlement::refused(&problem)),
-    };
-    let received = util::parse_date(&intent.received).expect("the date was validated above");
-    if let Some(why) = validate::domain(domain) {
-        return Err(Error::Failed(format!(
-            "the token's group domain {domain:?}: {why}"
-        )));
-    }
-    let Some(mut group) = group_record(store, domain).await? else {
-        return Ok(Settlement::refused(
-            "the token resolves to a group that is gone",
-        ));
-    };
-    if group.payment.no_charge {
-        return Ok(Settlement::refused(
-            "the group was approved without charge, so it has no payment to record",
-        ));
-    }
-    if group.payment.token_ref.as_deref() != Some(intent.token.as_str()) {
-        return Ok(Settlement::refused(
-            "the token is not the one the group's payment block holds",
-        ));
-    }
-
-    // A pass that journaled `applying` and wrote the group but crashed before
-    // the ledger append is finished here. The group's date is the witness, so
-    // nothing is extended twice and no second receipt is sent.
-    let progress = journal.credit_progress(&intent.id);
-    let written = progress.as_ref().is_some_and(|p| {
-        p.paid && group.payment.paid_until.as_deref() == p.paid_until_after.as_deref()
-    });
-    if let Some(progress) = progress.as_ref().filter(|_| written) {
-        if !Ledger::open(store).has_intent(&intent.id).await? {
-            append_credit_ledger(
-                cfg,
-                store,
-                intent,
-                None,
-                &util::date_string(received),
-                &util::gbp(amount),
-                &progress.applied_gbp,
-                progress.paid_until_after.as_deref(),
-            )
-            .await?;
+    target: &PaymentTarget<'_>,
+    owner: &str,
+    is_group: bool,
+) -> Result<(), Error> {
+    let application = if is_group {
+        match application_token(store, owner).await {
+            Some(token) => token,
+            None => return Ok(()),
         }
-        return Ok(Settlement::applied(
-            ApplicationRef::account(group.site_owner.clone()),
-            override_note(intent.override_reason.as_deref()),
-        ));
-    }
-
-    let before = match group.payment.paid_until.as_deref() {
-        Some(stamp) => match util::parse_date(stamp) {
-            Some(date) => Some(date),
-            None => {
-                return Ok(Settlement::refused(
-                    "the group's paid-until date cannot be read",
-                ))
-            }
-        },
-        None => None,
+    } else {
+        String::new()
     };
-    let Some(until) = util::paid_until_after(received, before) else {
-        return Ok(Settlement::refused(
-            "the group's paid-until date has no year in the calendar",
-        ));
-    };
-    let override_reason = intent
-        .override_reason
-        .as_deref()
-        .filter(|r| !r.trim().is_empty());
-    if util::credit_ceiling(received).is_some_and(|ceiling| until > ceiling)
-        && override_reason.is_none()
-    {
-        return Ok(Settlement::refused("the credit would put the group's paid_until more than 24 months past --received; give --override <reason> to mean it"));
-    }
-    let price = util::pence(&cfg.group_price_gbp)
-        .map_err(|e| Error::context("the drain's configured group_price_gbp", e))?;
-    if price <= 0 {
-        return Err(Error::Failed(
-            "the drain's configured group_price_gbp must be more than zero".to_string(),
-        ));
-    }
-    // The fee covers the whole group, so the year is one payment and the group
-    // holds no balance to carry a shortfall or an excess into.
-    let money = credit_money(price, 0, amount);
-    if !money.paid {
-        return Ok(Settlement::refused(format!(
-            "a group's year is one payment of GBP {}; GBP {} is not enough",
-            util::gbp(price),
-            util::gbp(amount)
-        )));
-    }
-    if money.balance > 0 {
-        return Ok(Settlement::refused(format!(
-            "a group's year is one payment of GBP {}; GBP {} is more than the fee",
-            util::gbp(price),
-            util::gbp(amount)
-        )));
-    }
-
-    // A transaction already in the ledger is the same payment seen again, and a
-    // token already credited is a renewal the operator must have meant.
-    if let Some(txid) = intent.txid.as_deref() {
-        if let Some((seq, received_on)) = ledger_txid(store, txid).await? {
-            return Ok(Settlement::refused(format!(
-                "transaction {txid} was already credited on {received_on} at ledger seq {seq}"
-            )));
-        }
-        if let Some((id, received_on)) = held_txid(store, txid).await? {
-            // The item this transition is attributing is not a second sighting
-            // of the payment, exactly as on the account path.
-            if attributed_item != Some(id.as_str()) {
-                return Ok(Settlement::refused(format!(
-                        "transaction {txid} is already held as {id}, received on {received_on}; attribute that item instead"
-                    )));
-            }
-        }
-    }
-    if let Some(paid_until) = group.payment.paid_until.as_deref() {
-        if !intent.confirm_double {
-            return Ok(Settlement::refused(format!(
-                    "the group's token was already credited until {paid_until}; give --confirm-double for a renewal"
-                )));
-        }
-    }
-
-    let until_text = util::date_string(until);
-    let applied = util::gbp(money.applied);
-    journal_credit_applying(
-        store,
-        journal,
-        &cfg.release,
-        intent,
-        &group.site_owner,
-        &CreditProgress {
-            paid: true,
-            paid_until_after: Some(until_text.clone()),
-            applied_gbp: applied.clone(),
-            balance_gbp: None,
-            quoted: false,
-        },
-    )
-    .await?;
-
-    // A payment after a lapse restores every mailbox in the group. A closing or
-    // suspended state is a decision of its own, and the payment sweep does not
-    // overturn it.
-    restore_group_mailboxes(cfg, store, &group).await?;
-    group.payment.paid_until = Some(until_text.clone());
-    group.payment.rail = intent.rail.clone();
-    if let Some(window) = group.payment.window.as_mut() {
-        window.state = "paid".to_string();
-    }
-    let payment = group.payment.clone();
-    store
-        .update_group(&group.domain, |current| {
-            if let Some(group) = current.as_mut() {
-                group.payment = payment.clone();
-            }
-            Ok::<(), Error>(())
-        })
-        .await?;
-    append_credit_ledger(
-        cfg,
-        store,
-        intent,
-        None,
-        &util::date_string(received),
-        &util::gbp(amount),
-        &applied,
-        Some(&until_text),
-    )
-    .await?;
-
-    // One receipt for the body, on the address its application gave. The
-    // ledger line is keyed by the group's token and holds no username, so the
-    // row stops naming the body once the group is gone.
-    let to = dns_contact(store, &group).await?;
-    let subject = format!("Your payment to kyriakon.net was received (paid until {until_text})");
-    let body = format!(
-        "We have recorded a payment of GBP {} on {} by {} for {}.\n\n\
-         The whole group is paid until {until_text}, and every mailbox in it shares that date.\n",
-        util::gbp(amount),
-        util::date_string(received),
-        intent.rail,
-        group.domain,
-    );
-    notice::send_account_notice(
-        cfg,
-        store,
-        &group.site_owner,
-        "group.receipt",
-        &subject,
-        &to,
-        &body,
-    )
-    .await?;
-    Ok(Settlement::applied(
-        ApplicationRef::account(group.site_owner.clone()),
-        override_note(override_reason),
-    ))
+    target
+        .sync_application_copy(store, &application)
+        .await
+        .map_err(Error::from)
 }
 
 /// Bring back every mailbox in a group that lapsed with it: the group lapsed as
@@ -736,15 +699,15 @@ pub(super) async fn restore_group_mailboxes(
         let Some(account) = store.account(mailbox).await? else {
             continue;
         };
-        if account.state != "lapsed" {
+        if account.state != Standing::Lapsed {
             continue;
         }
         run_script(cfg, "lapse-user.sh", &["--restore", mailbox]).await?;
         store
             .update_account(mailbox, |current| {
                 if let Some(account) = current.as_mut() {
-                    if account.state == "lapsed" {
-                        account.state = "active".to_string();
+                    if account.state == Standing::Lapsed {
+                        account.state = Standing::Active;
                         account.grace_until = None;
                         account.notice_stopped = None;
                     }
@@ -844,6 +807,7 @@ fn excess_cap(original: &PaymentLine, amount: i64, full_return: &str) -> Result<
 pub async fn refund(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: RefundIntent,
 ) -> Result<Settlement, Error> {
     let amount_text = intent.amount_gbp.as_deref().unwrap_or("");
@@ -961,18 +925,48 @@ pub async fn refund(
     }
     // The token index is the only join, through the same helper the credit
     // path uses, so a refund and a credit cannot disagree about whose token it
-    // is. A group's token names the group's one payment, which this path
-    // reverses the same way with one less account to write.
+    // is. A group's token names the group's one payment, reversed on the
+    // group's record; a person's names their account.
     let join = match token_join(store, &intent.token).await {
         Ok(join) => join,
         Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
-        return refund_group(
+        if intent.close {
+            return Ok(Settlement::refused(
+                "a group has no closing state, so --close cannot cancel one; end the group with `kyriakon-admin group remove <domain>`",
+            ));
+        }
+        let Some(mut group) = group_record(store, &domain).await? else {
+            return Ok(Settlement::refused(
+                "the token resolves to a group that is gone",
+            ));
+        };
+        if let Err(problem) =
+            excess_cap(&original, amount, "`kyriakon-admin group remove <domain>`")
+        {
+            return Ok(Settlement::refused(&problem));
+        }
+        if let Err(problem) = refund_total(store, &intent.token, &original, amount, true).await {
+            return Ok(Settlement::refused(&problem));
+        }
+        let address = match dns_contact(store, &group).await {
+            Ok(address) => address,
+            Err(e) => return Err(e),
+        };
+        let party = RefundParty::Group {
+            domain: group.domain.clone(),
+            site_owner: group.site_owner.clone(),
+            address,
+        };
+        let mut target = PaymentTarget::group(&mut group);
+        return apply_refund(
             cfg,
             store,
+            journal,
             &intent,
-            &domain,
+            &mut target,
+            &party,
             rail,
             amount,
             reason,
@@ -981,27 +975,16 @@ pub async fn refund(
         )
         .await;
     }
-    let (username, account, mut payment) = match resolve_payment(store, &intent.token).await {
+
+    let (username, mut account, _payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
         Err(problem) => return Ok(Settlement::refused(&problem)),
     };
-
     // An excess refund gives back held overpayment, so whatever it takes has
     // to leave the balance too. Its ceiling is the part of the payment that
     // never bought time, not the balance: the card rail holds no balance, and
     // a full return of money that did buy time is `--close`, which also takes
     // the access away.
-    let balance = match payment.balance_gbp.as_deref() {
-        Some(text) => match util::pence(text) {
-            Ok(pence) => pence,
-            Err(e) => {
-                return Ok(Settlement::refused(format!(
-                    "the account's balance cannot be read: {e}"
-                )))
-            }
-        },
-        None => 0,
-    };
     if intent.excess {
         if let Err(problem) = excess_cap(&original, amount, "--close") {
             return Ok(Settlement::refused(&problem));
@@ -1011,99 +994,26 @@ pub async fn refund(
     {
         return Ok(Settlement::refused(&problem));
     }
-
-    let received_on = util::filed_at()[..10].to_string();
-    let closing_until = util::date_after_days(7);
-    let settlement_by = util::date_after_days(14);
-    let deducted = format!("-{}", util::gbp(amount));
-
-    // The account write comes before the ledger append: a crash between them
-    // leaves a close or a spent balance that a rerun applies again, and the
-    // ledger still holds the one line. The other order would leave the money
-    // recorded and the account still holding it, which no rerun could see.
-    if intent.close || intent.excess {
-        if intent.close {
-            // A cancellation refund closes the account, so the card stops
-            // before the record that names the subscription goes. A failure
-            // fails the pass and the intent stays for the backoff.
-            if cancel_stripe_if_active(cfg, &payment.stripe).await? {
-                payment.stripe.cancel_at_period_end = true;
-            }
-        }
-        if intent.excess {
-            let left = (balance - amount).max(0);
-            payment.balance_gbp = (left > 0).then(|| util::gbp(left));
-        }
-        let close = intent.close;
-        let closing_until = closing_until.clone();
-        let payment_for_record = payment.clone();
-        store
-            .update_account(&username, |current| {
-                if let Some(account) = current.as_mut() {
-                    if close {
-                        account.state = "closing".to_string();
-                        account.closing_until = Some(closing_until.clone());
-                    }
-                    // A close stops the card and the excess refund changes the
-                    // balance, so the block is written for either.
-                    account.payment = Some(payment_for_record.clone());
-                }
-                Ok::<(), Error>(())
-            })
-            .await?;
-    }
-
-    let seq = append_refund_ledger(
-        store,
-        &intent,
-        &original,
-        rail,
-        &deducted,
-        reason.trim(),
-        rate.as_deref(),
-        &received_on,
-        payment.paid_until.as_deref(),
-    )
-    .await?;
-
-    let to = account.notice_address();
-    let (subject, body) = refund_notice(
-        rail,
-        &util::gbp(amount),
-        &received_on,
-        &settlement_by,
-        rate.as_deref(),
-        seq,
-    );
-    notice::send_account_notice(
+    let address = account.notice_address();
+    let party = RefundParty::Account {
+        username: username.clone(),
+        address,
+    };
+    let mut target = PaymentTarget::account(&mut account);
+    apply_refund(
         cfg,
         store,
-        &username,
-        "prepaid.refund",
-        &subject,
-        &to,
-        &body,
+        journal,
+        &intent,
+        &mut target,
+        &party,
+        rail,
+        amount,
+        reason,
+        rate.as_deref(),
+        &original,
     )
-    .await?;
-
-    let note = if rail == "card" {
-        format!("Stripe Idempotency-Key refund-{seq}")
-    } else {
-        format!("recorded at ledger seq {seq}")
-    };
-    let printed = if rail == "card" {
-        AfterLine::Print(format!(
-            "the Stripe refund's Idempotency-Key is refund-{seq}"
-        ))
-    } else {
-        AfterLine::Nothing
-    };
-    Ok(Settlement::line(
-        "applied",
-        ApplicationRef::account(username.clone()),
-        Some(note.clone()),
-    )
-    .with_after(printed))
+    .await
 }
 
 /// Refunds of one payment sum to no more than their ceiling, whatever their
@@ -1154,54 +1064,144 @@ async fn refund_total(
     Ok(())
 }
 
-/// Refund one group payment. The group holds no balance and no closing state,
-/// so only `--excess` is meaningful, and it may return only the part of the
-/// payment that never bought time: the group's own removal is the transition
-/// that ends the domain and the year with it.
-// The fields are the refund's own, resolved by the caller; one list keeps the
-// group and account paths' checks identical.
+/// Which record a refund reverses. The checks, the ledger line and the notice
+/// are shared; the owner and the notice's kind differ.
+enum RefundParty {
+    Account {
+        username: String,
+        address: String,
+    },
+    Group {
+        domain: String,
+        site_owner: String,
+        address: String,
+    },
+}
+
+impl RefundParty {
+    fn owner(&self) -> &str {
+        match self {
+            RefundParty::Account { username, .. } => username,
+            RefundParty::Group { site_owner, .. } => site_owner,
+        }
+    }
+
+    fn address(&self) -> &str {
+        match self {
+            RefundParty::Account { address, .. } => address,
+            RefundParty::Group { address, .. } => address,
+        }
+    }
+
+    fn application(&self) -> ApplicationRef {
+        match self {
+            RefundParty::Account { username, .. } => ApplicationRef::account(username.clone()),
+            RefundParty::Group {
+                domain, site_owner, ..
+            } => ApplicationRef::group(site_owner.clone(), domain.clone()),
+        }
+    }
+
+    fn notice_kind(&self) -> &'static str {
+        match self {
+            RefundParty::Account { .. } => "prepaid.refund",
+            RefundParty::Group { .. } => "group.refund",
+        }
+    }
+}
+
+/// Record one refund against whichever record holds the payment, or finish one
+/// an earlier pass wrote but did not append a ledger line for.
 #[allow(clippy::too_many_arguments)]
-async fn refund_group(
+async fn apply_refund(
     cfg: &DrainConfig,
     store: &Store,
+    journal: &Journal,
     intent: &RefundIntent,
-    domain: &str,
+    target: &mut PaymentTarget<'_>,
+    party: &RefundParty,
     rail: &str,
     amount: i64,
     reason: &str,
     rate: Option<&str>,
     original: &PaymentLine,
 ) -> Result<Settlement, Error> {
-    let Some(group) = group_record(store, domain).await? else {
-        return Ok(Settlement::refused(
-            "the token resolves to a group that is gone",
-        ));
-    };
-    if intent.close {
-        return Ok(Settlement::refused("a group has no closing state, so --close cannot cancel one; end the group with `kyriakon-admin group remove <domain>`"));
-    }
-    if let Err(problem) = excess_cap(original, amount, "`kyriakon-admin group remove <domain>`") {
-        return Ok(Settlement::refused(&problem));
-    }
-    if let Err(problem) = refund_total(store, &intent.token, original, amount, true).await {
-        return Ok(Settlement::refused(&problem));
-    }
     let received_on = util::filed_at()[..10].to_string();
     let settlement_by = util::date_after_days(14);
     let deducted = format!("-{}", util::gbp(amount));
+
+    // An excess refund's balance write is the one this pass may have made
+    // before a failed append. The journal's `applying` line carries the balance
+    // it meant to leave, so a retry finishes the ledger line instead of
+    // subtracting the amount again (#872).
+    let progress = journal.refund_progress(&intent.id);
+    let written = progress
+        .as_ref()
+        .is_some_and(|p| target.balance_is(p.balance_after.as_deref()));
+    if written {
+        if !Ledger::open(store).has_intent(&intent.id).await? {
+            append_refund_ledger(
+                store,
+                intent,
+                original,
+                rail,
+                amount,
+                &deducted,
+                reason.trim(),
+                rate,
+                &received_on,
+                target.paid_until(),
+            )
+            .await?;
+        }
+        sync_payment_copy(store, target, party.owner(), target.is_group()).await?;
+        return Ok(Settlement::applied(
+            party.application(),
+            Some("replayed: the balance already records this refund".to_string()),
+        ));
+    }
+
+    if intent.close {
+        // A cancellation refund closes the account, so the card stops before
+        // the record that names the subscription goes. A failure fails the
+        // pass and the intent stays for the backoff.
+        if !target.is_group() && cancel_stripe_if_active(cfg, &target.stripe()).await? {
+            target.cancel_card();
+        }
+        target.enter_closing(util::date_after_days(7), true)?;
+    }
+    if intent.excess {
+        let before = target.balance()?.map(str::to_string);
+        let after = target.spend_balance(amount)?;
+        journal_refund_applying(
+            store,
+            journal,
+            &cfg.release,
+            intent,
+            party.owner(),
+            &RefundProgress {
+                balance_before: before,
+                balance_after: after,
+            },
+        )
+        .await?;
+    }
+    target.save(store, false).await?;
+    sync_payment_copy(store, target, party.owner(), target.is_group()).await?;
+
     let seq = append_refund_ledger(
         store,
         intent,
         original,
         rail,
+        amount,
         &deducted,
         reason.trim(),
         rate,
         &received_on,
-        group.payment.paid_until.as_deref(),
+        target.paid_until(),
     )
     .await?;
-    let to = dns_contact(store, &group).await?;
     let (subject, body) = refund_notice(
         rail,
         &util::gbp(amount),
@@ -1213,13 +1213,14 @@ async fn refund_group(
     notice::send_account_notice(
         cfg,
         store,
-        &group.site_owner,
-        "group.refund",
+        party.owner(),
+        party.notice_kind(),
         &subject,
-        &to,
+        party.address(),
         &body,
     )
     .await?;
+
     let note = if rail == "card" {
         format!("Stripe Idempotency-Key refund-{seq}")
     } else {
@@ -1232,12 +1233,34 @@ async fn refund_group(
     } else {
         AfterLine::Nothing
     };
-    Ok(Settlement::line(
-        "applied",
-        ApplicationRef::group(group.site_owner.clone(), group.domain.clone()),
-        Some(note.clone()),
-    )
-    .with_after(printed))
+    Ok(Settlement::line("applied", party.application(), Some(note)).with_after(printed))
+}
+
+/// Journal a refund's `applying` line with the balance it is about to leave, so
+/// the ledger line can be finished if the write succeeds and the append does
+/// not.
+async fn journal_refund_applying(
+    store: &Store,
+    journal: &Journal,
+    release: &str,
+    intent: &RefundIntent,
+    username: &str,
+    progress: &RefundProgress,
+) -> Result<(), Error> {
+    let line = JournalLine {
+        version: 1,
+        at: util::filed_at(),
+        intent: intent.id.clone(),
+        kind: intent.kind.clone(),
+        release: release.to_string(),
+        application: ApplicationRef::account(username.to_string()),
+        outcome: "applying".to_string(),
+        note: None,
+        review: None,
+        credit: None,
+        refund: Some(progress.clone()),
+    };
+    journal.append(store, &line).await.map_err(Error::from)
 }
 
 /// The refund notice: what was refunded, by which rail, and the date reg 34(4)
@@ -1273,6 +1296,32 @@ fn refund_notice(
     )
 }
 
+/// The fraction of the recorded XMR a partial refund gives back. Rounded down
+/// at six decimal places, the precision `monero-wallet-cli` prints. A full
+/// refund keeps the receipt's own string, so its figure cannot drift through a
+/// parse and a format.
+fn prorated_xmr(recorded: &str, part: i64, whole: i64) -> Option<String> {
+    if whole <= 0 {
+        return None;
+    }
+    if part == whole {
+        return Some(recorded.to_string());
+    }
+    let (whole_text, fraction_text) = recorded.split_once('.').unwrap_or((recorded, ""));
+    let whole_part: u128 = whole_text.parse().ok()?;
+    let mut fraction = fraction_text.to_string();
+    fraction.truncate(6);
+    while fraction.len() < 6 {
+        fraction.push('0');
+    }
+    let fraction_part: u128 = fraction.parse().ok()?;
+    let units = whole_part
+        .checked_mul(1_000_000)?
+        .checked_add(fraction_part)?;
+    let scaled = units.checked_mul(part as u128)? / whole as u128;
+    Some(format!("{}.{:06}", scaled / 1_000_000, scaled % 1_000_000))
+}
+
 /// Append the refund's negative line. The amount is negative in both money
 /// fields so a sum over the ledger is the year's takings; the XMR and the basis
 /// it was computed on stay visible for a Monero refund.
@@ -1282,15 +1331,22 @@ async fn append_refund_ledger(
     intent: &RefundIntent,
     original: &PaymentLine,
     rail: &str,
+    amount: i64,
     deducted: &str,
     reason: &str,
     rate: Option<&str>,
     received_on: &str,
     paid_until_after: Option<&str>,
 ) -> Result<u64, Error> {
+    let partial = amount < original.amount;
     let refund_basis = match rail {
         "monero" => Some(if rate.is_some() {
             "sterling"
+        } else if partial {
+            // A partial payout returns the same fraction of the recorded coin
+            // it returns in sterling; the basis says the figure was scaled
+            // rather than the whole amount that arrived (#873).
+            "recorded_xmr_partial"
         } else {
             "recorded_xmr"
         }),
@@ -1303,7 +1359,10 @@ async fn append_refund_ledger(
     line.paid_until_after = paid_until_after
         .or(original.paid_until_after.as_deref())
         .map(str::to_string);
-    line.amount_xmr = original.amount_xmr.clone();
+    line.amount_xmr = original
+        .amount_xmr
+        .as_deref()
+        .and_then(|xmr| prorated_xmr(xmr, amount, original.amount));
     line.intent = Some(intent.id.clone());
     line.note = Some(reason.to_string());
     line.refund = Some(RefundTail {
@@ -1315,31 +1374,42 @@ async fn append_refund_ledger(
     Ledger::open(store).append(line).await.map_err(Error::from)
 }
 
-/// A settlement rewrites the newest refund line for the token that has no
-/// `settled_on`, under the ledger's lock, and nothing else on it. This is the
-/// ledger's one non-append write: `--settled` names a line already recorded, and
-/// appending a second line would leave two records of one refund.
+/// A settlement rewrites the refund line at the intent's `seq`, under the
+/// ledger's lock, and nothing else on it. This is the ledger's one non-append
+/// write: `--settled` names a line already recorded, and appending a second
+/// line would leave two records of one refund.
 async fn settle_refund(
     store: &Store,
     intent: &RefundIntent,
     on: &str,
 ) -> Result<Settlement, Error> {
     let settled_on = util::date_string(util::parse_date(on).expect("the date was validated"));
-    let Some(seq) = Ledger::open(store)
-        .settle_refund(&intent.token, &intent.id, &settled_on)
-        .await?
-    else {
+    let Some(seq) = intent.seq else {
         return Ok(Settlement::refused(
-            "the token has no unsettled refund to record a settlement against",
+            "a settlement names the refund's ledger seq; give --seq",
         ));
     };
-    Ok(Settlement::line(
-        "applied",
-        ApplicationRef::default(),
-        Some(format!(
-            "refund at ledger seq {seq} settled on {settled_on}"
+    match Ledger::open(store)
+        .settle_refund(&intent.token, seq, &intent.id, &settled_on)
+        .await?
+    {
+        ledger::Settlement::Settled { seq } => Ok(Settlement::line(
+            "applied",
+            ApplicationRef::default(),
+            Some(format!(
+                "refund at ledger seq {seq} settled on {settled_on}"
+            )),
         )),
-    ))
+        ledger::Settlement::AlreadySettled { seq, on } => Ok(Settlement::applied(
+            ApplicationRef::default(),
+            Some(format!(
+                "refund at ledger seq {seq} was already settled on {on}"
+            )),
+        )),
+        ledger::Settlement::NotFound => Ok(Settlement::refused(format!(
+            "the token has no refund at ledger seq {seq}"
+        ))),
+    }
 }
 
 /// Hold a credit that names no token: validate it exactly as a credit is
@@ -1503,32 +1573,28 @@ pub async fn reconcile_attribute(
         Err(problem) => return Ok(Settlement::refused(&problem)),
     };
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
-        let settled = group_credit(
+        return credit_group(
             cfg,
             store,
             journal,
             &payment_intent,
+            amount,
+            received,
             &domain,
             Some(&intent.item),
         )
-        .await?;
-        return Ok(settled);
+        .await;
     }
-
-    let (username, account, payment) = match resolve_payment(store, &payment_intent.token).await {
-        Ok(found) => found,
-        Err(problem) => return Ok(Settlement::refused(&problem)),
-    };
-    let app = PaymentApplication {
-        intent: &payment_intent,
-        username: &username,
-        account,
-        payment,
+    credit_account(
+        cfg,
+        store,
+        journal,
+        &payment_intent,
         amount,
         received,
-        attributed_item: Some(&intent.item),
-    };
-    apply_payment(cfg, store, journal, app).await
+        Some(&intent.item),
+    )
+    .await
 }
 
 /// Close a held payment with the evidence it went back or was kept. No payment
@@ -1716,6 +1782,7 @@ async fn journal_credit_applying(
         note: None,
         review: None,
         credit: Some(progress.clone()),
+        refund: None,
     };
     journal.append(store, &line).await.map_err(Error::from)
 }
@@ -2167,6 +2234,7 @@ mod tests {
             "kind": "refund",
             "token": token,
             "settled_on": "2026-11-05",
+            "seq": 7,
             "sig": "",
         });
         let intent: RefundIntent = serde_json::from_value(value.clone()).unwrap();
@@ -2256,6 +2324,7 @@ mod tests {
         let store = Store::new_for_test(dir.to_str().unwrap());
         let intent = RefundIntent {
             token: "KYR-AAAA-BBBB-CCCC".to_string(),
+            seq: Some(7),
             ..Default::default()
         };
         let error = settle_refund(&store, &intent, "2026-11-04")

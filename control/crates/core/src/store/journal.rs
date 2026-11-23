@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::store::{CreditProgress, Error, JournalLine, Store};
+use crate::store::{CreditProgress, Error, JournalLine, RefundProgress, Store};
 
 /// The journal's lines, indexed by intent id. The index is behind a lock only
 /// because [`Journal::append`] takes `&self`; it is never held across an await.
@@ -43,6 +43,8 @@ struct Index {
     decided: HashMap<String, (String, String)>,
     /// Intent id → the progress its first `applying` credit line carried.
     credits: HashMap<String, CreditProgress>,
+    /// Intent id → the balance its first `applying` refund line recorded.
+    refunds: HashMap<String, RefundProgress>,
 }
 
 #[derive(Default, Clone)]
@@ -97,6 +99,9 @@ impl Index {
         if line.outcome == "applying" {
             if let Some(credit) = line.credit.clone() {
                 self.credits.entry(line.intent.clone()).or_insert(credit);
+            }
+            if let Some(refund) = line.refund.clone() {
+                self.refunds.entry(line.intent.clone()).or_insert(refund);
             }
         }
         // A decision that has taken effect is single-use, and this is the only
@@ -241,6 +246,13 @@ impl Journal {
         self.lock().credits.get(id).cloned()
     }
 
+    /// The balance an excess refund recorded on its `applying` line, if it got
+    /// that far. A retry whose account already holds `balance_after` finishes
+    /// the ledger append instead of subtracting again (#872).
+    pub fn refund_progress(&self, id: &str) -> Option<RefundProgress> {
+        self.lock().refunds.get(id).cloned()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Index> {
         // The index is only ever held for a lookup or one insertion, so a panic
         // poisoning it leaves nothing half-written to protect against.
@@ -295,6 +307,7 @@ mod tests {
             note: note.map(str::to_string),
             review: None,
             credit: None,
+            refund: None,
         }
     }
 

@@ -8,6 +8,7 @@
 
 use time::OffsetDateTime;
 
+use kyriakon_control_core::account::state::WindowState;
 use kyriakon_control_core::store::{self, Store};
 use kyriakon_control_core::util;
 
@@ -45,7 +46,7 @@ pub async fn open_windows(
         let Some(window) = payment.window else {
             continue;
         };
-        if window.state != "open" {
+        if window.state != WindowState::Open {
             continue;
         }
         let Some(token) = payment.token_ref else {
@@ -83,7 +84,7 @@ pub async fn open_windows(
         let Some(window) = group.payment.window.as_ref() else {
             continue;
         };
-        if window.state != "open" {
+        if window.state != WindowState::Open {
             continue;
         }
         let Some(token) = group.payment.token_ref.clone() else {

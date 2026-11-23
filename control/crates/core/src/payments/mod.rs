@@ -4,4 +4,5 @@
 pub mod billing;
 pub mod ledger;
 pub mod rails;
+pub mod target;
 pub mod xmr;

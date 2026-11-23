@@ -427,6 +427,11 @@ pub struct RefundIntent {
     /// The day the refund was paid out, for the settlement form.
     #[serde(default)]
     pub settled_on: Option<String>,
+    /// The ledger `seq` of the refund a settlement names. A settlement keys on
+    /// the line, never on the newest unsettled one, so a replay cannot walk
+    /// back onto an older refund (#880). Absent on a refund that writes a line.
+    #[serde(default)]
+    pub seq: Option<u64>,
     pub sig: String,
 }
 

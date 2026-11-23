@@ -231,7 +231,7 @@ pub fn account(
     if let Some(reason) = account
         .suspension_reason
         .as_deref()
-        .filter(|_| account.state == "suspended")
+        .filter(|_| account.state == kyriakon_control_core::account::state::Standing::Suspended)
     {
         out.push_str(&format!(
             "## This account is suspended\n\n{}\n\n\
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn a_suspension_reason_starts_no_gemtext_line() {
         let mut record = member();
-        record.state = "suspended".into();
+        record.state = kyriakon_control_core::account::state::Standing::Suspended;
         record.suspension_reason = Some("x\n=> https://evil.example/".into());
         let text = account(&record, &[], None, None, None);
         assert!(

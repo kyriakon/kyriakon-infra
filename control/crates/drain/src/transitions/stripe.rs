@@ -10,11 +10,13 @@ use super::payments::{restore_group_mailboxes, token_join};
 use super::report_failure;
 use super::Error;
 use kyriakon_control_core::account::sign;
+use kyriakon_control_core::account::state::Standing;
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::validate;
 use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::payments::ledger::Ledger;
 use kyriakon_control_core::payments::ledger::LedgerLine;
+use kyriakon_control_core::payments::target::PaymentTarget;
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{self, Account, GroupRecord, Store};
 use kyriakon_control_core::util;
@@ -502,73 +504,41 @@ impl BillingTarget {
             BillingTarget::Account(a) => {
                 // A payment after a lapse restores access from the day it is
                 // recorded. The restore runs before the record says active, as
-                // `apply_payment` does, so a failure leaves the account lapsed
-                // and the retry repeats an idempotent script.
-                if a.state == "lapsed" {
+                // the prepaid credit path does, so a failure leaves the account
+                // lapsed and the retry repeats an idempotent script.
+                if a.state == Standing::Lapsed {
                     run_script(cfg, "lapse-user.sh", &["--restore", &a.username]).await?;
-                    a.state = "active".to_string();
-                    a.grace_until = None;
-                    a.notice_stopped = None;
                 }
-                let payment = a
-                    .payment
-                    .as_mut()
-                    .ok_or_else(|| Error::Failed("the account has no payment block".to_string()))?;
-                payment.paid_until = Some(date);
-                if let Some(window) = payment.window.as_mut() {
-                    window.state = "paid".to_string();
-                }
+                let mut target = PaymentTarget::account(a);
+                target.set_paid_until(date)?;
+                target.restore_after_payment();
+                target.clear_grace();
             }
             BillingTarget::Group(g) => {
-                g.payment.paid_until = Some(date);
-                if let Some(window) = g.payment.window.as_mut() {
-                    window.state = "paid".to_string();
+                {
+                    let mut target = PaymentTarget::group(g);
+                    target.set_paid_until(date)?;
+                    target.clear_grace();
                 }
-                g.grace_until = None;
                 restore_group_mailboxes(cfg, store, g).await?;
             }
         }
         Ok(())
     }
 
-    async fn save(&self, store: &Store) -> Result<(), Error> {
+    /// Write the payment block this pass changed. An account that lapsed when
+    /// the pass read it is restored under its own lock too, because a console
+    /// suspension can land between the read and the write.
+    async fn save(&mut self, store: &Store) -> Result<(), Error> {
         match self {
-            BillingTarget::Account(a) => {
-                let username = a.username.clone();
-                let payment = a.payment.clone();
-                store
-                    .update_account(&username, move |current| {
-                        if let Some(account) = current.as_mut() {
-                            // Only the payment block is this pass's to change.
-                            // A concurrent console suspension or closure keeps
-                            // its own state; a lapsed account is restored as the
-                            // prepaid credit path does.
-                            if let Some(payment) = payment.clone() {
-                                account.payment = Some(payment);
-                            }
-                            if account.state == "lapsed" {
-                                account.state = "active".to_string();
-                                account.grace_until = None;
-                                account.notice_stopped = None;
-                            }
-                        }
-                        Ok::<(), Error>(())
-                    })
-                    .await
-            }
-            BillingTarget::Group(g) => {
-                let domain = g.domain.clone();
-                let payment = g.payment.clone();
-                store
-                    .update_group(&domain, move |current| {
-                        if let Some(group) = current.as_mut() {
-                            group.payment = payment.clone();
-                            group.grace_until = None;
-                        }
-                        Ok::<(), Error>(())
-                    })
-                    .await
-            }
+            BillingTarget::Account(a) => PaymentTarget::account(a)
+                .save(store, true)
+                .await
+                .map_err(Error::from),
+            BillingTarget::Group(g) => PaymentTarget::group(g)
+                .save(store, false)
+                .await
+                .map_err(Error::from),
         }
     }
 

@@ -22,7 +22,7 @@ pub(crate) async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) ->
     let flags = flags(
         &paired,
         &[
-            "token", "username", "amount", "rail", "reason", "rate", "settled",
+            "token", "username", "amount", "rail", "reason", "rate", "settled", "seq",
         ],
     )?;
     let token = payment_token(store, &flags).await?;
@@ -43,14 +43,26 @@ pub(crate) async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) ->
                 "--settled {settled:?} is not YYYY-MM-DD"
             )));
         }
+        // A settlement names the ledger line it completes. Without the seq the
+        // drain would settle whichever refund looked newest, and a retried
+        // command would mark the next one paid (#880).
+        let seq = flags
+            .get("seq")
+            .ok_or_else(|| Error::Failed("--settled needs --seq <ledger seq>".to_string()))?
+            .parse::<u64>()
+            .map_err(|_| Error::Failed("--seq is not a ledger sequence".to_string()))?;
+        if seq == 0 {
+            return Err(Error::Failed("--seq must be a ledger sequence".to_string()));
+        }
         let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
         let sig = sign::sign(
             &key,
-            &sign::refund_payload(&token, "", "", false, false, "", settled, ""),
+            &sign::refund_payload(&token, "", "", false, false, "", settled, Some(seq), ""),
         )?;
         let id = intent::Intent::Refund(intent::RefundIntent {
             token: token.clone(),
             settled_on: Some(settled.to_string()),
+            seq: Some(seq),
             sig,
             ..Default::default()
         })
@@ -108,6 +120,7 @@ pub(crate) async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) ->
             excess,
             rate.unwrap_or(""),
             "",
+            None,
             reason,
         ),
     )?;
