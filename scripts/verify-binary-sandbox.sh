@@ -298,7 +298,7 @@ PERL
 		HTTP_ORIGIN=https://signup.kyriakon.net \
 		> "$tree/logs/login-reply" 2>&1 ||
 		fail "the login request could not be sent"
-	grep -q 'http /login 200' "$tree/logs/handler" ||
+	grep -q 'httpd /login 200' "$tree/logs/handler" ||
 		fail "the handler did not answer the login route"
 	if grep -q 'cannot run the login check' "$tree/logs/handler"; then
 		fail "the handler could not exec doas under its pledge"
