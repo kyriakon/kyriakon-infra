@@ -274,7 +274,7 @@ impl Term {
     fn new(mode: Mode) -> Term {
         Term {
             mode,
-            input: tui::Reader::new(std::io::stdin()),
+            input: tui::Reader::timed(std::io::stdin(), tui::IDLE_TIMEOUT, tui::SESSION_LIFETIME),
             saved: None,
         }
     }

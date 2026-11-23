@@ -2,164 +2,36 @@
 
 use super::*;
 
-use super::portal::portal_connection;
 use super::reply::{too_many, Which};
 use super::route::{gemini, http};
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
 
-use crate::fastcgi::{self, Reply, Request};
+use crate::fastcgi::{Answer, Reply, Request};
 use kyriakon_control_core::flow::rate;
 use kyriakon_control_core::store::Certificate;
 use kyriakon_control_core::util::percent_decode;
 
-/// How long the loop waits after an accept error it cannot attribute to a dead
-/// connection. A full descriptor table (`EMFILE`, `ENFILE`) leaves the backlog
-/// as ready as it was, so an unpaused retry would spin; a connection closing
-/// ends the wait sooner than any other repair could.
-const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// The wait before the next accept. `accept(2)`'s errors are the connection's,
-/// not the listener's: a connection that died in the queue (`ECONNABORTED`) or
-/// a signal (`EINTR`) has already left the backlog, so the next call runs at
-/// once, and everything else is treated as the descriptor limit above.
-fn backoff(error: &std::io::Error) -> std::time::Duration {
-    match error.kind() {
-        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted => {
-            std::time::Duration::ZERO
-        }
-        _ => ACCEPT_BACKOFF,
-    }
-}
-
-/// How long one portal connection may take, from the first byte to the reply.
-/// The protocol is one line in and one line out, so a client that connects and
-/// sends nothing is gone by this deadline instead of holding a descriptor for
-/// the life of the process.
-const PORTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Portal connections served at once. The rest wait for a permit before the
-/// socket is accepted, so a flood costs the listening backlog rather than a
-/// descriptor each.
-///
-/// The three counts here and `TITAN_CONNECTIONS` are chosen against the login
-/// class the unit runs under: `rc.subr` gives it the `daemon` class's
-/// `openfiles-cur=128`, and the four listeners share that table with the store.
-/// A flood that filled the table stopped every listener answering, which the
-/// deadline alone only lets recover between waves. The sum is 24 + 24 + 16 + 32
-/// = 96, leaving the descriptors the process itself needs.
-const PORTAL_CONNECTIONS: usize = 16;
-/// How long one FastCGI connection may take. The front-end writes the request
-/// and reads the reply without pausing, so a peer that stalls is the front-end
-/// failing, not a slow client; the deadline is what keeps a stalled one from
-/// pinning a task and a descriptor for the life of the process.
-const FRONTEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-/// FastCGI connections served at once per listener. Above this the accept loop
-/// waits for a permit, so a flood costs the backlog and one socket, not a
-/// descriptor and a task each. The form and the capsule share the process, so
-/// the ceiling is what keeps one front-end's flood from exhausting the
-/// descriptors the other three listeners need. Two FastCGI listeners, so the
-/// pair costs 48 of the 128.
-const FRONTEND_CONNECTIONS: usize = 24;
-
-/// Accept connections for as long as the process lives. An accept error is a
-/// connection a flood provoked, not the listener: returning it would cancel the
-/// other three listeners in `try_join!` and take every front-end down with it,
-/// so the loop logs, waits and continues.
-pub(super) async fn accept(
-    listener: UnixListener,
-    app: Arc<App>,
-    channel: Channel,
-) -> Result<(), Error> {
-    let (limit, timeout) = match channel {
-        Channel::Portal => (PORTAL_CONNECTIONS, PORTAL_TIMEOUT),
-        Channel::FrontEnd => (FRONTEND_CONNECTIONS, FRONTEND_TIMEOUT),
-    };
-    let slots = Arc::new(tokio::sync::Semaphore::new(limit));
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                let wait = backoff(&e);
-                Error::context("cannot accept", e).report("accepting a connection");
-                tokio::time::sleep(wait).await;
-                continue;
-            }
-        };
-        // A permit is waited for here rather than in the spawned task, so a flood
-        // costs the listening backlog and one accepted socket, not a descriptor
-        // per waiting connection. It is released when the task that holds the
-        // connection ends.
-        let permit = match slots.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            // The semaphore is never closed while the process lives.
-            Err(_) => return Ok(()),
-        };
-        let app = app.clone();
-        tokio::spawn(async move {
-            // Held for as long as this connection is served.
-            let _permit = permit;
-            let served = async {
-                match channel {
-                    Channel::FrontEnd => connection(stream, &app).await,
-                    Channel::Portal => portal_connection(stream, &app).await,
-                }
-            };
-            let outcome = match tokio::time::timeout(timeout, served).await {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    let name = match channel {
-                        Channel::FrontEnd => "front-end",
-                        Channel::Portal => "portal",
-                    };
-                    kyriakon_control_core::util::log(&format!(
-                        "kyriakon-control: the {name} connection timed out"
-                    ));
-                    return;
-                }
-            };
-            if let Err(e) = outcome {
-                e.report("serving a connection");
-            }
-        });
-    }
-}
-
-/// Answer the requests on one connection. Both front-ends connect for one request
-/// and close, and gmid asks for the connection to be kept in case it has another,
-/// so the loop runs until the peer closes or a record cannot be read.
-pub(super) async fn connection(stream: UnixStream, app: &App) -> Result<(), Error> {
-    let (mut reader, mut writer) = stream.into_split();
-    loop {
-        let request = match fastcgi::read_request(&mut reader, MAX_BODY).await? {
-            Some(request) => request,
-            None => return Ok(()),
-        };
-        let outcome = respond(app, &request).await;
-        kyriakon_control_core::util::log(&format!(
-            "kyriakon-control: {} {} {} {}",
-            front_end(&request).word(),
-            outcome.route,
-            outcome.reply.code(),
-            outcome.addr
-        ));
-        say(
-            &mut writer,
-            &fastcgi::reply_bytes(&outcome.reply, request.id()),
-        )
-        .await?;
-        if !request.keep_conn {
-            return Ok(());
-        }
-    }
+/// Answer one request on a FastCGI listener: the routes' answer, with the log
+/// line every front-end gets. The deadline and the connection loop are the core
+/// server's.
+pub(super) async fn fastcgi_answer(app: Arc<App>, request: Request) -> Answer {
+    let outcome = respond(&app, &request).await;
+    kyriakon_control_core::util::log(&format!(
+        "kyriakon-control: {} {} {} {}",
+        front_end(&request).word(),
+        outcome.route,
+        outcome.reply.code(),
+        outcome.addr
+    ));
+    Answer::Reply(outcome.reply)
 }
 
 /// Write one reply and flush it, so the front-end reads a whole answer. The
-/// connection, the three portal answers and the Titan reply all write here, so
-/// a write that fails says the same thing everywhere.
+/// portal's answers and the Titan reply write here, so a write that fails says
+/// the same thing everywhere.
 pub(super) async fn say<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) -> Result<(), Error> {
     writer.write_all(bytes).await.map_err(|source| Error::Io {
         what: "write the reply",

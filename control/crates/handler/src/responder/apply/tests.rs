@@ -2,7 +2,7 @@
 
 use crate::fastcgi::fixture;
 use crate::responder::test_support::*;
-use crate::responder::*;
+use std::os::unix::fs::PermissionsExt;
 
 /// A Stripe delivery is stored exactly as it arrived, raw body and signature
 /// header, for the drain to verify. Nothing is parsed here and nothing is

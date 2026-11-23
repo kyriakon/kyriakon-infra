@@ -16,6 +16,7 @@
 use crate::Error;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -125,16 +126,123 @@ pub fn parse_file_answer(line: &str) -> Result<String, Error> {
 
 /// Connect to the handler, with the timeouts every request here uses.
 fn connect(socket: &Path, what: &str) -> Result<UnixStream, Error> {
-    let stream = UnixStream::connect(socket).map_err(|e| {
+    connect_with(socket, what, TIMEOUT)
+}
+
+/// Connect with an explicit timeout, for a test that cannot wait the service's
+/// five seconds.
+fn connect_with(socket: &Path, what: &str, timeout: Duration) -> Result<UnixStream, Error> {
+    let stream = connect_timeout(socket, timeout).map_err(|e| {
         Error::context(
             format!("cannot reach the {what} at {}", socket.display()),
             e,
         )
     })?;
     stream
-        .set_read_timeout(Some(TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(TIMEOUT)))
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
         .map_err(|e| Error::context(format!("cannot set the {what}'s timeout"), e))?;
+    Ok(stream)
+}
+
+/// Connect to a unix socket, giving up after `timeout`.
+///
+/// A plain blocking connect waits in the listener's backlog, so a handler that
+/// has stopped accepting would hang the portal before its read timeout could
+/// apply (#878). The socket is non-blocking for the connect and `poll` waits for
+/// it to finish; `SO_ERROR` says whether it succeeded.
+///
+/// [#878]: https://github.com/kyriakon/kyriakon-infra/issues/878
+fn connect_timeout(socket: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = socket.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= address.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the socket path is too long",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    // The BSD socket address carries its own length; Linux's does not.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    {
+        address.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
+    }
+
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Own the descriptor from here, so every error path closes it.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let connected = unsafe {
+        libc::connect(
+            fd,
+            &address as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if connected != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error);
+        }
+        let mut ready = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let wait = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let polled = unsafe { libc::poll(&mut ready, 1, wait) };
+        if polled == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the connection was not accepted in time",
+            ));
+        }
+        if polled < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut pending: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut pending as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if pending != 0 {
+            return Err(std::io::Error::from_raw_os_error(pending));
+        }
+    }
+    // Back to blocking for the read and write timeouts.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(stream)
 }
 
@@ -156,7 +264,16 @@ fn reply(stream: UnixStream, what: &str) -> Result<String, Error> {
 
 /// Ask the handler for one token's stage.
 pub fn ask(socket: &Path, address: Option<&str>, token: &str) -> Result<Answer, Error> {
-    let stream = connect(socket, "status service")?;
+    ask_with(socket, address, token, TIMEOUT)
+}
+
+fn ask_with(
+    socket: &Path,
+    address: Option<&str>,
+    token: &str,
+    timeout: Duration,
+) -> Result<Answer, Error> {
+    let stream = connect_with(socket, "status service", timeout)?;
     (&stream)
         .write_all(request_line(address, token).as_bytes())
         .and_then(|()| (&stream).flush())
@@ -310,6 +427,46 @@ mod tests {
         assert_eq!(
             ask(&path, Some("203.0.113.9"), "abcdefghjkmnpqrstvwxyz0123").unwrap(),
             Answer::Stage("with the reviewer".into())
+        );
+        handler.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A handler that accepts and never answers must not hold the portal on a
+    /// blocking read forever: the reply timeout ends it ([#878]).
+    ///
+    /// [#878]: https://github.com/kyriakon/kyriakon-infra/issues/878
+    #[test]
+    fn a_stalled_portal_socket_times_out() {
+        use std::os::unix::net::UnixListener;
+        use std::time::Instant;
+
+        let dir = std::env::temp_dir().join(format!("onboard-portal-stall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("portal.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let handler = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            // Hold the connection open without writing a reply.
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let started = Instant::now();
+        let why = ask_with(
+            &path,
+            Some("203.0.113.9"),
+            "abcdefghjkmnpqrstvwxyz0123",
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the read ended at the timeout rather than at the handler: {why}"
+        );
+        assert!(
+            why.to_string().contains("status service"),
+            "the failure names the boundary: {why}"
         );
         handler.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

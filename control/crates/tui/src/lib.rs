@@ -41,6 +41,7 @@ use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use kyriakon_control_core::flow::applicant::{flow_answers, flow_path, flow_problem, Page};
 use kyriakon_control_core::flow::catalogue::{self, Action, Protocol, Row, Service};
@@ -89,6 +90,16 @@ https://signup.kyriakon.net works the same way and has no session limit.
 pub const SESSION_DIR: &str = "/var/db/kyriakon-onboard-tui";
 pub const SESSIONS_PER_ADDRESS: usize = 2;
 pub const SESSIONS_TOTAL: usize = 16;
+
+/// How long a session may sit without reading anything before it is ended. The
+/// portal holds one of the box's few SSH slots and a lock file for its whole
+/// life, and a client that went away without closing leaves both held.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// How long one session may last at all, however busy. A reader who needs longer
+/// reconnects; the application is not filed until the confirm, so nothing is
+/// lost.
+pub const SESSION_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// The longest line this program reads, in bytes. A real armoured key line is 64
 /// characters of base64, so this is a hundredfold margin. It is a bound rather
@@ -163,7 +174,7 @@ impl Sessions {
             }));
         };
 
-        let prefix = format!("{address}@");
+        let prefix = format!("{}@", bucket(address));
         let mut held = 0;
         let mut total = 0;
         for entry in fs::read_dir(dir)
@@ -214,6 +225,25 @@ impl Drop for Sessions {
     fn drop(&mut self) {
         if let Some(path) = &self.path {
             let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// The session bucket an address belongs to. An IPv6 client usually controls a
+/// whole `/64`, so counting per address would let one client hold the per-address
+/// cap under every address it owns. The bucket is that prefix; IPv4 is counted
+/// per address, because a client rarely controls more than one ([#930]).
+///
+/// [#930]: https://github.com/kyriakon/kyriakon-infra/issues/930
+fn bucket(address: IpAddr) -> String {
+    match address {
+        IpAddr::V4(v4) => format!("v4-{v4}"),
+        IpAddr::V6(v6) => {
+            let mut key = String::from("v6-");
+            for byte in &v6.octets()[..8] {
+                key.push_str(&format!("{byte:02x}"));
+            }
+            key
         }
     }
 }
@@ -370,6 +400,59 @@ pub struct Reader<R: Read> {
     held: [u8; 4096],
     held_at: usize,
     held_len: usize,
+    /// The idle and lifetime deadline, present only for a session's input.
+    watch: Option<Watch>,
+}
+
+/// One session's deadline. `poll` waits for input with the shorter of the two
+/// remaining times, so an idle reader wakes at its idle limit and a busy one
+/// still ends at the lifetime limit.
+struct Watch {
+    fd: i32,
+    idle: Duration,
+    started: Instant,
+    lifetime: Duration,
+    last_read: Instant,
+}
+
+impl Watch {
+    fn wait(&mut self) -> Result<(), Error> {
+        loop {
+            let now = Instant::now();
+            let lifetime_end = self.started + self.lifetime;
+            if now >= lifetime_end {
+                return Err(Error::Failed(
+                    "the session has reached its maximum length".to_string(),
+                ));
+            }
+            let idle_end = self.last_read + self.idle;
+            if now >= idle_end {
+                return Err(Error::Failed(
+                    "the session was idle for too long".to_string(),
+                ));
+            }
+            let wait = (idle_end - now).min(lifetime_end - now);
+            let mut ready = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Rounded up so a sub-millisecond remainder cannot spin the poll.
+            let millis = wait.as_millis().max(1).min(i32::MAX as u128) as i32;
+            let polled = unsafe { libc::poll(&mut ready, 1, millis) };
+            if polled > 0 {
+                return Ok(());
+            }
+            if polled < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(Error::context("cannot wait for the session's input", error));
+            }
+            // The wait ran out; the loop says which deadline it was.
+        }
+    }
 }
 
 impl<R: Read> Reader<R> {
@@ -379,6 +462,32 @@ impl<R: Read> Reader<R> {
             held: [0u8; 4096],
             held_at: 0,
             held_len: 0,
+            watch: None,
+        }
+    }
+
+    /// A session's reader: it ends the session after `idle` without input, and
+    /// after `lifetime` from the moment it is made whatever arrives. Both limits
+    /// are needed because a client can keep a connection alive with one byte at a
+    /// time and still hold the slot.
+    pub fn timed(inner: R, idle: Duration, lifetime: Duration) -> Reader<R>
+    where
+        R: AsRawFd,
+    {
+        let fd = inner.as_raw_fd();
+        let now = Instant::now();
+        Reader {
+            inner,
+            held: [0u8; 4096],
+            held_at: 0,
+            held_len: 0,
+            watch: Some(Watch {
+                fd,
+                idle,
+                started: now,
+                lifetime,
+                last_read: now,
+            }),
         }
     }
 
@@ -386,6 +495,9 @@ impl<R: Read> Reader<R> {
     /// connection that closed.
     fn hold(&mut self) -> Result<bool, Error> {
         while self.held_at == self.held_len {
+            if let Some(watch) = &mut self.watch {
+                watch.wait()?;
+            }
             let n = match self.inner.read(&mut self.held) {
                 Ok(0) => return Ok(false),
                 Ok(n) => n,
@@ -396,6 +508,9 @@ impl<R: Read> Reader<R> {
                     )))
                 }
             };
+            if let Some(watch) = &mut self.watch {
+                watch.last_read = Instant::now();
+            }
             self.held_at = 0;
             self.held_len = n;
         }
@@ -2779,5 +2894,80 @@ mod tests {
             Sessions::open(&dir, Some("203.0.113.10".parse().unwrap())).unwrap(),
             Admission::Busy
         ));
+    }
+
+    /// An idle session's reader ends with the timeout, and the same return that
+    /// ends the process drops the session's lock file ([#930]).
+    ///
+    /// [#930]: https://github.com/kyriakon/kyriakon-infra/issues/930
+    #[test]
+    fn an_idle_session_reader_ends_and_frees_its_slot() {
+        use std::os::unix::net::UnixStream;
+
+        let dir = scratch("idle");
+        let address: IpAddr = "203.0.113.9".parse().unwrap();
+        let Admission::Open(first) = Sessions::open(&dir, Some(address)).unwrap() else {
+            panic!("the first session was refused");
+        };
+        let Admission::Open(second) = Sessions::open(&dir, Some(address)).unwrap() else {
+            panic!("the second session was refused");
+        };
+        assert!(matches!(
+            Sessions::open(&dir, Some(address)).unwrap(),
+            Admission::Busy
+        ));
+
+        // A connection that sends nothing: the reader waits on it and ends at
+        // the idle limit rather than holding the task.
+        let (silent, _client) = UnixStream::pair().unwrap();
+        let mut reader = Reader::timed(silent, Duration::from_millis(100), Duration::from_secs(5));
+        let why = reader.word().unwrap_err();
+        assert!(why.to_string().contains("idle"), "{why}");
+
+        // The error is what main returns on, and its return drops the session.
+        drop(first);
+        assert!(
+            matches!(
+                Sessions::open(&dir, Some(address)).unwrap(),
+                Admission::Open(_)
+            ),
+            "the ended session's slot was not released"
+        );
+        drop(second);
+    }
+
+    /// An IPv6 client controls a whole `/64`, so the per-address cap counts that
+    /// prefix rather than each address inside it ([#930]).
+    ///
+    /// [#930]: https://github.com/kyriakon/kyriakon-infra/issues/930
+    #[test]
+    fn ipv6_sessions_are_bucketed_by_their_64() {
+        let dir = scratch("v6-bucket");
+        let first: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let same_prefix: IpAddr = "2001:db8:1:2::2".parse().unwrap();
+        let elsewhere: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+
+        let Admission::Open(a) = Sessions::open(&dir, Some(first)).unwrap() else {
+            panic!("the first session was refused");
+        };
+        let Admission::Open(b) = Sessions::open(&dir, Some(same_prefix)).unwrap() else {
+            panic!("the second address in the same /64 was refused");
+        };
+        assert!(
+            matches!(
+                Sessions::open(&dir, Some(same_prefix)).unwrap(),
+                Admission::Busy
+            ),
+            "a third session in the same /64 was allowed"
+        );
+        assert!(
+            matches!(
+                Sessions::open(&dir, Some(elsewhere)).unwrap(),
+                Admission::Open(_)
+            ),
+            "another /64 was counted against this one"
+        );
+        drop(a);
+        drop(b);
     }
 }

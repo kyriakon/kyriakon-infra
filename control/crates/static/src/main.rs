@@ -22,17 +22,15 @@
 //! dot is a refusal.
 
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kyriakon_control_core::fastcgi::{self, Http, Reply, Request};
+use kyriakon_control_core::fastcgi::{self, Answer, Http, Reply, Request};
 use kyriakon_control_core::util::{self, percent_decode};
 use kyriakon_control_core::Error;
 use kyriakon_control_static::{open, Refusal, Served};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
-use tokio::net::{UnixListener, UnixStream};
 
 /// The web tree's index. A directory request serves this and never a listing,
 /// which would publish names the member did not link.
@@ -54,19 +52,26 @@ const MAX_FILE: usize = 16 * 1024 * 1024;
 const ALIAS_MAX: u64 = 4096;
 
 /// The most of a request body this process will read. A static request has none:
-/// httpd sends the form posts to the control plane's socket, not this one.
+/// httpd sends the form posts to the control plane's socket, not this one. A
+/// body record is therefore refused on its first byte rather than drained.
 const MAX_BODY: usize = 0;
 
-/// The wait before the next accept after an error that is not the connection's.
-const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+/// How long one connection may take, from accept to the reply's last byte. It
+/// bounds both the request read and the file write, so a front-end that stops
+/// reading is gone by it rather than holding a descriptor.
+const DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Connections served at once, across both listeners. Above this the accept loop
-/// waits for a permit, so a flood costs the listening backlog and one socket
-/// rather than a descriptor each. The unit runs under the `daemon` login class's
-/// 128 descriptors, and a front-end opens one backend connection per request, so
-/// the ceiling is what keeps an anonymous flood from exhausting the table and
-/// stopping both listeners from accepting.
-const CONNECTIONS: usize = 64;
+/// Connections served at once on one listener. The permit is taken before a
+/// task is spawned, so a flood costs the backlog and one socket.
+///
+/// Two listeners at 24 each is 48 of the login class's `openfiles-cur=128`; the
+/// rest is the process's own descriptors and each member file's. A single pool
+/// shared by both listeners was 64 and left no room once open files were
+/// counted ([#877]). The test `the_listener_budgets_fit_the_login_class` holds
+/// the arithmetic.
+///
+/// [#877]: https://github.com/kyriakon/kyriakon-infra/issues/877
+const CONNECTIONS: usize = 24;
 
 #[derive(Clone, serde::Deserialize)]
 struct Config {
@@ -231,158 +236,52 @@ async fn run() -> Result<(), Error> {
     }
 
     let cfg = Arc::new(Config::load(&cfg_path)?);
-    let httpd = bind(&cfg.httpd_socket)?;
-    let gemini = bind(&cfg.gemini_socket)?;
     util::log(&format!(
         "kyriakon-control-static: httpd {}, gemini {}, root {}",
         cfg.httpd_socket.display(),
         cfg.gemini_socket.display(),
         cfg.root.display()
     ));
-    let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTIONS));
-    tokio::try_join!(
-        accept(httpd, cfg.clone(), FrontEnd::Httpd, slots.clone()),
-        accept(gemini, cfg, FrontEnd::Gemini, slots),
-    )
-    .map(|_| ())
-}
-
-/// Bind one socket, replacing whatever a previous run left at the path, with mode
-/// 0660 so the group the socket directory carries is what decides who may
-/// connect. Same shape as the control plane's own bind, for the same reasons.
-fn bind(path: &Path) -> Result<UnixListener, Error> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => std::fs::remove_file(path).map_err(|source| Error::Io {
-            what: "clear the path for",
-            path: Some(path.into()),
-            source,
-        })?,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(Error::Io {
-                what: "check",
-                path: Some(path.into()),
+    let limits = fastcgi::Limits {
+        connections: CONNECTIONS,
+        deadline: DEADLINE,
+        body_cap: MAX_BODY,
+    };
+    let listen = |front_end: FrontEnd| {
+        let cfg = cfg.clone();
+        move |request: Request| {
+            let cfg = cfg.clone();
+            async move {
+                let (answer, route) = answer(&cfg, front_end, &request);
+                util::log(&format!(
+                    "kyriakon-control-static: {} {} {}",
+                    front_end.word(),
+                    route,
+                    answer.code()
+                ));
+                answer
+            }
+        }
+    };
+    let httpd = async {
+        fastcgi::serve(&cfg.httpd_socket, limits, listen(FrontEnd::Httpd))
+            .await
+            .map_err(|source| Error::Io {
+                what: "serve",
+                path: Some(cfg.httpd_socket.clone()),
                 source,
             })
-        }
-    }
-    let listener = UnixListener::bind(path).map_err(|source| Error::Io {
-        what: "listen on",
-        path: Some(path.into()),
-        source,
-    })?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660)).map_err(|source| {
-        Error::Io {
-            what: "set the mode on",
-            path: Some(path.into()),
-            source,
-        }
-    })?;
-    Ok(listener)
-}
-
-/// Accept connections for as long as the process lives. An accept error is a
-/// connection the front-end dropped, not the listener: returning it would take
-/// the other front-end down with it.
-async fn accept(
-    listener: UnixListener,
-    cfg: Arc<Config>,
-    front_end: FrontEnd,
-    slots: Arc<tokio::sync::Semaphore>,
-) -> Result<(), Error> {
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                util::log(&format!(
-                    "kyriakon-control-static: cannot accept a connection: {e}"
-                ));
-                tokio::time::sleep(ACCEPT_BACKOFF).await;
-                continue;
-            }
-        };
-        // Taken before the task is spawned, so a flood waits on the backlog with
-        // one accepted socket rather than a task and a descriptor per connection.
-        let permit = match slots.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => return Ok(()),
-        };
-        let cfg = cfg.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = connection(stream, &cfg, front_end).await {
-                e.report("serving a connection");
-            }
-        });
-    }
-}
-
-/// Answer the requests on one connection. gmid asks for the connection to be
-/// kept, httpd does not, so the loop runs until the peer closes or says so.
-async fn connection(stream: UnixStream, cfg: &Config, front_end: FrontEnd) -> Result<(), Error> {
-    let (mut reader, mut writer) = stream.into_split();
-    loop {
-        let request = fastcgi::read_request(&mut reader, MAX_BODY)
+    };
+    let gemini = async {
+        fastcgi::serve(&cfg.gemini_socket, limits, listen(FrontEnd::Gemini))
             .await
-            .map_err(|e| Error::Failed(format!("cannot read a request: {e}")))?;
-        let Some(request) = request else {
-            return Ok(());
-        };
-        let (answer, route) = answer(cfg, front_end, &request);
-        let id = request.id();
-        util::log(&format!(
-            "kyriakon-control-static: {} {} {}",
-            front_end.word(),
-            route,
-            answer.code()
-        ));
-        match answer {
-            Answer::Reply(reply) => {
-                let head = reply.head_block();
-                fastcgi::write_reply(&mut writer, &head, fastcgi::Body::Bytes(reply.body()), id)
-                    .await
-            }
-            Answer::File {
-                head, file, len, ..
-            } => {
-                let mut file = tokio::fs::File::from_std(file);
-                fastcgi::write_reply(&mut writer, &head, fastcgi::Body::File(&mut file, len), id)
-                    .await
-            }
-        }
-        .map_err(|source| Error::Io {
-            what: "write the reply",
-            path: None,
-            source,
-        })?;
-        if !request.keep_conn {
-            return Ok(());
-        }
-    }
-}
-
-/// One request's answer. A file is written as it is read, so a member's upload
-/// costs one buffer rather than one whole copy per in-flight request.
-enum Answer {
-    /// A reply that already holds its body: a page, a refusal, a redirect.
-    Reply(Reply),
-    /// A member's file, whose body is streamed behind `head`.
-    File {
-        head: Vec<u8>,
-        file: std::fs::File,
-        len: u64,
-        code: u16,
-    },
-}
-
-impl Answer {
-    /// The status this answer carries, for the log line and the tests.
-    fn code(&self) -> u16 {
-        match self {
-            Answer::Reply(reply) => reply.code(),
-            Answer::File { code, .. } => *code,
-        }
-    }
+            .map_err(|source| Error::Io {
+                what: "serve",
+                path: Some(cfg.gemini_socket.clone()),
+                source,
+            })
+    };
+    tokio::try_join!(httpd, gemini).map(|_| ())
 }
 
 /// One request's reply, and the path the log line names. The path is the decoded
@@ -404,6 +303,12 @@ fn answer(cfg: &Config, front_end: FrontEnd, request: &Request) -> (Answer, Stri
     };
     let host = normalise_host(request.value("SERVER_NAME"));
     let route = log_route(&host, &path);
+    // A static request has no body at all. The core reader already stopped at
+    // the first body record, so answer the refusal and let the connection close
+    // rather than serve the file on a request that carried one.
+    if request.body_too_large {
+        return (Answer::Reply(too_large(front_end)), route);
+    }
     let Some(root) = cfg.tree(front_end, &host) else {
         return (Answer::Reply(refuse(front_end)), route);
     };
@@ -453,7 +358,7 @@ fn answer(cfg: &Config, front_end: FrontEnd, request: &Request) -> (Answer, Stri
             (
                 Answer::File {
                     head,
-                    file,
+                    file: tokio::fs::File::from_std(file),
                     len,
                     code: match front_end {
                         FrontEnd::Httpd => 200,
@@ -745,22 +650,7 @@ mod tests {
         let (answer, _) = answer(cfg, front_end, request);
         let code = answer.code();
         let mut out = Vec::new();
-        match answer {
-            Answer::Reply(reply) => {
-                let head = reply.head_block();
-                fastcgi::write_reply(&mut out, &head, fastcgi::Body::Bytes(reply.body()), 1)
-                    .await
-                    .unwrap();
-            }
-            Answer::File {
-                head, file, len, ..
-            } => {
-                let mut file = tokio::fs::File::from_std(file);
-                fastcgi::write_reply(&mut out, &head, fastcgi::Body::File(&mut file, len), 1)
-                    .await
-                    .unwrap();
-            }
-        }
+        answer.write_to(&mut out, 1).await.unwrap();
         let (body, _) = fixture::reply(&out);
         (code, String::from_utf8_lossy(&body).into_owned())
     }
@@ -1171,5 +1061,18 @@ mod tests {
         assert_eq!(uri("/%2e%2e/x"), "/../x");
         assert_eq!(uri("/100%"), "/100%");
         assert_eq!(uri("/a%zz"), "/a%zz");
+    }
+
+    /// Both listeners' permits fit the login class's 128 descriptors once the
+    /// process's own files are set aside. A pool sized without the open member
+    /// files is what #877 was.
+    #[test]
+    fn the_listener_budgets_fit_the_login_class() {
+        use kyriakon_control_core::fastcgi::{OPEN_FILES, RESERVED_FILES};
+        let held = 2 * CONNECTIONS;
+        assert!(
+            held <= OPEN_FILES - RESERVED_FILES,
+            "{held} connection permits do not fit in {OPEN_FILES} descriptors"
+        );
     }
 }
