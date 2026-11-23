@@ -36,10 +36,34 @@ for lib_module in atomic-fs tls-acme identity manifest paths; do
 done
 unset lib_module lib_sh_dir
 
-# ping_url <url> — best-effort GET that never fails the caller. A monitoring ping
+# ping_url <url> [body] — best-effort GET that never fails the caller. A monitoring ping
 # must not turn a transient curl failure into a script failure / cron mail storm.
+#
+# The URL is a bearer secret: whoever holds it can keep the external dead-man's
+# switch green. It goes in a mode-0600 curl config rather than argv, where every
+# local account can read it with ps(1). A non-empty body is written to a private
+# file the config names, so it stays off the command line too.
 ping_url() {
-	curl -fsS -m 10 --retry 3 "$1" >/dev/null 2>&1 || true
+	typeset conf body_file="" escaped
+	conf=$(mktemp "${TMPDIR:-/tmp}/kyriakon-ping.XXXXXX") || return 0
+	chmod 0600 "$conf"
+	if [ "$#" -ge 2 ] && [ -n "$2" ]; then
+		body_file=$(mktemp "${TMPDIR:-/tmp}/kyriakon-ping-body.XXXXXX") || {
+			rm -f "$conf"
+			return 0
+		}
+		chmod 0600 "$body_file"
+		printf '%s' "$2" > "$body_file"
+	fi
+	escaped=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+	{
+		printf 'url = "%s"\n' "$escaped"
+		if [ -n "$body_file" ]; then
+			printf 'data-binary = "@%s"\n' "$body_file"
+		fi
+	} > "$conf"
+	curl -fsS -m 10 --retry 3 -K "$conf" >/dev/null 2>&1 || true
+	rm -f "$conf" "$body_file"
 }
 
 # hc_fail <url> — ping Healthchecks /fail and exit 1. Wired to the ERR trap so a

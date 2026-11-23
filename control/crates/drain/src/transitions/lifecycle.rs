@@ -6,7 +6,8 @@
 //! body returns a [`Settlement`](super::Settlement) and the seam journals it.
 
 use super::boxrun::{
-    cancel_stripe_if_active, outside_address, publish_mail_keys, run_script, write_public_key,
+    cancel_stripe_if_active, outside_address, publish_mail_keys, run_script, run_script_with_stdin,
+    write_public_key,
 };
 use super::groups::{
     account_on_box, application_token, close_group_tokens, group_record, hold_name,
@@ -310,7 +311,7 @@ pub async fn set_password(
     store.write_record("spent", &spent, &marker).await?;
 
     let finished = async {
-        run_script(cfg, "set-mail-password.sh", &[username, &hash]).await?;
+        run_script_with_stdin(cfg, "set-mail-password.sh", &[username], hash.as_bytes()).await?;
 
         // One use: the mailbox keeps no link, so the page stops answering. Only
         // this link is cleared: a reset between the check above and this write
@@ -2340,7 +2341,13 @@ pub async fn change_password(
             return Ok(Settlement::refused(&e));
         }
     };
-    run_script(cfg, "set-mail-password.sh", &[&account.username, &hash]).await?;
+    run_script_with_stdin(
+        cfg,
+        "set-mail-password.sh",
+        &[&account.username],
+        hash.as_bytes(),
+    )
+    .await?;
     // A password change is also the end of every page session: the record is
     // the whole of what a cookie proves, so a cookie copied before the change
     // must not keep the account page open. A new login makes a new record.
@@ -4083,7 +4090,13 @@ pub(super) async fn erase_half_made(
     journal: &Journal,
     username: &str,
 ) -> Result<bool, Error> {
-    if store.account(username).await?.is_some() {
+    if let Some(account) = store.account(username).await? {
+        // A group mailbox carries this name but is another transition's
+        // account. A failed person approval began under the same name, and
+        // erasing the group's mailbox would take its mail with it.
+        if account.group.is_some() {
+            return Ok(false);
+        }
         // Before the deletion, so the drift check never sees a key that is
         // published and no longer served.
         remove_published_key(cfg, username).await?;

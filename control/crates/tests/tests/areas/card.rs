@@ -69,7 +69,7 @@ fn a_webhook_that_does_not_verify_leaves_the_store_untouched() {
         fix.webhooks()
     );
     assert!(
-        fix.read("webhooks/processed.jsonl").is_empty(),
+        fix.read("verified/processed.jsonl").is_empty(),
         "a refused event is not recorded as settled"
     );
     assert!(
@@ -102,7 +102,7 @@ fn a_delivery_received_inside_the_window_survives_a_late_pass() {
     );
     assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
     assert!(
-        fix.read("webhooks/processed.jsonl")
+        fix.read("verified/processed.jsonl")
             .contains("evt_late_pass"),
         "the settled payment was not journalled"
     );
@@ -173,7 +173,7 @@ fn a_delivery_stale_against_its_arrival_is_still_refused() {
     assert_eq!(paid_until(&fix, "secretary"), None);
     assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
     assert!(
-        fix.read("webhooks/processed.jsonl").is_empty(),
+        fix.read("verified/processed.jsonl").is_empty(),
         "a replayed event was recorded as settled"
     );
 }
@@ -209,7 +209,7 @@ fn a_replayed_event_id_or_invoice_extends_nothing() {
         Some(first.as_str())
     );
     assert_eq!(
-        fix.read("webhooks/processed.jsonl").lines().count(),
+        fix.read("verified/processed.jsonl").lines().count(),
         1,
         "one payment is recorded once"
     );
@@ -384,7 +384,7 @@ fn a_dispute_and_a_refund_alert_the_operator_instead_of_being_ignored() {
     );
     assert!(sent.contains("To: reviewer@example.invalid"), "{sent}");
 
-    let processed = fix.read("webhooks/processed.jsonl");
+    let processed = fix.read("verified/processed.jsonl");
     for line in [
         "charge.dispute.created",
         "charge.refunded",
@@ -515,7 +515,7 @@ fn a_deferred_event_survives_past_the_timestamp_window() {
         "the record outlived the event it proved"
     );
     assert!(
-        fix.read("webhooks/processed.jsonl")
+        fix.read("verified/processed.jsonl")
             .contains("evt_deferred"),
         "the settled payment was not journalled"
     );
@@ -633,7 +633,7 @@ fn a_valid_event_with_no_matching_application_writes_nothing() {
     assert!(touching.is_empty(), "changed: {touching:?}");
     assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
     assert!(
-        fix.read("webhooks/processed.jsonl").is_empty(),
+        fix.read("verified/processed.jsonl").is_empty(),
         "nothing of ours was settled"
     );
 }
@@ -979,7 +979,7 @@ fn a_corrupt_account_record_keeps_the_checkout_and_reports() {
         fix.webhooks()
     );
     assert!(
-        fix.read("webhooks/processed.jsonl").is_empty(),
+        fix.read("verified/processed.jsonl").is_empty(),
         "the delivery was recorded as settled"
     );
 }
@@ -1030,7 +1030,7 @@ fn a_damaged_account_fails_an_invoice_visibly_and_keeps_it() {
         fix.webhooks()
     );
     assert!(
-        fix.read("webhooks/processed.jsonl").is_empty(),
+        fix.read("verified/processed.jsonl").is_empty(),
         "the delivery was recorded as settled"
     );
 }
@@ -1154,9 +1154,119 @@ fn a_payment_on_the_grace_date_is_applied_before_the_sweep_deletes() {
         "the queued payment did not credit the account: {account}"
     );
     assert!(
-        fix.read("webhooks/processed.jsonl")
+        fix.read("verified/processed.jsonl")
             .contains("evt_grace_paid"),
         "the payment was not settled"
     );
     assert!(fix.webhooks().is_empty(), "{:?}", fix.webhooks());
+}
+
+/// The application record is the handler's, and after the approval its payment
+/// block is a handler-writable redirect. The webhook pass resolves the status
+/// token through the root-only `reviewed/` snapshot instead, so a rewrite after
+/// the approval cannot attach the subscription or the year to another account.
+#[test]
+fn a_record_rewritten_after_approval_cannot_redirect_a_card_payment() {
+    let fix = Fix::new("card-snapshot-redirect");
+    let record = fix.filed("secretary", "card", &[("rail", "card")]);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    assert!(fix.drain().status.success());
+    let secretary_token = fix.account("secretary")["payment"]["token_ref"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A second account with its own token, the target a redirected payment
+    // would land on.
+    let warden_token = approved_paid(&fix, "warden", "card");
+    assert_ne!(secretary_token, warden_token);
+
+    // The handler rewrites the application record after the approval. The
+    // payment block it names is the other account's.
+    fix.amend_application(TOKEN, |record| {
+        record["payment"]["token_ref"] = json!(warden_token);
+    });
+
+    fix.webhook(
+        "evt_snapshot_checkout",
+        "checkout.session.completed",
+        json!({
+            "id": "cs_example",
+            "client_reference_id": TOKEN,
+            "subscription": SUBSCRIPTION,
+            "customer": "cus_example",
+        }),
+    );
+    fix.webhook(
+        "evt_snapshot_invoice",
+        "invoice.paid",
+        invoice("in_snapshot_redirect"),
+    );
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    assert!(
+        paid_until(&fix, "secretary").is_some(),
+        "the payment did not follow the root snapshot: {}",
+        fix.account("secretary")
+    );
+    assert_eq!(
+        paid_until(&fix, "warden"),
+        None,
+        "a handler rewrite redirected the payment: {}",
+        fix.account("warden")
+    );
+    assert_eq!(
+        fix.account("warden")["payment"]["stripe"]["subscription"],
+        Value::Null,
+        "the redirected subscription was attached: {}",
+        fix.account("warden")
+    );
+}
+
+/// A symlink or a FIFO planted in a handler-owned directory is refused without
+/// the root pass following it or hanging on it. `O_NOFOLLOW` answers the link,
+/// `O_NONBLOCK` does not wait for a FIFO writer, and the descriptor's metadata
+/// refuses anything that is not a regular file.
+#[test]
+fn a_symlink_or_fifo_in_a_handler_directory_is_refused_without_hanging() {
+    let fix = Fix::new("handler-trap");
+    let webhooks = fix.dir.join("store/webhooks");
+    let intents = fix.dir.join("store/intents");
+    std::fs::create_dir_all(&webhooks).unwrap();
+    std::fs::create_dir_all(&intents).unwrap();
+
+    let target = fix.dir.join("real-body.json");
+    std::fs::write(&target, b"{\"id\":\"evt_link\",\"type\":\"invoice.paid\"}").unwrap();
+    std::os::unix::fs::symlink(&target, webhooks.join("evt_link.body")).unwrap();
+
+    let fifo = webhooks.join("evt_fifo.body");
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+    let intent_fifo = intents.join("01HZZZZZZZZZZZZZZZZZZZZZZZ.json");
+    let intent_c = std::ffi::CString::new(intent_fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(intent_c.as_ptr(), 0o600) }, 0);
+
+    let out = fix.drain();
+    let text = body(&out);
+    assert!(
+        text.contains("non-regular file") || text.contains("symlink"),
+        "the pass did not name the planted trap: {text}"
+    );
+    // Nothing read through the traps, and the pass removed neither the traps
+    // nor the application state behind them. A trap may fail the pass, but it
+    // must not be followed and must not settle anything.
+    assert!(
+        !fix.sent().contains("evt_link") && !fix.sent().contains("evt_fifo"),
+        "a trapped webhook was settled: {}",
+        fix.sent()
+    );
+    assert!(
+        fix.names("accounts").is_empty(),
+        "{:?}",
+        fix.names("accounts")
+    );
+    assert!(fix.read("verified/processed.jsonl").is_empty());
 }

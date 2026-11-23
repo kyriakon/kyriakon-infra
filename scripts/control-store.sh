@@ -228,7 +228,8 @@ store_dir tokens       root wheel 750
 store_dir keys         root wheel 750
 store_dir holds        root wheel 750
 store_dir ledger       root wheel 750
-store_dir verified     root wheel 750
+store_dir verified     root wheel 700
+store_dir reviewed     root wheel 700
 store_dir spent        root wheel 750
 store_dir rates        root wheel 750
 

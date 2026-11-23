@@ -12,6 +12,8 @@ use kyriakon_control_core::store::{self, KeyRecord, Record, Store};
 use std::fmt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::process::Stdio;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 /// A script, a key file, or an address the drain could not use.
@@ -111,6 +113,63 @@ pub(super) async fn run_script(cfg: &DrainConfig, name: &str, args: &[&str]) -> 
         return Err(script_error(cfg, name, &out));
     }
     Ok(())
+}
+
+/// Run a script with its secret on stdin, so it never reaches `ps`'s argv view.
+/// `set-mail-password.sh` is the caller: a bcrypt hash in argv is readable by
+/// every local account on OpenBSD.
+pub(super) async fn run_script_with_stdin(
+    cfg: &DrainConfig,
+    name: &str,
+    args: &[&str],
+    input: &[u8],
+) -> Result<(), Error> {
+    let out = spawn_script_with_stdin(cfg, name, args, input).await?;
+    if !out.status.success() {
+        return Err(script_error(cfg, name, &out));
+    }
+    Ok(())
+}
+
+/// Spawn a script, write `input` to its stdin, and collect its output. stdin is
+/// closed after the write, so a script that reads until EOF does not hang.
+pub(super) async fn spawn_script_with_stdin(
+    cfg: &DrainConfig,
+    name: &str,
+    args: &[&str],
+    input: &[u8],
+) -> Result<std::process::Output, Error> {
+    let path = PathBuf::from(format!("{}/{}", cfg.scripts.trim_end_matches('/'), name));
+    let mut child = Command::new(&path)
+        .args(args)
+        .env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin",
+        )
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|source| Error::Spawn {
+            script: path.clone(),
+            source,
+        })?;
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(Error::Refused("the script has no stdin".to_string()));
+    };
+    if let Err(source) = stdin.write_all(input).await {
+        let _ = child.kill().await;
+        return Err(Error::Spawn {
+            script: path,
+            source,
+        });
+    }
+    drop(stdin);
+    child
+        .wait_with_output()
+        .await
+        .map_err(|source| Error::Spawn {
+            script: path,
+            source,
+        })
 }
 
 /// Stop a card subscription's renewal before the record that names it goes, so

@@ -48,7 +48,7 @@ const WEBHOOK_TOLERANCE: i64 = 300;
 /// forged or replayed delivery is. A pair proven before keeps its queue entry if
 /// a later check fails: the bytes or the secret changed, and a money-bearing
 /// event is not root's to drop. A verified event is deduplicated on its id and
-/// on `(type, object.id)`, applied, recorded in `webhooks/processed.jsonl`, and
+/// on `(type, object.id)`, applied, recorded in root-only `verified/processed.jsonl`, and
 /// only then removed.
 ///
 /// An event that cannot be applied yet — the Stripe API unreachable for an
@@ -236,7 +236,7 @@ pub async fn stripe_webhooks(
                     // A pair whose record cannot be written is left in place:
                     // the event is settled and must be retried, and dropping
                     // the webhook here would apply it twice.
-                    if let Err(e) = store.log("webhooks/processed.jsonl").append(&bytes).await {
+                    if let Err(e) = store.log("verified/processed.jsonl").append(&bytes).await {
                         e.report(&format!(
                             "webhook {id} ({kind}) could not be recorded as processed; it will be retried"
                         ));
@@ -411,7 +411,7 @@ fn invoice_pair(kind: &str, object: &str) -> Option<String> {
 async fn processed_events(store: &Store) -> Result<HashSet<String>, Error> {
     let mut seen = HashSet::new();
     for value in store
-        .log("webhooks/processed.jsonl")
+        .log("verified/processed.jsonl")
         .jsonl::<Value>()
         .await?
     {
@@ -836,6 +836,24 @@ async fn target_for_application(
     if !store::is_status_token(application) {
         return Ok(None);
     }
+    // The root-only snapshot is written at review and again, carrying the
+    // payment block, at approval. The handler owns `applications/` and can
+    // rewrite it after the mail, so its payment block is not what decides where
+    // a card payment lands.
+    let snapshot = store.reviewed_application(application).await?;
+    let token = snapshot
+        .as_ref()
+        .and_then(|record| record.payment.as_ref())
+        .and_then(|payment| payment.token_ref.clone());
+    if let Some(token) = token {
+        return target_for_payment_reference(store, &token).await;
+    }
+    // Transition: an approval that ran before the snapshot existed, and a
+    // review snapshot an old approval never updated, still resolve through the
+    // handler's record. New approvals always carry the root token above.
+    // shortcut: a handler-planted payment block can answer here until the
+    // record is approved once more; upgrade when the pre-upgrade applications
+    // have been purged.
     let Some(record) = store.application(application).await? else {
         return Ok(None);
     };
