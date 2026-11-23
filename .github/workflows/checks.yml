@@ -11,7 +11,12 @@
 #     runs the scripts under it. CONTEXT.md records the trap, from a script
 #     that passed its self-test on a workstation and died on the box's
 #     `typeset -a`.
-#
+#   * The deps job audits all seven committed lockfiles against RustSec, and
+#     runs cargo deny against deny.toml for the three shipping build roots.
+#     It refuses a version with a published advisory outside the two the config
+#     records as unreachable, an unknown licence and a source that is not
+#     crates.io. What it cannot see is a backdoored upstream release nobody has
+#     reported yet, which docs/threat-model.md states.
 #
 # What these catch, all of them found by hand in the 2026-10-15 audit: a status
 # read inside the wrong branch, a loop variable read after its loop, a checkbox
@@ -140,6 +145,56 @@ jobs:
         run: cargo test --manifest-path mailparse/Cargo.toml
       - name: clippy
         run: cargo clippy --manifest-path mailparse/Cargo.toml --all-targets -- -D warnings
+
+  # What would actually ship, plus every tree that builds it: `cargo audit`
+  # reads all seven committed lockfiles, and `cargo deny` checks the three
+  # shipping build roots against this repository's own policy in deny.toml. The
+  # encryptor has no dependencies today and commits a lockfile anyway, so the
+  # first one it gains is scanned on the pull request that adds it.
+  deps:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: toolchain
+        run: rustc --version && cargo --version
+      # Pinned, not latest: a new advisory is news, but a new scanner is a change
+      # to this repository that gets its own review. The versions are printed for
+      # the same reason as the toolchain above, so a failure reads without a
+      # second run.
+      - name: install scanners
+        run: |
+          cargo install cargo-audit --version 0.23.0 --locked
+          cargo install cargo-deny --version 0.22.0 --locked
+          cargo audit --version && cargo deny --version
+      # --file, so the check is against the lockfile the repository commits. A
+      # lockfile regenerated from a different manifest would otherwise be the
+      # thing audited, and it would be the wrong one. Every committed lockfile
+      # is named, including the three fuzz trees and the keygen-spike prototype,
+      # so no build root carries an advisory the shipping scan misses. The two
+      # ignored advisories are in .cargo/audit.toml, which cargo audit reads
+      # from this directory.
+      - name: cargo audit
+        run: |
+          cargo audit --file control/Cargo.lock
+          cargo audit --file kyriakon-encrypt/Cargo.lock
+          cargo audit --file mailparse/Cargo.lock
+          cargo audit --file control/fuzz/Cargo.lock
+          cargo audit --file kyriakon-encrypt/fuzz/Cargo.lock
+          cargo audit --file mailparse/fuzz/Cargo.lock
+          cargo audit --file docs/planning/prototypes/keygen-spike/Cargo.lock
+      # deny.toml carries the licence allowlist and the source policy; see its
+      # own header. It runs against the three shipping build roots, because the
+      # fuzz trees add libfuzzer-sys under the NCSA licence and none of their
+      # code ships. Advisories are checked here as well, because a duplicate
+      # version allowed to warn must not be the one carrying the advisory.
+      - name: cargo deny
+        run: |
+          cargo deny --manifest-path control/Cargo.toml check
+          cargo deny --manifest-path kyriakon-encrypt/Cargo.toml check
+          cargo deny --manifest-path mailparse/Cargo.toml check
 
   shell:
     name: shell scripts

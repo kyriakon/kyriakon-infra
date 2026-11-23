@@ -1,0 +1,14 @@
+# cargo-audit's half of the policy in deny.toml, which lists the licence and
+# source rules and the same advisory IDs with their reasoning. Kept beside it so
+# the two scanners agree: the `deps` job in .github/workflows/checks.yml
+# runs both, and an advisory ignored in one file only would fail the other.
+
+[advisories]
+ignore = [
+  # rsa 0.9.10, the Marvin attack on PKCS#1 v1.5 decryption. Nothing here
+  # decrypts; see deny.toml.
+  "RUSTSEC-2023-0071",
+  # crypto-bigint 0.5.5, timing variability in secret-scalar arithmetic. Nothing
+  # here handles a private scalar; see deny.toml.
+  "RUSTSEC-2026-0387",
+]
