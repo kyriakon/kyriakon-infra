@@ -81,6 +81,10 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
         OffsetDateTime::now_utc(),
     )
     .await;
+    // The page sessions' expiry sweep. A login writes only its own account's
+    // record and does not list the directory, so this pass is what clears the
+    // spent ones, including any an earlier build left under a random name.
+    kyriakon_control_core::account::session::prune(store, OffsetDateTime::now_utc()).await;
     transitions::lifecycle::purge_declined(cfg, store, &journal).await?;
     // ADR 0005's application answers: the ninety days are counted from filing,
     // so this clears an approved application's copies and an abandoned record
