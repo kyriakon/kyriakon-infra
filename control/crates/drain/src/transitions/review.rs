@@ -8,7 +8,7 @@ use super::boxrun::{
 };
 use super::groups::{
     account_on_box, append_ledger, body_domain_refusal, check_group_names, group_addresses,
-    group_record, name_allowed, name_held, site_owner, write_account_record,
+    group_record, name_allowed, name_held, site_owner,
 };
 use super::lifecycle::group_recipient;
 use super::Error;
@@ -93,9 +93,8 @@ async fn save_application(store: &Store, token: &str, record: &Record) -> Result
         context: "encode the record",
         source,
     })?;
-    let owner = store.dir_owner("applications");
     store
-        .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
+        .write_filed_application(token, &bytes)
         .await
         .map_err(Error::from)
 }
@@ -664,18 +663,24 @@ async fn approve(
         grace_until: None,
         notice_stopped: None,
     };
+    // The write takes the account's own lock and keeps the fields another
+    // process may have set since this pass read the record: a rotation, a
+    // bounce latch, a grace date, a closure.
+    let fresh = account.clone();
     store
-        .ensure_dir_owned(
-            &format!("accounts/{username}"),
-            0o750,
-            store.dir_owner("accounts"),
-        )
+        .update_account(username, move |current| {
+            let mut account = fresh.clone();
+            if let Some(existing) = current.as_ref() {
+                account.rotation = existing.rotation.clone();
+                account.notice_stopped = existing.notice_stopped.clone();
+                account.grace_until = existing.grace_until.clone();
+                account.closing_until = existing.closing_until.clone();
+                account.space_used = existing.space_used;
+            }
+            *current = Some(account);
+            Ok::<(), Error>(())
+        })
         .await?;
-    let account_bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
-    write_account_record(store, username, &account_bytes).await?;
 
     if let (Some(token), Some(window)) = (&token_ref, &window) {
         let join = TokenRecord {
@@ -719,17 +724,8 @@ async fn approve(
         context: "encode the application copy",
         source,
     })?;
-    store
-        .write_record(
-            &format!("accounts/{username}"),
-            "application.json",
-            &copy_bytes,
-        )
-        .await?;
-    let owner = store.dir_owner("applications");
-    store
-        .write_record_owned("applications", &format!("{token}.json"), &copy_bytes, owner)
-        .await?;
+    store.write_application_copy(username, &copy_bytes).await?;
+    store.write_filed_application(token, &copy_bytes).await?;
 
     // The decision email, recorded in the account's notices before it is
     // enqueued. The address outside the platform when one was given, and the
@@ -922,12 +918,9 @@ async fn approve_group(
     // Carry out the bytes on disk, not the copy in memory: the file is what the
     // next pass would read, envelope included, so the payload the transition
     // acts on is the one the writer stamped.
-    let text = store
-        .read_record("intents", &filename)
-        .await
-        .ok_or_else(|| {
-            Error::Failed(format!("the intent this pass filed at {filename} is gone"))
-        })?;
+    let text = store.intent_text(&filename).await?.ok_or_else(|| {
+        Error::Failed(format!("the intent this pass filed at {filename} is gone"))
+    })?;
     let value: Value = serde_json::from_str(&text)
         .map_err(|e| Error::context("the intent this pass filed does not parse", e))?;
     let filed = kyriakon_control_core::intent::Intent::parse(&value)?;
@@ -1081,9 +1074,8 @@ async fn stamp_group_payment(
     // `applications/` belongs to the handler, so the drain hands the rewritten
     // record back to that directory's owner. A root-owned file would read as
     // missing to the process that renders the page.
-    let owner = store.dir_owner("applications");
     store
-        .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
+        .write_filed_application(token, &bytes)
         .await
         .map_err(Error::from)
 }
@@ -1248,9 +1240,8 @@ async fn mark_decided(
     // record back to that directory's owner. A root-owned 0600 file would read
     // as missing to the unprivileged process that renders the status page, and
     // the link would answer as an unknown token for the week it should answer.
-    let owner = store.dir_owner("applications");
     store
-        .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
+        .write_filed_application(token, &bytes)
         .await
         .map_err(Error::from)
 }

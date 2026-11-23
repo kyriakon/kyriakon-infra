@@ -11,9 +11,8 @@ use super::boxrun::{
 use super::groups::{
     account_on_box, application_token, close_group_tokens, group_record, hold_name,
     remove_addresses, remove_group_record, remove_senders_for_domain, take_group_down,
-    write_account_record, write_group_record, write_group_state,
 };
-use super::payments::{resolve_payment, token_join, write_payment_copy};
+use super::payments::{resolve_payment, token_join};
 use super::Error;
 use super::{due, report_failure, write_journal, Settlement};
 use kyriakon_control_core::account::{dns, export, session};
@@ -146,10 +145,6 @@ pub async fn issue_password_link(
     username: &str,
     key: &[u8],
 ) -> Result<String, Error> {
-    let mut account = store
-        .account(username)
-        .await?
-        .ok_or_else(|| Error::Failed(format!("no account for {username}")))?;
     let link = PasswordLink::fresh().await?;
     let url = kyriakon_control_core::account::sign::password_link(
         &cfg.base_url,
@@ -158,17 +153,20 @@ pub async fn issue_password_link(
         username,
         &link.until,
     )?;
-    account.password_link = Some(link);
     // The status page renders the application copy, not the account. A reset
     // replaces the link, so clear the page's copy before the account changes: a
     // failure here leaves the old link live and the retry safe, where the reverse
     // order could consume the old link without delivering the new one.
     clear_status_link(store, username).await?;
-    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
-    write_account_record(store, username, &bytes).await?;
+    store
+        .update_account(username, |current| {
+            let Some(account) = current.as_mut() else {
+                return Err(Error::Failed(format!("no account for {username}")));
+            };
+            account.password_link = Some(link);
+            Ok(())
+        })
+        .await?;
     Ok(url)
 }
 
@@ -201,9 +199,8 @@ async fn clear_status_link(store: &Store, username: &str) -> Result<(), Error> {
         context: "encode the application record",
         source,
     })?;
-    let owner = store.dir_owner("applications");
     store
-        .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
+        .write_filed_application(token, &bytes)
         .await
         .map_err(Error::from)
 }
@@ -263,7 +260,6 @@ pub async fn set_password(
     // had: a link issued for one account cannot be relabelled onto another by a
     // handler that rewrites the record. A group mailbox's link has no
     // application record at all, and the account is what authorizes it.
-    let name = format!("{token}.json");
     let mut app_record: Option<Value> = match store.filed_application_text(token).await? {
         Some(text) => Some(
             serde_json::from_str(&text)
@@ -279,7 +275,7 @@ pub async fn set_password(
         }
     }
 
-    let Some(mut account) = store.account(username).await? else {
+    let Some(account) = store.account(username).await? else {
         return Ok(
             password_refusal(store, file, value, format!("no account for {username}")).await,
         );
@@ -314,13 +310,23 @@ pub async fn set_password(
     let finished = async {
         run_script(cfg, "set-mail-password.sh", &[username, &hash]).await?;
 
-        // One use: the mailbox keeps no link, so the page stops answering.
-        account.password_link = None;
-        let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-            context: "encode the account",
-            source,
-        })?;
-        write_account_record(store, username, &bytes).await?;
+        // One use: the mailbox keeps no link, so the page stops answering. Only
+        // this link is cleared: a reset between the check above and this write
+        // has replaced it with one that is still live.
+        store
+            .update_account(username, |current| {
+                if let Some(account) = current.as_mut() {
+                    if account
+                        .password_link
+                        .as_ref()
+                        .is_some_and(|link| link.token == token)
+                    {
+                        account.password_link = None;
+                    }
+                }
+                Ok::<(), Error>(())
+            })
+            .await?;
 
         // Clear the status page's copy too, when this token is the link that page
         // carries. A reset's token has no application record, so it is left alone.
@@ -333,10 +339,7 @@ pub async fn set_password(
                 })?;
                 // `applications/` belongs to the handler, which renders the status
                 // page as _onboard: a root-owned record reads as missing to it.
-                let owner = store.dir_owner("applications");
-                store
-                    .write_record_owned("applications", &name, &bytes, owner)
-                    .await?;
+                store.write_filed_application(token, &bytes).await?;
             }
         }
 
@@ -395,9 +398,8 @@ pub(crate) async fn redact_password(store: &Store, file: &str, value: &Value) ->
         context: "encode the intent",
         source,
     })?;
-    let owner = store.dir_owner("intents");
     store
-        .write_record_owned("intents", file, &bytes, owner)
+        .write_intent_record(file, &bytes)
         .await
         .map_err(Error::from)
 }
@@ -430,7 +432,7 @@ pub async fn window_extend(store: &Store, intent: WindowExtendIntent) -> Result<
     if let Some(domain) = join.as_ref().and_then(|j| j.group.clone()) {
         return extend_group_window(store, intent, &domain).await;
     }
-    let (username, mut account, mut payment) = match resolve_payment(store, &intent.token).await {
+    let (username, _account, mut payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
         Err(problem) => return Ok(Settlement::refused(&problem)),
     };
@@ -447,13 +449,15 @@ pub async fn window_extend(store: &Store, intent: WindowExtendIntent) -> Result<
     // Read the join before the account is written: a token record that cannot
     // be read fails here, with the window still unchanged for the retry.
     let mut join = store.token(&intent.token).await?;
-    account.payment = Some(payment.clone());
-    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
-    write_account_record(store, &username, &bytes).await?;
-    write_payment_copy(store, &username, &payment).await?;
+    store
+        .update_account(&username, |current| {
+            if let Some(account) = current.as_mut() {
+                account.payment = Some(payment.clone());
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
+    store.write_payment_copy(&username, &payment).await?;
     // The token index carries the date the operator's list and any later lookup
     // sees, so keep it beside the account.
     if let Some(join) = join.as_mut() {
@@ -513,7 +517,7 @@ async fn extend_group_window(
     };
     // Read the join before the group is written, as the person path does.
     let mut join = store.token(&intent.token).await?;
-    write_group_record(store, &group).await?;
+    store.write_group_record(&group).await?;
     if let Some(join) = join.as_mut() {
         join.window_closes_at = new_close.clone();
         let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Error::Json {
@@ -583,7 +587,7 @@ pub async fn window_sweep(
 ) -> Result<(), Error> {
     let now = OffsetDateTime::now_utc();
     for username in store.list("accounts").await? {
-        let Some(mut account) = sweep_account(cfg, store, journal, &username).await else {
+        let Some(account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
         };
         let Some(mut payment) = account.payment_state() else {
@@ -618,13 +622,15 @@ pub async fn window_sweep(
             if let Some(window) = payment.window.as_mut() {
                 window.state = "paid".to_string();
             }
-            account.payment = Some(payment.clone());
-            let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-                context: "encode the account",
-                source,
-            })?;
-            write_account_record(store, &username, &bytes).await?;
-            write_payment_copy(store, &username, &payment).await?;
+            store
+                .update_account(&username, |current| {
+                    if let Some(account) = current.as_mut() {
+                        account.payment = Some(payment.clone());
+                    }
+                    Ok::<(), Error>(())
+                })
+                .await?;
+            store.write_payment_copy(&username, &payment).await?;
             continue;
         }
         // Stop the three access paths before the record says lapsed. A script
@@ -638,17 +644,20 @@ pub async fn window_sweep(
             continue;
         };
         window.state = "closed".to_string();
-        account.state = "lapsed".to_string();
-        account.grace_until = Some(util::date_after_days(40));
+        let grace = util::date_after_days(40);
         // A new date does not prove a channel works, so a stop set by a bounce
         // stays until an operator resends or the member pays.
-        account.payment = Some(payment.clone());
-        let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-            context: "encode the account",
-            source,
-        })?;
-        write_account_record(store, &username, &bytes).await?;
-        write_payment_copy(store, &username, &payment).await?;
+        store
+            .update_account(&username, |current| {
+                if let Some(account) = current.as_mut() {
+                    account.state = "lapsed".to_string();
+                    account.grace_until = Some(grace.clone());
+                    account.payment = Some(payment.clone());
+                }
+                Ok::<(), Error>(())
+            })
+            .await?;
+        store.write_payment_copy(&username, &payment).await?;
         if let Err(e) = lapse_notice(cfg, store, &username, &account, &payment).await {
             e.report(&format!("the lapse notice for {username}"));
         }
@@ -691,7 +700,7 @@ pub async fn window_sweep(
             if let Some(window) = group.payment.window.as_mut() {
                 window.state = "paid".to_string();
             }
-            write_group_record(store, &group).await?;
+            store.write_group_record(&group).await?;
             continue;
         }
         // Stop every mailbox before the group's record says lapsed, so the
@@ -713,7 +722,7 @@ pub async fn window_sweep(
                 stopped = false;
                 continue;
             }
-            let mut account = match store.account(mailbox).await {
+            let account = match store.account(mailbox).await {
                 Ok(Some(account)) => account,
                 Ok(None) => continue,
                 Err(e) => {
@@ -723,17 +732,23 @@ pub async fn window_sweep(
                 }
             };
             // A closing or suspended mailbox keeps its own state: the group's
-            // lapse is not the decision that put it there.
+            // lapse is not the decision that put it there. The check is repeated
+            // under the lock, because a console suspension can land between the
+            // read above and this write.
             if account.state != "active" {
                 continue;
             }
-            account.state = "lapsed".to_string();
-            account.grace_until = Some(grace.clone());
-            let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-                context: "encode the account",
-                source,
-            })?;
-            write_account_record(store, mailbox, &bytes).await?;
+            store
+                .update_account(mailbox, |current| {
+                    if let Some(account) = current.as_mut() {
+                        if account.state == "active" {
+                            account.state = "lapsed".to_string();
+                            account.grace_until = Some(grace.clone());
+                        }
+                    }
+                    Ok::<(), Error>(())
+                })
+                .await?;
         }
         if !stopped {
             continue;
@@ -742,7 +757,7 @@ pub async fn window_sweep(
             window.state = "closed".to_string();
         }
         group.grace_until = Some(grace.clone());
-        write_group_record(store, &group).await?;
+        store.write_group_record(&group).await?;
         if let Err(e) = group_lapse_notice(cfg, store, journal, &group, &window).await {
             e.report(&format!("the lapse notice for {domain}"));
         }
@@ -914,7 +929,7 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
     let now = OffsetDateTime::now_utc();
     let today = now.date();
     for username in store.list("accounts").await? {
-        let Some(mut account) = sweep_account(cfg, store, journal, &username).await else {
+        let Some(account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
         };
         // A lapsed group mailbox's grace is the group's: one conversation and
@@ -968,8 +983,14 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
                 // This pass sent the notice for the first time. The text
                 // promises seven days, so it gets them.
                 Ok(true) => {
-                    account.grace_until = Some(util::date_after_days(7));
-                    save_account(store, &account).await?;
+                    store
+                        .update_account(&username, |current| {
+                            if let Some(account) = current.as_mut() {
+                                account.grace_until = Some(util::date_after_days(7));
+                            }
+                            Ok::<(), Error>(())
+                        })
+                        .await?;
                     continue;
                 }
                 Ok(false) => {}
@@ -1015,7 +1036,7 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
     // every account in the group, keyed on the group's own journal id so a
     // failed erase backs off.
     for domain in store.list("groups").await? {
-        let mut group = match group_record(store, &domain).await {
+        let group = match group_record(store, &domain).await {
             Ok(Some(group)) => group,
             Ok(None) => continue,
             Err(e) => {
@@ -1072,8 +1093,14 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
                 // waits. A notice sent for the first time gets its seven days.
                 match group_final_notice(cfg, store, journal, &group, grace).await {
                     Ok(true) => {
-                        group.grace_until = Some(util::date_after_days(7));
-                        write_group_record(store, &group).await?;
+                        store
+                            .update_group(&domain, |current| {
+                                if let Some(group) = current.as_mut() {
+                                    group.grace_until = Some(util::date_after_days(7));
+                                }
+                                Ok::<(), Error>(())
+                            })
+                            .await?;
                         continue;
                     }
                     Ok(false) => {}
@@ -1277,7 +1304,7 @@ async fn delete_group(
     let mut group = group.clone();
     if cancel_stripe_if_active(cfg, &group.payment.stripe).await? {
         group.payment.stripe.cancel_at_period_end = true;
-        write_group_record(store, &group).await?;
+        store.write_group_record(&group).await?;
     }
     take_group_down(cfg, store, &group.domain).await?;
     write_journal(
@@ -1443,7 +1470,7 @@ pub async fn resend_notice(
 async fn resend_account(
     cfg: &DrainConfig,
     store: &Store,
-    mut account: Account,
+    account: Account,
     username: &str,
     to: Option<&str>,
 ) -> Result<(String, String), Error> {
@@ -1490,16 +1517,19 @@ async fn resend_account(
     // The working channel has to outlive this command: the day-33 final notice
     // reads notice_address, so a resend to a new address that is not persisted
     // would bounce again and re-latch the clock the resend just cleared.
-    if to != account.notice_address() {
-        account.outside_address = Some(to.clone());
-    }
-    account.grace_until = Some(grace.clone());
-    account.notice_stopped = None;
-    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
-    write_account_record(store, username, &bytes).await?;
+    store
+        .update_account(username, |current| {
+            let Some(account) = current.as_mut() else {
+                return Err(Error::Failed(format!("no account for {username}")));
+            };
+            if to != account.notice_address() {
+                account.outside_address = Some(to.clone());
+            }
+            account.grace_until = Some(grace.clone());
+            account.notice_stopped = None;
+            Ok(())
+        })
+        .await?;
     Ok((to, grace))
 }
 
@@ -1513,7 +1543,7 @@ async fn resend_group(
     domain: &str,
     to: Option<&str>,
 ) -> Result<(String, String), Error> {
-    let Some(mut group) = store.group(domain).await? else {
+    let Some(group) = store.group(domain).await? else {
         return Err(Error::Failed(format!("no group for {domain}")));
     };
     if group.site_owner != username {
@@ -1564,24 +1594,31 @@ async fn resend_group(
         &body,
     )
     .await?;
-    group.grace_until = Some(grace.clone());
-    write_group_record(store, &group).await?;
+    store
+        .update_group(domain, |current| {
+            let Some(group) = current.as_mut() else {
+                return Err(Error::Failed(format!("no group for {domain}")));
+            };
+            group.grace_until = Some(grace.clone());
+            Ok(())
+        })
+        .await?;
     // The latch is on the site owner's account, and the group's date has moved,
     // so clear it last: a failure here leaves the sweep refusing, not deleting.
-    let Some(mut account) = store.account(username).await? else {
-        return Err(Error::Failed(format!("no account for {username}")));
-    };
     // The group's later notices go to the site owner's notice_address, so a
     // working channel named here has to be recorded there, not just used once.
-    if to != account.notice_address() {
-        account.outside_address = Some(to.clone());
-    }
-    account.notice_stopped = None;
-    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
-    write_account_record(store, username, &bytes).await?;
+    store
+        .update_account(username, |current| {
+            let Some(account) = current.as_mut() else {
+                return Err(Error::Failed(format!("no account for {username}")));
+            };
+            if to != account.notice_address() {
+                account.outside_address = Some(to.clone());
+            }
+            account.notice_stopped = None;
+            Ok(())
+        })
+        .await?;
     Ok((to, grace))
 }
 
@@ -1667,7 +1704,7 @@ pub async fn suspend(
             "a suspension needs a reason, in the words the member will read".to_string(),
         ));
     }
-    let Some(mut account) = store.account(username).await? else {
+    let Some(account) = store.account(username).await? else {
         return Err(Error::Failed(format!("no account for {username}")));
     };
     // The id is the account's own, so a retry after a crash finishes the same
@@ -1688,19 +1725,22 @@ pub async fn suspend(
         .await?;
     }
     run_script(cfg, "lapse-user.sh", &[username]).await?;
-    account.state = "suspended".to_string();
-    account.suspension_reason = Some(reason.to_string());
-    // The suspension enters the same forty-day grace as a lapse. A retry keeps
-    // the date it first set, and a stop a bounce set stays with the clock,
-    // because a new date does not prove a channel works.
-    if account.grace_until.is_none() {
-        account.grace_until = Some(util::date_after_days(40));
-    }
-    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
-    write_account_record(store, username, &bytes).await?;
+    let account = store
+        .update_account(username, |current| {
+            let Some(account) = current.as_mut() else {
+                return Err(Error::Failed(format!("no account for {username}")));
+            };
+            account.state = "suspended".to_string();
+            account.suspension_reason = Some(reason.to_string());
+            // The suspension enters the same forty-day grace as a lapse. A retry
+            // keeps the date it first set, and a stop a bounce set stays with the
+            // clock, because a new date does not prove a channel works.
+            if account.grace_until.is_none() {
+                account.grace_until = Some(util::date_after_days(40));
+            }
+            Ok(account.clone())
+        })
+        .await?;
     if !journal.has(&id, "applied") {
         write_journal(
             store,
@@ -1758,7 +1798,7 @@ pub async fn resume(
     if let Some(why) = validate::username_shape(username) {
         return Err(Error::Failed(format!("the username {username:?}: {why}")));
     }
-    let Some(mut account) = store.account(username).await? else {
+    let Some(account) = store.account(username).await? else {
         return Err(Error::Failed(format!("no account for {username}")));
     };
     if account.state != "suspended" {
@@ -1803,17 +1843,20 @@ pub async fn resume(
     if !lapsed {
         run_script(cfg, "lapse-user.sh", &["--restore", username]).await?;
     }
-    account.state = if lapsed { "lapsed" } else { "active" }.to_string();
-    account.suspension_reason = None;
-    if !lapsed {
-        account.grace_until = None;
-        account.notice_stopped = None;
-    }
-    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
-    write_account_record(store, username, &bytes).await?;
+    store
+        .update_account(username, |current| {
+            let Some(account) = current.as_mut() else {
+                return Err(Error::Failed(format!("no account for {username}")));
+            };
+            account.state = if lapsed { "lapsed" } else { "active" }.to_string();
+            account.suspension_reason = None;
+            if !lapsed {
+                account.grace_until = None;
+                account.notice_stopped = None;
+            }
+            Ok(())
+        })
+        .await?;
     write_journal(
         store,
         journal,
@@ -1954,7 +1997,7 @@ pub async fn delete_account(
         if let Some(mut group) = group_record(store, domain).await? {
             if group.accounts.iter().any(|mailbox| mailbox == username) {
                 group.accounts.retain(|mailbox| mailbox != username);
-                write_group_record(store, &group).await?;
+                store.write_group_record(&group).await?;
             }
         }
     }
@@ -2113,15 +2156,20 @@ pub async fn close_account(
                 .any(|mailbox| mailbox == &intent.username)
             {
                 group.accounts.retain(|mailbox| mailbox != &intent.username);
-                write_group_record(store, &group).await?;
+                store.write_group_record(&group).await?;
             }
         }
     }
-    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
-    write_account_record(store, &intent.username, &bytes).await?;
+    let closing_until = account.closing_until.clone();
+    store
+        .update_account(&intent.username, |current| {
+            if let Some(account) = current.as_mut() {
+                account.state = "closing".to_string();
+                account.closing_until = closing_until.clone();
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
     Ok(Settlement::line(
         "applied",
         application.clone(),
@@ -2167,15 +2215,19 @@ pub async fn cancel_close(store: &Store, intent: CancelCloseIntent) -> Result<Se
                 .any(|mailbox| mailbox == &intent.username)
             {
                 group.accounts.push(intent.username.clone());
-                write_group_record(store, &group).await?;
+                store.write_group_record(&group).await?;
             }
         }
     }
-    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
-    write_account_record(store, &intent.username, &bytes).await?;
+    store
+        .update_account(&intent.username, |current| {
+            if let Some(account) = current.as_mut() {
+                account.state = "active".to_string();
+                account.closing_until = None;
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
     Ok(Settlement::line(
         "applied",
         application,
@@ -2190,16 +2242,6 @@ fn account_gone(username: &str) -> Settlement {
         ApplicationRef::account(username.to_string()),
         Some("the account had already gone".to_string()),
     )
-}
-
-/// Write an account record back, readable by the handler and owned the way the
-/// directory's other records are.
-async fn save_account(store: &Store, account: &Account) -> Result<(), Error> {
-    let bytes = serde_json::to_vec_pretty(account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
-    write_account_record(store, &account.username, &bytes).await
 }
 
 /// A password change from the account page. The handler had the current
@@ -2360,7 +2402,15 @@ pub async fn upload_key(
             )))
         }
     }
-    save_account(store, &account).await?;
+    let upload_keys = account.upload_keys.clone();
+    store
+        .update_account(&account.username, |current| {
+            if let Some(account) = current.as_mut() {
+                account.upload_keys = upload_keys;
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
     Ok(Settlement::line(
         "applied",
         ApplicationRef::account(account.username.clone()),
@@ -2375,7 +2425,7 @@ pub async fn set_outside_address(
     store: &Store,
     intent: OutsideAddressIntent,
 ) -> Result<Settlement, Error> {
-    let Some(mut account) = store.account(&intent.username).await? else {
+    let Some(account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
     let address = intent.address.trim();
@@ -2394,8 +2444,14 @@ pub async fn set_outside_address(
     } else {
         "the contact and recovery address is cleared"
     };
-    account.outside_address = outside;
-    save_account(store, &account).await?;
+    store
+        .update_account(&account.username, |current| {
+            if let Some(account) = current.as_mut() {
+                account.outside_address = outside;
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
     Ok(Settlement::line(
         "applied",
         ApplicationRef::account(account.username.clone()),
@@ -2411,7 +2467,7 @@ pub async fn set_serving(
     store: &Store,
     intent: ServingIntent,
 ) -> Result<Settlement, Error> {
-    let Some(mut account) = store.account(&intent.username).await? else {
+    let Some(account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
     // An unrecorded lane on a hosting member is serving: provision-member.sh
@@ -2449,9 +2505,15 @@ pub async fn set_serving(
         // daemon and reloads it: one pass for a batch rather than one a lane.
         run_script(cfg, "cron-apply.sh", &["--web"]).await?;
     }
-    account.site_served = Some(intent.http);
-    account.capsule_served = Some(intent.gemini);
-    save_account(store, &account).await?;
+    store
+        .update_account(&account.username, |current| {
+            if let Some(account) = current.as_mut() {
+                account.site_served = Some(intent.http);
+                account.capsule_served = Some(intent.gemini);
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
     Ok(Settlement::line(
         "applied",
         ApplicationRef::account(account.username.clone()),
@@ -2494,7 +2556,7 @@ pub async fn cancel_renewal(
         }
         if cancel_stripe_if_active(cfg, &group.payment.stripe).await? {
             group.payment.stripe.cancel_at_period_end = true;
-            write_group_record(store, &group).await?;
+            store.write_group_record(&group).await?;
         }
         return Ok(Settlement::line(
             "applied",
@@ -2513,8 +2575,16 @@ pub async fn cancel_renewal(
         ));
     }
     if cancel_stripe_if_active(cfg, &payment.stripe).await? {
-        payment.stripe.cancel_at_period_end = true;
-        save_account(store, &account).await?;
+        store
+            .update_account(&account.username, |current| {
+                if let Some(account) = current.as_mut() {
+                    if let Some(payment) = account.payment.as_mut() {
+                        payment.stripe.cancel_at_period_end = true;
+                    }
+                }
+                Ok::<(), Error>(())
+            })
+            .await?;
     }
     Ok(Settlement::line(
         "applied",
@@ -2679,9 +2749,17 @@ async fn apply_rotation(
         )));
     }
     publish_mail_keys(cfg, &account.username, std::slice::from_ref(&key)).await?;
-    account.mail_key = Some(rotation.fingerprint.clone());
-    account.rotation = None;
-    save_account(store, account).await?;
+    let username = account.username.clone();
+    let fingerprint = rotation.fingerprint.clone();
+    store
+        .update_account(&username, |current| {
+            if let Some(account) = current.as_mut() {
+                account.mail_key = Some(fingerprint.clone());
+                account.rotation = None;
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
     // The published set is the operator's step, and the box keyring and the
     // repository now disagree until they take it. The drift check waits seven
     // days, so say so now rather than make the operator find out then.
@@ -2747,8 +2825,15 @@ pub async fn mail_key(
                     Some("no replacement was pending".to_string()),
                 ));
             };
-            account.rotation = None;
-            save_account(store, &account).await?;
+            let username = account.username.clone();
+            store
+                .update_account(&username, |current| {
+                    if let Some(account) = current.as_mut() {
+                        account.rotation = None;
+                    }
+                    Ok::<(), Error>(())
+                })
+                .await?;
             let body = "The replacement of your mail key was cancelled. The key in use is \
                         unchanged, and mail keeps arriving to it."
                 .to_string();
@@ -2827,7 +2912,16 @@ pub async fn mail_key(
             if signed {
                 apply_rotation(cfg, store, &mut account, &rotation).await?;
             } else {
-                save_account(store, &account).await?;
+                let username = account.username.clone();
+                let pending = rotation.clone();
+                store
+                    .update_account(&username, |current| {
+                        if let Some(account) = current.as_mut() {
+                            account.rotation = Some(pending.clone());
+                        }
+                        Ok::<(), Error>(())
+                    })
+                    .await?;
                 let body = format!(
                     "You asked to replace the mail key for {}. If you did make this request, \
                      nothing else is needed: the new key applies at {} and mail arriving after \
@@ -2975,8 +3069,8 @@ async fn check_one_group(
     now: OffsetDateTime,
 ) -> Result<(), Error> {
     let state: Option<Value> = store
-        .read_record(&format!("groups/{}", group.domain), "dns-check.json")
-        .await
+        .dns_check_text(&group.domain)
+        .await?
         .and_then(|t| serde_json::from_str(&t).ok());
     let checked_at = state
         .as_ref()
@@ -3200,8 +3294,8 @@ pub async fn refresh_space_used(
     }
     let now = OffsetDateTime::now_utc();
     let state: Option<Value> = store
-        .read_record("", "quota-check.json")
-        .await
+        .quota_check_text()
+        .await?
         .and_then(|text| serde_json::from_str(&text).ok());
     let checked_at = state
         .as_ref()
@@ -3250,11 +3344,15 @@ pub async fn refresh_space_used(
             continue;
         }
         account.space_used = Some(bytes);
-        let encoded = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-            context: "encode the account",
-            source,
-        })?;
-        match write_account_record(store, username, &encoded).await {
+        match store
+            .update_account(username, |current| {
+                if let Some(account) = current.as_mut() {
+                    account.space_used = Some(bytes);
+                }
+                Ok::<(), Error>(())
+            })
+            .await
+        {
             Ok(()) => {
                 recorded.insert(username.clone());
             }
@@ -3302,11 +3400,7 @@ pub async fn refresh_space_used(
             continue;
         }
         group.space_used = Some(total);
-        let encoded = serde_json::to_vec_pretty(&group).map_err(|source| Error::Json {
-            context: "encode the group record",
-            source,
-        })?;
-        if let Err(e) = write_group_state(store, &name, &encoded).await {
+        if let Err(e) = store.write_group_record(&group).await {
             e.report(&format!("recording {name}'s quota"));
         }
     }
@@ -4126,7 +4220,7 @@ async fn keep_copy_join(
         source,
     })?;
     store
-        .write_record(&format!("accounts/{mailbox}"), "application.json", &bytes)
+        .write_application_copy(mailbox, &bytes)
         .await
         .map_err(Error::from)
 }
@@ -4147,9 +4241,8 @@ async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result
         context: "encode the application record",
         source,
     })?;
-    let owner = store.dir_owner("applications");
     store
-        .write_record_owned("applications", &format!("{token}.json"), &bytes, owner)
+        .write_filed_application(token, &bytes)
         .await
         .map_err(Error::from)
 }
@@ -4161,7 +4254,7 @@ async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result
 async fn queued_tokens(store: &Store) -> Result<HashSet<String>, Error> {
     let mut queued = HashSet::new();
     for name in store.list("intents").await? {
-        let Some(text) = store.read_record("intents", &name).await else {
+        let Some(text) = store.intent_text(&name).await? else {
             continue;
         };
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
@@ -4431,58 +4524,10 @@ pub async fn purge_drafts(
 ) -> Result<(), Error> {
     let cutoff = OffsetDateTime::now_utc()
         - Duration::days(kyriakon_control_core::store::draft::RETENTION_DAYS);
-    for name in store.list("drafts").await? {
-        let Some(token) = name.strip_suffix(".json") else {
-            continue;
-        };
-        let draft = match store::draft::load(store, token).await {
-            Ok(Some(draft)) => draft,
-            Ok(None) => continue,
-            Err(e) => {
-                report_record(cfg, store, journal, "draft", token, &Error::from(e)).await;
-                continue;
-            }
-        };
-        // A stamp that cannot be read is not an age this sweep can prove, so
-        // the file stays for the operator's report rather than being deleted.
-        let Ok(updated) = OffsetDateTime::parse(&draft.updated_at, &Rfc3339) else {
-            continue;
-        };
-        if updated > cutoff {
-            continue;
-        }
-        let purge_id = format!("purge-draft-{token}");
-        let subject = ApplicationRef::application("", token);
-        if !journal.has(&purge_id, "purged") && !journal.has(&purge_id, "applying") {
-            write_journal(
-                store,
-                journal,
-                &cfg.release,
-                &purge_id,
-                "draft",
-                &subject,
-                "applying",
-                Some("the draft's seven days are up; the answers are being cleared away"),
-            )
-            .await?;
-        }
-        if let Err(e) = store::draft::remove(store, token).await {
-            report_record(cfg, store, journal, "draft", token, &Error::from(e)).await;
-            continue;
-        }
-        if !journal.has(&purge_id, "purged") {
-            write_journal(
-                store,
-                journal,
-                &cfg.release,
-                &purge_id,
-                "draft",
-                &subject,
-                "purged",
-                Some("the abandoned draft answers were cleared away"),
-            )
-            .await?;
-        }
+    // The store holds the draft lock across each age check, its journal lines
+    // and the unlink, so a save cannot slip between them.
+    for (token, e) in store.purge_drafts(cutoff, journal, &cfg.release).await? {
+        report_record(cfg, store, journal, "draft", &token, &Error::from(e)).await;
     }
     Ok(())
 }

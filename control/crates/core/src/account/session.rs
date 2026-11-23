@@ -291,7 +291,7 @@ pub async fn lookup(store: &Store, cookie: &str, now: OffsetDateTime) -> Option<
     if !crate::store::is_status_token(id) {
         return None;
     }
-    let text = store.read_record("sessions", &format!("{id}.json")).await?;
+    let text = store.session_text(id).await.ok()??;
     let record: Record = serde_json::from_str(&text).ok()?;
     if !sign::verify(record.secret.as_bytes(), id, sig) {
         return None;
@@ -316,7 +316,7 @@ pub async fn close_all(store: &Store, username: &str) -> Result<(), Error> {
         if !name.ends_with(".json") {
             continue;
         }
-        let Some(text) = store.read_record("sessions", &name).await else {
+        let Some(text) = store.session_text(name.trim_end_matches(".json")).await? else {
             continue;
         };
         let belongs =
@@ -339,7 +339,7 @@ pub async fn prune(store: &Store, now: OffsetDateTime) {
         if !name.ends_with(".json") {
             continue;
         }
-        let Some(text) = store.read_record("sessions", &name).await else {
+        let Ok(Some(text)) = store.session_text(name.trim_end_matches(".json")).await else {
             continue;
         };
         let expired = serde_json::from_str::<Record>(&text)
@@ -371,7 +371,7 @@ pub async fn close(store: &Store, cookie: &str) {
     if !crate::store::is_status_token(id) {
         return;
     }
-    let Some(text) = store.read_record("sessions", &format!("{id}.json")).await else {
+    let Ok(Some(text)) = store.session_text(id).await else {
         return;
     };
     let Ok(record) = serde_json::from_str::<Record>(&text) else {

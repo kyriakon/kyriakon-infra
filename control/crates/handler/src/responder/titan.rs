@@ -227,67 +227,67 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
     // The checks run again under the draft lock before anything is written, so
     // two uploads that both read a keyless draft cannot both file a key. The
     // lock is held across the read-modify-write and not across the body read.
-    let _lock = match app.store.lock("drafts/.lock").await {
-        Ok(lock) => lock,
-        Err(e) => {
-            e.report("the titan request");
-            return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
-        }
-    };
-    let record = match draft::load(&app.store, token).await {
-        Ok(record) => record,
-        Err(e) => {
-            e.report("the titan request");
-            return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
-        }
-    };
-    let Some(mut record) = record else {
-        return Ok((capsule_not_found(), address));
-    };
-    let Some(mailbox) = titan_mailbox(app, &record) else {
-        return Ok((
-            Reply::gemini(
-                59,
-                "Every mailbox in this draft already has a key",
-                String::new(),
-            ),
-            address,
-        ));
-    };
     let blocks = keycheck::blocks(&String::from_utf8_lossy(&body));
-    if blocks.len() != 1 {
-        return Ok((
-            Reply::gemini(59, "Upload one public key block", String::new()),
-            address,
-        ));
-    }
-    if let Some(why) = kyriakon_control_core::flow::applicant::key_error(&blocks[0]) {
-        return Ok((Reply::gemini(59, &why, String::new()), address));
-    }
-    // The same retain-then-push the capsule's key page uses, so a retry for one
-    // mailbox replaces its key rather than adding a second.
-    record.mail_keys.retain(|k| k.mailbox != mailbox);
-    let identity = if record.answers.get("whose").map(String::as_str) == Some("body") {
-        let domain = record
-            .answers
-            .get("body_domain")
-            .cloned()
-            .unwrap_or_default();
-        if domain.is_empty() {
-            mailbox.clone()
-        } else {
-            format!("{mailbox}@{domain}")
+    let outcome = match app
+        .store
+        .update_draft(token, |record| {
+            let Some(mailbox) = titan_mailbox(app, record) else {
+                return Ok((Upload::Full, false));
+            };
+            if blocks.len() != 1 {
+                return Ok((
+                    Upload::Refused("Upload one public key block".to_string()),
+                    false,
+                ));
+            }
+            if let Some(why) = kyriakon_control_core::flow::applicant::key_error(&blocks[0]) {
+                return Ok((Upload::Refused(why), false));
+            }
+            // The same retain-then-push the capsule's key page uses, so a retry
+            // for one mailbox replaces its key rather than adding a second.
+            record.mail_keys.retain(|k| k.mailbox != mailbox);
+            let identity = if record.answers.get("whose").map(String::as_str) == Some("body") {
+                let domain = record
+                    .answers
+                    .get("body_domain")
+                    .cloned()
+                    .unwrap_or_default();
+                if domain.is_empty() {
+                    mailbox.clone()
+                } else {
+                    format!("{mailbox}@{domain}")
+                }
+            } else {
+                format!("{mailbox}@kyriakon.net")
+            };
+            record
+                .mail_keys
+                .push(keycheck::mail_key(mailbox.clone(), &identity, &blocks[0]));
+            Ok::<_, Error>((Upload::Filled(mailbox), true))
+        })
+        .await
+    {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return Ok((capsule_not_found(), address)),
+        Err(e) => {
+            e.report("the titan request");
+            return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
         }
-    } else {
-        format!("{mailbox}@kyriakon.net")
     };
-    record
-        .mail_keys
-        .push(keycheck::mail_key(mailbox.clone(), &identity, &blocks[0]));
-    if let Err(e) = draft::save(&app.store, &mut record).await {
-        e.report("the titan request");
-        return Ok((Reply::gemini(40, TEMP_FAILURE, String::new()), address));
-    }
+    let mailbox = match outcome {
+        Upload::Filled(mailbox) => mailbox,
+        Upload::Full => {
+            return Ok((
+                Reply::gemini(
+                    59,
+                    "Every mailbox in this draft already has a key",
+                    String::new(),
+                ),
+                address,
+            ))
+        }
+        Upload::Refused(why) => return Ok((Reply::gemini(59, &why, String::new()), address)),
+    };
     let link = format!("gemini://{HOST}/status/{token}");
     Ok((
         Reply::gemini(
@@ -297,6 +297,13 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
         ),
         address,
     ))
+}
+
+/// What one upload decided, once the draft is out of the closure.
+enum Upload {
+    Filled(String),
+    Full,
+    Refused(String),
 }
 
 /// The mailbox an upload belongs to: the first key page without a key. A draft

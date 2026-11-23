@@ -168,7 +168,7 @@ async fn one(
     // the same pass, then removes it. A file that is gone reads as done, the
     // same rule store.remove uses, rather than as a failure the reviewer is
     // mailed about.
-    let Some(text) = store.read_record("intents", file).await else {
+    let Some(text) = store.intent_text(file).await? else {
         return Ok(());
     };
     let value: Value =
@@ -737,7 +737,7 @@ pub async fn verify_session(
             "the intent carries no usable session id".to_string(),
         ));
     }
-    let Some(text) = store.read_record("sessions", &format!("{id}.json")).await else {
+    let Some(text) = store.session_text(id).await? else {
         return Err(Error::Failed(
             "the session named by the intent has gone".to_string(),
         ));

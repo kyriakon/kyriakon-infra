@@ -145,14 +145,7 @@ impl Journal {
     /// Append one line, then index it so a query later in the same pass sees
     /// it. The file is written first: the record is the truth.
     pub async fn append(&self, store: &Store, line: &JournalLine) -> Result<(), Error> {
-        let encoded = serde_json::to_string(line).map_err(|source| Error::Encode {
-            what: "a journal line",
-            source,
-        })?;
-        store
-            .log("journal.jsonl")
-            .append(encoded.as_bytes())
-            .await?;
+        store.append_journal(line).await?;
         let mut index = self.lock();
         let at = index.lines;
         index.remember(at, line);

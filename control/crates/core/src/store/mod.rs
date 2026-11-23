@@ -29,7 +29,8 @@ use std::path::PathBuf;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use time::OffsetDateTime;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// The queue money with no token is held in, append-only except for the one
 /// line `reconcile` completes under its lock.
@@ -89,15 +90,22 @@ impl Store {
             })
     }
 
-    /// Read a record's bytes when a missing one and a damaged one mean the same
-    /// thing: the status page's token oracle, which answers an unknown token and
-    /// a corrupt record alike, and a console listing that is best effort. A
-    /// caller that has to tell the two apart reads an account, group or
-    /// application record through the typed accessors below.
-    pub async fn read_record(&self, dir: &str, name: &str) -> Option<String> {
-        tokio::fs::read_to_string(self.root.join(dir).join(name))
-            .await
-            .ok()
+    /// The status page's optional oracle: a filed application for a token, or
+    /// `None` for one that is unknown, damaged, expired or spent alike. This is
+    /// the one reader that deliberately cannot tell a missing record from a
+    /// broken one, because the page must not answer a probe differently either
+    /// way. Every other read is typed and returns `Result<Option<T>, Error>`.
+    pub async fn read_optional_oracle(&self, token: &str) -> Option<Record> {
+        if !is_status_token(token) {
+            return None;
+        }
+        match self.application(token).await {
+            Ok(record) => record,
+            Err(e) => {
+                e.report("the status page");
+                None
+            }
+        }
     }
 
     /// One record's bytes, `Ok(None)` only when the file is absent. An IO error
@@ -115,20 +123,14 @@ impl Store {
     }
 
     /// Read one record as its own type. `Ok(None)` only when the file is not
-    /// there: an IO error or a parse failure is an error naming the file. A
-    /// caller that has to tell a record that has gone from one that is damaged
-    /// reads through this, not [`Store::read_record`], where both are "not
-    /// there".
+    /// there: an IO error, an unsupported version or a parse failure is an
+    /// error naming the file. A caller that has to tell a record that has gone
+    /// from one that is damaged reads through this.
     async fn typed_record<T: DeserializeOwned>(&self, rel: &str) -> Result<Option<T>, Error> {
         let Some(text) = self.record_text(rel).await? else {
             return Ok(None);
         };
-        serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|source| Error::Parse {
-                path: rel.into(),
-                source,
-            })
+        decode_record(rel, &text).map(Some)
     }
 
     /// One account record, `accounts/<username>/account.json`.
@@ -203,6 +205,274 @@ impl Store {
         self.typed_record(&format!("spent/{token}.json")).await
     }
 
+    /// One account page session, `sessions/<id>.json`, as written. A session is
+    /// signed by the record's own secret and is read by the same module that
+    /// wrote it, so it is text rather than a type shared across the store.
+    /// `Ok(None)` only when the file is absent.
+    pub async fn session_text(&self, id: &str) -> Result<Option<String>, Error> {
+        self.record_text(&format!("sessions/{id}.json")).await
+    }
+
+    /// One intent file as written, `intents/<file>.json`. A named intent is not
+    /// this build's to model, so its caller parses the fields it acts on.
+    pub async fn intent_text(&self, file: &str) -> Result<Option<String>, Error> {
+        self.record_text(&format!("intents/{file}")).await
+    }
+
+    /// The mail replies' record as written, `mail/replies.json`. The handler and
+    /// the drain loop over an open set of keys, so it is text.
+    pub async fn mail_replies_text(&self) -> Result<Option<String>, Error> {
+        self.record_text("mail/replies.json").await
+    }
+
+    /// A published public key's material, `keys/<localpart>.pub`. Not a JSON
+    /// record; `Ok(None)` only when the file is absent.
+    pub async fn public_key_text(&self, localpart: &str) -> Result<Option<String>, Error> {
+        self.record_text(&format!("keys/{localpart}.pub")).await
+    }
+
+    /// One group's DNS check, `groups/<domain>/dns-check.json`.
+    pub async fn dns_check_text(&self, domain: &str) -> Result<Option<String>, Error> {
+        self.record_text(&format!("groups/{domain}/dns-check.json"))
+            .await
+    }
+
+    /// The quota sweep's own record, `quota-check.json`, at the store root.
+    pub async fn quota_check_text(&self) -> Result<Option<String>, Error> {
+        self.record_text("quota-check.json").await
+    }
+
+    /// One webhook delivery the handler queued: the signature header, the raw
+    /// body, and the arrival stamp when the handler wrote one. `Ok(None)` only
+    /// when the body is absent, which is a pair an earlier iteration settled.
+    ///
+    /// A `.sig` that exists but cannot be read is an error, never an empty
+    /// signature: verification would fail and the caller would delete a genuine
+    /// delivery. A missing `.sig` and a missing `.at` are the older handler's
+    /// shapes and read as empty, as they always did.
+    pub async fn read_webhook_pair(&self, id: &str) -> Result<Option<WebhookPair>, Error> {
+        check_name(id)?;
+        let body =
+            match tokio::fs::read(self.root.join("webhooks").join(format!("{id}.body"))).await {
+                Ok(body) => body,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(source) => {
+                    return Err(Error::Io {
+                        action: Action::Read,
+                        path: format!("webhooks/{id}.body").into(),
+                        source,
+                    })
+                }
+            };
+        let signature = self
+            .record_text(&format!("webhooks/{id}.sig"))
+            .await?
+            .unwrap_or_default();
+        let received = match self.record_text(&format!("webhooks/{id}.at")).await? {
+            Some(stamp) => stamp.trim().parse::<i64>().ok(),
+            None => tokio::fs::metadata(self.root.join("webhooks").join(format!("{id}.body")))
+                .await
+                .ok()
+                .and_then(|md| md.modified().ok())
+                .map(|when| OffsetDateTime::from(when).unix_timestamp()),
+        };
+        Ok(Some(WebhookPair {
+            signature,
+            body,
+            received,
+        }))
+    }
+
+    /// Queue one Stripe delivery: the signature and the arrival before the body,
+    /// because the drain iterates `.body` files and the other order leaves a
+    /// body it would refuse and delete. 0600, handler-owned directory.
+    pub async fn write_webhook(
+        &self,
+        id: &str,
+        signature: &str,
+        received: i64,
+        body: &[u8],
+    ) -> Result<(), Error> {
+        self.ensure_dir("webhooks").await?;
+        self.write_record("webhooks", &format!("{id}.sig"), signature.as_bytes())
+            .await?;
+        self.write_record(
+            "webhooks",
+            &format!("{id}.at"),
+            received.to_string().as_bytes(),
+        )
+        .await?;
+        self.write_record("webhooks", &format!("{id}.body"), body)
+            .await
+    }
+
+    /// Remove a delivery's three files once it has settled or been refused.
+    pub async fn remove_webhook(&self, id: &str) -> Result<(), Error> {
+        check_name(id)?;
+        self.remove("webhooks", &format!("{id}.body")).await?;
+        self.remove("webhooks", &format!("{id}.sig")).await?;
+        self.remove("webhooks", &format!("{id}.at")).await
+    }
+
+    /// Read-modify-write one account under `accounts/<username>/.lock`. The
+    /// closure sees the record as it is at that moment, so a field another
+    /// writer set between this caller's own read and this call is preserved.
+    /// `None` is a name with no record; the closure may replace it or refuse.
+    pub async fn update_account<T, E>(
+        &self,
+        username: &str,
+        f: impl FnOnce(&mut Option<Account>) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<Error>,
+    {
+        check_name(username).map_err(E::from)?;
+        let _lock = self
+            .lock(&format!("accounts/{username}/.lock"))
+            .await
+            .map_err(E::from)?;
+        let mut current = self.account(username).await.map_err(E::from)?;
+        let out = f(&mut current)?;
+        if let Some(account) = current {
+            self.write_account_record(&account).await.map_err(E::from)?;
+        }
+        Ok(out)
+    }
+
+    /// Read-modify-write one group under `groups/<domain>/.lock`, with the same
+    /// rule as [`Store::update_account`].
+    pub async fn update_group<T, E>(
+        &self,
+        domain: &str,
+        f: impl FnOnce(&mut Option<GroupRecord>) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<Error>,
+    {
+        check_name(domain).map_err(E::from)?;
+        let _lock = self
+            .lock(&format!("groups/{domain}/.lock"))
+            .await
+            .map_err(E::from)?;
+        let mut current = self.group(domain).await.map_err(E::from)?;
+        let out = f(&mut current)?;
+        if let Some(group) = current {
+            self.write_group_record(&group).await.map_err(E::from)?;
+        }
+        Ok(out)
+    }
+
+    /// Read-modify-write one capsule draft under `drafts/.lock`. `Ok(None)` only
+    /// when the token names no draft. The closure returns the value to hand back
+    /// and whether its answers changed; an unchanged read (a re-asked page) is
+    /// not written, so it does not refresh the draft's retention clock.
+    pub async fn update_draft<T, E>(
+        &self,
+        token: &str,
+        f: impl FnOnce(&mut draft::Draft) -> Result<(T, bool), E>,
+    ) -> Result<Option<T>, E>
+    where
+        E: From<Error>,
+    {
+        if !is_status_token(token) {
+            return Ok(None);
+        }
+        let _lock = self.lock("drafts/.lock").await.map_err(E::from)?;
+        let Some(mut current) = draft::load(self, token).await.map_err(E::from)? else {
+            return Ok(None);
+        };
+        let (out, write) = f(&mut current)?;
+        if write {
+            draft::save_locked(self, &mut current)
+                .await
+                .map_err(E::from)?;
+        }
+        Ok(Some(out))
+    }
+
+    /// Remove every draft older than `cutoff`, holding `drafts/.lock` across the
+    /// age check, the journal line and the unlink. Returns the drafts whose
+    /// record could not be read, for the pass to report and leave in place.
+    pub async fn purge_drafts(
+        &self,
+        cutoff: OffsetDateTime,
+        journal: &journal::Journal,
+        release: &str,
+    ) -> Result<Vec<(String, Error)>, Error> {
+        let mut damaged = Vec::new();
+        for name in self.list("drafts").await? {
+            let Some(token) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let _lock = self.lock("drafts/.lock").await?;
+            let draft = match draft::load(self, token).await {
+                Ok(Some(draft)) => draft,
+                Ok(None) => continue,
+                Err(e) => {
+                    damaged.push((token.to_string(), e));
+                    continue;
+                }
+            };
+            let Ok(updated) = OffsetDateTime::parse(
+                &draft.updated_at,
+                &time::format_description::well_known::Rfc3339,
+            ) else {
+                continue;
+            };
+            if updated > cutoff {
+                continue;
+            }
+            let purge_id = format!("purge-draft-{token}");
+            let subject = ApplicationRef::application("", token);
+            if !journal.has(&purge_id, "purged") && !journal.has(&purge_id, "applying") {
+                journal
+                    .append(
+                        self,
+                        &JournalLine {
+                            version: 1,
+                            at: crate::util::filed_at(),
+                            intent: purge_id.clone(),
+                            kind: "draft".to_string(),
+                            release: release.to_string(),
+                            application: subject.clone(),
+                            outcome: "applying".to_string(),
+                            note: Some(
+                                "the draft's seven days are up; the answers are being cleared away"
+                                    .to_string(),
+                            ),
+                            review: None,
+                            credit: None,
+                        },
+                    )
+                    .await?;
+            }
+            if let Err(e) = draft::remove_locked(self, token).await {
+                damaged.push((token.to_string(), e));
+                continue;
+            }
+            if !journal.has(&purge_id, "purged") {
+                journal
+                    .append(
+                        self,
+                        &JournalLine {
+                            version: 1,
+                            at: crate::util::filed_at(),
+                            intent: purge_id,
+                            kind: "draft".to_string(),
+                            release: release.to_string(),
+                            application: subject,
+                            outcome: "purged".to_string(),
+                            note: Some("the abandoned draft answers were cleared away".to_string()),
+                            review: None,
+                            credit: None,
+                        },
+                    )
+                    .await?;
+            }
+        }
+        Ok(damaged)
+    }
+
     /// Write one record by rename: a temporary file in the same directory, then
     /// the rename, so a reader never sees half of one and a crash leaves the
     /// temporary file rather than a truncated record. The file is created 0600,
@@ -224,7 +494,7 @@ impl Store {
     /// followed, and O_NOFOLLOW is set on top as belt and braces. A stale
     /// temporary left by an interrupted run is removed first, which is safe
     /// because it can only be one this code left.
-    pub async fn write_record_owned(
+    pub(crate) async fn write_record_owned(
         &self,
         dir: &str,
         name: &str,
@@ -238,7 +508,7 @@ impl Store {
     /// record is written 0640, group `_onboard`: the handler renders the page
     /// from it and cannot be allowed to rewrite it, and a 0600 file is invisible
     /// to the process the page runs as.
-    pub async fn write_record_mode(
+    pub(crate) async fn write_record_mode(
         &self,
         dir: &str,
         name: &str,
@@ -267,6 +537,191 @@ impl Store {
             )));
         }
         self.place_record(dir, name, bytes, owner, mode).await
+    }
+
+    /// Write one account record, 0640 and owned by the `accounts/` directory's
+    /// group: the handler renders the page as `_onboard` and cannot read a
+    /// root-only file. The directory is repaired to 0750 on the way, so a store
+    /// an earlier release left at 0700 becomes readable again.
+    pub async fn write_account_record(&self, account: &Account) -> Result<(), Error> {
+        let username = account.username.as_str();
+        check_name(username)?;
+        let bytes = serde_json::to_vec_pretty(account).map_err(|source| Error::Encode {
+            what: "the account record",
+            source,
+        })?;
+        self.ensure_dir_owned(
+            &format!("accounts/{username}"),
+            0o750,
+            self.dir_owner("accounts"),
+        )
+        .await?;
+        self.write_record_mode(
+            &format!("accounts/{username}"),
+            "account.json",
+            &bytes,
+            self.dir_owner("accounts"),
+            0o640,
+        )
+        .await
+    }
+
+    /// Write one group record with the same mode, owner and repair rule.
+    pub async fn write_group_record(&self, group: &GroupRecord) -> Result<(), Error> {
+        let domain = group.domain.as_str();
+        check_name(domain)?;
+        let bytes = serde_json::to_vec_pretty(group).map_err(|source| Error::Encode {
+            what: "the group record",
+            source,
+        })?;
+        self.ensure_dir_owned(&format!("groups/{domain}"), 0o750, self.dir_owner("groups"))
+            .await?;
+        self.write_record_mode(
+            &format!("groups/{domain}"),
+            "group.json",
+            &bytes,
+            self.dir_owner("groups"),
+            0o640,
+        )
+        .await
+    }
+
+    /// Rewrite the payment block on an account's retained application copy and,
+    /// when the copy still names a filed application, on that record too. The
+    /// account record itself is the caller's, written under its own lock.
+    pub async fn write_payment_copy(&self, username: &str, payment: &Payment) -> Result<(), Error> {
+        let Some(text) = self.account_application_text(username).await? else {
+            return Ok(());
+        };
+        let mut copy: serde_json::Value =
+            serde_json::from_str(&text).map_err(|source| Error::Parse {
+                path: format!("accounts/{username}/application.json").into(),
+                source,
+            })?;
+        copy["payment"] = serde_json::to_value(payment).map_err(|source| Error::Encode {
+            what: "the payment block",
+            source,
+        })?;
+        let bytes = serde_json::to_vec_pretty(&copy).map_err(|source| Error::Encode {
+            what: "the application copy",
+            source,
+        })?;
+        self.write_application_copy(username, &bytes).await?;
+        let Some(token) = copy.get("status_token").and_then(serde_json::Value::as_str) else {
+            return Ok(());
+        };
+        // A token from a copy the unprivileged handler owns must not become a
+        // path unless it is the generated shape.
+        if !is_status_token(token) {
+            return Ok(());
+        }
+        if let Some(filed) = self.filed_application_text(token).await? {
+            // The account copy is written before the decision stamp and can be
+            // stale. Merge only the block into the shared record, so its stage,
+            // its decision and its purged answers are not replaced by the
+            // mailbox's copy.
+            let mut record: serde_json::Value =
+                serde_json::from_str(&filed).map_err(|source| Error::Parse {
+                    path: format!("applications/{token}.json").into(),
+                    source,
+                })?;
+            record["payment"] = serde_json::to_value(payment).map_err(|source| Error::Encode {
+                what: "the payment block",
+                source,
+            })?;
+            let merged = serde_json::to_vec_pretty(&record).map_err(|source| Error::Encode {
+                what: "the application record",
+                source,
+            })?;
+            self.write_filed_application(token, &merged).await?;
+        }
+        Ok(())
+    }
+
+    /// Write an account's retained application copy, inside the account purge.
+    pub async fn write_application_copy(&self, username: &str, bytes: &[u8]) -> Result<(), Error> {
+        check_name(username)?;
+        self.ensure_dir_owned(
+            &format!("accounts/{username}"),
+            0o750,
+            self.dir_owner("accounts"),
+        )
+        .await?;
+        self.write_record(&format!("accounts/{username}"), "application.json", bytes)
+            .await
+    }
+
+    /// Write a filed application, `applications/<token>.json`, handed to the
+    /// directory's owner so the handler can still render it.
+    pub async fn write_filed_application(&self, token: &str, bytes: &[u8]) -> Result<(), Error> {
+        check_name(token)?;
+        self.ensure_dir("applications").await?;
+        self.write_record_owned(
+            "applications",
+            &format!("{token}.json"),
+            bytes,
+            self.dir_owner("applications"),
+        )
+        .await
+    }
+
+    /// Write an intent file, handed to `intents/`'s owner so the handler can
+    /// read the settled intent it filed.
+    pub async fn write_intent_record(&self, file: &str, bytes: &[u8]) -> Result<(), Error> {
+        check_name(file)?;
+        self.ensure_dir("intents").await?;
+        self.write_record_owned("intents", file, bytes, self.dir_owner("intents"))
+            .await
+    }
+
+    /// Write the mail replies' record, handed to `mail/`'s owner.
+    pub async fn write_mail_replies(&self, bytes: &[u8]) -> Result<(), Error> {
+        self.ensure_dir("mail").await?;
+        self.write_record_owned("mail", "replies.json", bytes, self.dir_owner("mail"))
+            .await
+    }
+
+    /// File an application: the record the status page renders, then the intent
+    /// the drain applies. The application goes first, so the drain never sees an
+    /// intent whose application is not on disk; a failed intent removes the
+    /// half-filed application so a retry starts clean.
+    pub async fn file_application(&self, record: &Record) -> Result<(), Error> {
+        let id = ulid::Ulid::new().to_string();
+        let token = record.status_token.as_str();
+        check_name(token)?;
+        let bytes = serde_json::to_vec_pretty(record).map_err(|source| Error::Encode {
+            what: "the application",
+            source,
+        })?;
+        let intent =
+            serde_json::to_vec_pretty(&record.intent(&id)).map_err(|source| Error::Encode {
+                what: "the intent",
+                source,
+            })?;
+        self.write_filed_application(token, &bytes).await?;
+        if let Err(e) = self
+            .write_intent_record(&format!("{id}.json"), &intent)
+            .await
+        {
+            if let Err(remove) = self.remove("applications", &format!("{token}.json")).await {
+                remove.report(&format!(
+                    "the orphaned application record {token}.json stays"
+                ));
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Append one journal line under the journal's own lock. The encoder lives
+    /// here so every caller writes the same shape; the in-memory index is
+    /// [`journal::Journal`]'s.
+    pub async fn append_journal(&self, line: &JournalLine) -> Result<(), Error> {
+        let encoded = serde_json::to_string(line).map_err(|source| Error::Encode {
+            what: "a journal line",
+            source,
+        })?;
+        self.log("journal.jsonl").append(encoded.as_bytes()).await
     }
 
     /// The rename itself, for a caller that has already decided the write is
@@ -300,6 +755,12 @@ impl Store {
             opts.write(true).create_new(true).mode(mode);
             opts.custom_flags(libc::O_NOFOLLOW);
             let mut f = opts.open(&tmp).await?;
+            // `mode` above is narrowed by the process umask, and a 0640 record
+            // under umask 0077 is a record the handler cannot read. Repair it on
+            // the descriptor, as `append_mode` does, so the promised mode is
+            // exact whatever the caller's umask.
+            f.set_permissions(std::fs::Permissions::from_mode(mode))
+                .await?;
             f.write_all(bytes).await?;
             // `write_all` on a `tokio::fs::File` returns once the write is
             // handed to the blocking pool: `poll_write` answers `Ready` straight
@@ -479,6 +940,7 @@ impl Store {
         }
         let placed = async {
             let mut f = tokio::fs::OpenOptions::new()
+                .read(true)
                 .create(true)
                 .append(true)
                 .mode(mode)
@@ -493,6 +955,11 @@ impl Store {
                     p.display()
                 )));
             }
+            // A crash between a short write and its newline leaves a partial
+            // tail. A new line appended after it would otherwise be glued to
+            // the fragment and wedge every later read: complete a full JSON
+            // line, and quarantine bytes that are not one.
+            repair_tail(&mut f, &p, mode, sync).await?;
             // The mode argument above applies only at creation, and an upgrade
             // finds the file already 0600; both are corrected here.
             f.set_permissions(std::fs::Permissions::from_mode(mode))
@@ -737,15 +1204,19 @@ impl Store {
     /// empty result. A reader that reports "nothing" for a record it could not
     /// read is a check that cannot see what it is checking.
     async fn read_jsonl<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, Error> {
+        let (lines, terminated) = self.read_lines(path).await?;
+        let last = lines.len().saturating_sub(1);
         let mut out = Vec::new();
-        for (i, line) in self.read_lines(path).await?.iter().enumerate() {
-            out.push(
-                serde_json::from_str(line).map_err(|source| Error::ParseLine {
-                    path: path.into(),
-                    line: i + 1,
-                    source,
-                })?,
-            );
+        for (i, line) in lines.iter().enumerate() {
+            match decode_line(path, i, line) {
+                Ok(value) => out.push(value),
+                // A crash between a short write and its newline leaves one
+                // fragment at the end. It is not a line anyone wrote; the next
+                // append repairs it (`repair_tail`). An interior bad line is
+                // still corruption and still fails.
+                Err(_) if i == last && !terminated => break,
+                Err(e) => return Err(e),
+            }
         }
         Ok(out)
     }
@@ -758,12 +1229,14 @@ impl Store {
         path: &str,
         mut walk: impl FnMut(usize, &T) -> bool,
     ) -> Result<(), Error> {
-        for (i, line) in self.read_lines(path).await?.iter().enumerate() {
-            let value: T = serde_json::from_str(line).map_err(|source| Error::ParseLine {
-                path: path.into(),
-                line: i + 1,
-                source,
-            })?;
+        let (lines, terminated) = self.read_lines(path).await?;
+        let last = lines.len().saturating_sub(1);
+        for (i, line) in lines.iter().enumerate() {
+            let value: T = match decode_line(path, i, line) {
+                Ok(value) => value,
+                Err(_) if i == last && !terminated => break,
+                Err(e) => return Err(e),
+            };
             if !walk(i, &value) {
                 return Ok(());
             }
@@ -787,21 +1260,23 @@ impl Store {
         Ok(hit)
     }
 
-    /// The non-empty lines of a store file, as recorded. A missing file reads as
-    /// nothing; an unreadable one is an error.
-    async fn read_lines(&self, path: &str) -> Result<Vec<String>, Error> {
+    /// The record's lines and whether the file ended with a newline. The flag
+    /// is what lets a reader tell a crash-truncated tail from real corruption.
+    async fn read_lines(&self, path: &str) -> Result<(Vec<String>, bool), Error> {
         if path == "journal.jsonl" {
             self.reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let abs = self.root.join(path);
         match tokio::fs::read_to_string(&abs).await {
-            Ok(s) => Ok(s
-                .lines()
-                .map(|l| l.trim_end().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Ok(s) => Ok((
+                s.lines()
+                    .map(|l| l.trim_end().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect(),
+                s.ends_with('\n'),
+            )),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok((Vec::new(), true)),
             Err(source) => Err(Error::Io {
                 action: Action::Read,
                 path: abs,
@@ -944,8 +1419,25 @@ impl Log<'_> {
     /// The record's lines as written. For the one reader that copies a record
     /// into an artefact verbatim — the export — rather than reading it.
     pub async fn raw_lines(&self) -> Result<Vec<String>, Error> {
-        self.store.read_lines(self.path).await
+        self.store
+            .read_lines(self.path)
+            .await
+            .map(|(lines, _)| lines)
     }
+}
+
+/// One queued Stripe delivery: the `Stripe-Signature` header, the exact bytes
+/// the handler received, and when it took them.
+#[derive(Clone, Debug)]
+pub struct WebhookPair {
+    /// The header as stored. Empty only for a pair an older handler queued with
+    /// no signature file, which verification refuses.
+    pub signature: String,
+    /// The raw body, which the HMAC is computed over.
+    pub body: Vec<u8>,
+    /// The arrival stamped by the handler, or the body's mtime when no stamp
+    /// exists.
+    pub received: Option<i64>,
 }
 
 /// A key as the store carries it: the fingerprint computed here over the
@@ -1178,6 +1670,100 @@ fn crockford128(bytes: [u8; 16]) -> String {
         out.push(A[((v >> (5 * i)) & 31) as usize] as char);
     }
     out
+}
+
+/// Decode one whole record, refusing a `version` this build does not read
+/// before its fields are trusted. Version 1 is what is on disk.
+fn decode_record<T: DeserializeOwned>(rel: &str, text: &str) -> Result<T, Error> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|source| Error::Parse {
+        path: rel.into(),
+        source,
+    })?;
+    check_version(rel, &value)?;
+    serde_json::from_value(value).map_err(|source| Error::Parse {
+        path: rel.into(),
+        source,
+    })
+}
+
+/// Decode one line of an append-only record with the same version rule.
+fn decode_line<T: DeserializeOwned>(path: &str, index: usize, line: &str) -> Result<T, Error> {
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|source| Error::ParseLine {
+            path: path.into(),
+            line: index + 1,
+            source,
+        })?;
+    check_version(&format!("{path} line {}", index + 1), &value)?;
+    serde_json::from_value(value).map_err(|source| Error::ParseLine {
+        path: path.into(),
+        line: index + 1,
+        source,
+    })
+}
+
+/// A record whose `version` says it was written by a schema this build does not
+/// read is refused, not guessed at. The field is checked where every typed read
+/// passes, so a new record type cannot be added without inheriting the rule.
+fn check_version(rel: &str, value: &serde_json::Value) -> Result<(), Error> {
+    const SUPPORTED: u64 = 1;
+    let Some(version) = value.get("version") else {
+        return Ok(());
+    };
+    if version.as_u64() != Some(SUPPORTED) {
+        return Err(Error::Refused(format!(
+            "{rel} is version {version}; this build reads version {SUPPORTED}"
+        )));
+    }
+    Ok(())
+}
+
+/// Make an append-only record end at a line boundary. A crash between a short
+/// write and its newline leaves a fragment: a complete JSON value is completed
+/// with the newline it lost, anything else is quarantined to `<path>.bad` and
+/// removed, so the next append cannot glue a valid line onto it and wedge every
+/// later read.
+async fn repair_tail(
+    f: &mut tokio::fs::File,
+    path: &std::path::Path,
+    mode: u32,
+    sync: bool,
+) -> std::io::Result<()> {
+    let len = f.metadata().await?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    f.seek(std::io::SeekFrom::End(-1)).await?;
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last).await?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    let mut all = Vec::new();
+    f.seek(std::io::SeekFrom::Start(0)).await?;
+    f.read_to_end(&mut all).await?;
+    let start = all.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let tail = &all[start..];
+    if serde_json::from_slice::<serde_json::Value>(tail).is_ok() {
+        f.write_all(b"\n").await?;
+    } else {
+        let mut bad = path.as_os_str().to_os_string();
+        bad.push(".bad");
+        let mut q = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(mode)
+            .open(&bad)
+            .await?;
+        q.write_all(tail).await?;
+        q.write_all(b"\n").await?;
+        q.flush().await?;
+        if sync {
+            q.sync_all().await?;
+        }
+        f.set_len(start as u64).await?;
+    }
+    Ok(())
 }
 
 /// A record name is one component inside its directory. A name carrying a
@@ -2432,8 +3018,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .read_record("accounts/alice", "account.json")
+                .record_text("accounts/alice/account.json")
                 .await
+                .unwrap()
                 .as_deref(),
             Some("{}")
         );
@@ -2451,8 +3038,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .read_record("applications", "tok.json")
+                .record_text("applications/tok.json")
                 .await
+                .unwrap()
                 .as_deref(),
             Some("{\"a\":1}")
         );
@@ -2534,8 +3122,9 @@ mod tests {
     async fn a_missing_record_is_none_not_an_error() {
         let store = Store::new("/tmp");
         assert!(store
-            .read_record("applications", "nope.json")
+            .record_text("applications/nope.json")
             .await
+            .unwrap()
             .is_none());
     }
 
@@ -2941,6 +3530,256 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An account a test can start from: the v1 shape already on disk.
+    fn v1_account(username: &str) -> Account {
+        serde_json::from_str(&format!(
+            r#"{{"version": 1, "username": "{username}", "state": "active",
+                "decision": "approve", "decided_at": "2026-10-01T09:00:00Z",
+                "rail": "no_charge", "no_charge": true,
+                "created_at": "2026-10-01T09:00:00Z"}}"#
+        ))
+        .unwrap()
+    }
+
+    /// Restores the process umask when it drops. The umask is process-wide, so
+    /// this guard keeps a 0077 test from leaking into its neighbours.
+    struct Umask(libc::mode_t);
+
+    impl Umask {
+        fn set(mode: libc::mode_t) -> Umask {
+            Umask(unsafe { libc::umask(mode) })
+        }
+    }
+
+    impl Drop for Umask {
+        fn drop(&mut self) {
+            unsafe {
+                libc::umask(self.0);
+            }
+        }
+    }
+
+    /// Two writers on one account each change a different field. The lock makes
+    /// them serial, so neither field is lost; without it the later write
+    /// publishes the earlier read and drops the other writer's change (#875).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_update_account_writers_preserve_both_fields() {
+        let dir =
+            std::env::temp_dir().join(format!("control-update-account-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.to_str().unwrap());
+        store
+            .update_account("alice", |current| {
+                *current = Some(v1_account("alice"));
+                Ok::<(), Error>(())
+            })
+            .await
+            .unwrap();
+
+        let root = dir.to_str().unwrap().to_string();
+        let (holding, held) = std::sync::mpsc::channel();
+        let first_root = root.clone();
+        let first = std::thread::spawn(move || {
+            let store = Store::new(&first_root);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(store.update_account("alice", move |current| {
+                let account = current.as_mut().unwrap();
+                account.notice_stopped = Some(NoticeStop {
+                    address: "alice@example.invalid".to_string(),
+                    status: "5.1.1".to_string(),
+                    at: "2026-11-01T09:00:00Z".to_string(),
+                });
+                // Tell the other writer we hold the record, then keep holding it
+                // long enough for it to reach the lock. Without the lock it reads
+                // and writes in this window and the latch below is lost.
+                holding.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                Ok::<(), Error>(())
+            }))
+        });
+        let second = std::thread::spawn(move || {
+            held.recv().unwrap();
+            let store = Store::new(&root);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(store.update_account("alice", |current| {
+                current.as_mut().unwrap().state = "suspended".to_string();
+                Ok::<(), Error>(())
+            }))
+        });
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+
+        let account = store.account("alice").await.unwrap().unwrap();
+        assert!(
+            account.notice_stopped.is_some(),
+            "the bounce latch was dropped by the other writer"
+        );
+        assert_eq!(account.state, "suspended", "the suspension was dropped");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A promised 0640 is exact whatever the caller's umask (#883): under 0077
+    /// the open-time mode alone would land as 0600 and hide the record from the
+    /// handler.
+    #[tokio::test]
+    async fn an_account_record_is_exactly_0640_under_umask_0077() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("control-umask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("accounts")).unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+        let _umask = Umask::set(0o077);
+        store
+            .write_account_record(&v1_account("alice"))
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(dir.join("accounts/alice/account.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "record mode is {mode:o}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn journal_line(intent: &str) -> JournalLine {
+        JournalLine {
+            version: 1,
+            at: "2026-11-01T09:00:00Z".to_string(),
+            intent: intent.to_string(),
+            kind: "approve".to_string(),
+            release: "test".to_string(),
+            application: ApplicationRef::account("alice"),
+            outcome: "applied".to_string(),
+            note: None,
+            review: None,
+            credit: None,
+        }
+    }
+
+    /// A crash between a short write and its newline leaves one fragment. The
+    /// journal loads without it instead of wedging every later pass (#911).
+    #[tokio::test]
+    async fn a_truncated_journal_tail_does_not_wedge_startup() {
+        let dir = std::env::temp_dir().join(format!("control-journal-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.to_str().unwrap());
+        store.append_journal(&journal_line("01H")).await.unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("journal.jsonl"))
+                .unwrap();
+            f.write_all(br#"{"version":1,"at":"#).unwrap();
+        }
+        let journal = journal::Journal::load(&store).await.unwrap();
+        assert!(
+            journal.has("01H", "applied"),
+            "the complete line before the fragment is lost"
+        );
+        // The next append repairs the tail instead of gluing a line onto it.
+        store.append_journal(&journal_line("02H")).await.unwrap();
+        let journal = journal::Journal::load(&store).await.unwrap();
+        assert!(journal.has("02H", "applied"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The sweep cannot unlink a draft while another writer holds the draft
+    /// lock, so its age check and its remove are one step (#912).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn purge_drafts_holds_the_draft_lock_across_check_and_unlink() {
+        let dir = std::env::temp_dir().join(format!("control-purge-drafts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("drafts")).unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+        let token = "abcdefghjkmnpqrstvwxyz0123";
+        let mut draft = draft::Draft::new(token.to_string());
+        draft.updated_at = "2020-01-01T00:00:00Z".to_string();
+        std::fs::write(
+            dir.join(format!("drafts/{token}.json")),
+            serde_json::to_vec(&draft).unwrap(),
+        )
+        .unwrap();
+
+        let held = store.lock("drafts/.lock").await.unwrap();
+        let root = dir.to_str().unwrap().to_string();
+        let sweep = std::thread::spawn(move || {
+            let store = Store::new(&root);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let journal = journal::Journal::load(&store).await.unwrap();
+                let cutoff =
+                    OffsetDateTime::now_utc() - time::Duration::days(draft::RETENTION_DAYS);
+                store.purge_drafts(cutoff, &journal, "test").await
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            dir.join(format!("drafts/{token}.json")).exists(),
+            "the sweep removed a draft without the draft lock"
+        );
+        drop(held);
+        sweep.join().unwrap().unwrap();
+        assert!(!dir.join(format!("drafts/{token}.json")).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A signature that exists but cannot be read is an error, not an empty
+    /// signature: the caller keeps the body for the next pass (#931).
+    #[tokio::test]
+    async fn an_unreadable_webhook_signature_is_an_error_and_leaves_the_body() {
+        let dir = std::env::temp_dir().join(format!("control-webhook-sig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("webhooks/01J.sig")).unwrap();
+        std::fs::write(dir.join("webhooks/01J.body"), b"{}").unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+        store
+            .read_webhook_pair("01J")
+            .await
+            .expect_err("an unreadable signature must not read as empty");
+        assert!(
+            dir.join("webhooks/01J.body").exists(),
+            "the body was removed on a transient signature read"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A record from a schema this build does not read fails closed, rather than
+    /// having its unknown fields ignored or guessed at.
+    #[tokio::test]
+    async fn an_unsupported_record_version_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("control-version-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("accounts/alice")).unwrap();
+        let mut value = serde_json::to_value(v1_account("alice")).unwrap();
+        value["version"] = serde_json::json!(2);
+        std::fs::write(
+            dir.join("accounts/alice/account.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+        let err = store
+            .account("alice")
+            .await
+            .expect_err("version 2 must not read as version 1");
+        assert!(
+            matches!(&err, Error::Refused(message) if message.contains("version 2")),
+            "{err}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -184,103 +184,107 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
     // One lock around the read and every write: the drain files a mailed key
     // into this same record as root, and two unsynchronised read-modify-writes
     // would lose one of them.
-    let _lock = match app.store.lock("drafts/.lock").await {
-        Ok(lock) => lock,
-        Err(e) => return respond(&Error::from(e), FrontEnd::Gemini),
-    };
-    let mut record = match draft::load(&app.store, token).await {
-        Ok(Some(d)) => d,
+    let step = match app
+        .store
+        .update_draft(token, |record| {
+            let path = flow_path(&app.questions, &record.answers);
+            if record.cursor >= path.len() {
+                return Ok((Step::File(record.clone()), false));
+            }
+            if page != record.cursor + 1 {
+                return Ok((Step::Redirect(record.cursor + 1), false));
+            }
+            // A key mailed to apply@ is filed against this draft by the drain.
+            // When the flow reaches that page, it is already answered: advance
+            // past every such page rather than asking for a key already sent.
+            if capsule_skip_mailed(&path, record) {
+                if record.cursor >= path.len() {
+                    return Ok((Step::File(record.clone()), true));
+                }
+                return Ok((Step::Redirect(record.cursor + 1), true));
+            }
+
+            let index = record.cursor;
+            let page = &path[index];
+            let q = page.q;
+            if incoming.query.is_empty() {
+                let meta = capsule_meta(page, index, path.len(), token, None);
+                return Ok((Step::Ask(meta), false));
+            }
+
+            let value = capsule_value(&incoming.query);
+            let value = match q.kind {
+                Kind::YesNo | Kind::Acceptance => value.to_ascii_lowercase(),
+                _ => value,
+            };
+            if let Some(why) =
+                flow_problem(page, &value, &app.reserved, q.required, &record.answers)
+            {
+                let meta = capsule_meta(page, index, path.len(), token, Some(&why));
+                return Ok((Step::Ask(meta), false));
+            }
+            match &page.mailbox {
+                Some(mailbox) => {
+                    let address = if mailbox.address.is_empty() {
+                        mailbox.name.clone()
+                    } else {
+                        mailbox.address.clone()
+                    };
+                    record.mail_keys.retain(|k| k.mailbox != mailbox.name);
+                    record.mail_keys.push(keycheck::mail_key(
+                        mailbox.name.clone(),
+                        &address,
+                        &value,
+                    ));
+                }
+                None => {
+                    record.answers.insert(q.id.clone(), value);
+                }
+            }
+            record.cursor = index + 1;
+
+            // The body's two line lists are checked together, because the fault
+            // is the count rather than either list. Re-ask the page just
+            // answered, so the applicant can correct it; nothing is saved until
+            // the pair agrees.
+            if q.id == "body_account_names"
+                && record.answers.get("whose").map(String::as_str) == Some("body")
+                && record.answers.contains_key("body_addresses")
+            {
+                let mut errors = Vec::new();
+                body_cross_checks(&record.answers, &mut errors);
+                if !errors.is_empty() {
+                    record.cursor = index;
+                    let why = errors.join(" ");
+                    let meta = capsule_meta(page, index, path.len(), token, Some(&why));
+                    return Ok((Step::Ask(meta), false));
+                }
+            }
+
+            let next = flow_path(&app.questions, &record.answers);
+            if record.cursor >= next.len() {
+                return Ok((Step::File(record.clone()), false));
+            }
+            Ok::<_, kyriakon_control_core::Error>((Step::Redirect(record.cursor + 1), true))
+        })
+        .await
+    {
+        Ok(Some(step)) => step,
         Ok(None) => return capsule_not_found(),
         Err(e) => return respond(&Error::from(e), FrontEnd::Gemini),
     };
-    let path = flow_path(&app.questions, &record.answers);
-    if record.cursor >= path.len() {
-        return capsule_file(app, &record).await;
+    match step {
+        Step::File(record) => capsule_file(app, &record).await,
+        Step::Redirect(page) => capsule_redirect(token, page),
+        Step::Ask(meta) => Reply::gemini(10, &meta, String::new()),
     }
-    if page != record.cursor + 1 {
-        return capsule_redirect(token, record.cursor + 1);
-    }
-    // A key mailed to apply@ is filed against this draft by the drain. When the
-    // flow reaches that page, it is already answered: advance past every such
-    // page rather than asking for a key the applicant has sent.
-    if capsule_skip_mailed(&path, &mut record) {
-        if let Err(e) = draft::save(&app.store, &mut record).await {
-            return respond(&Error::from(e), FrontEnd::Gemini);
-        }
-        if record.cursor >= path.len() {
-            return capsule_file(app, &record).await;
-        }
-        return capsule_redirect(token, record.cursor + 1);
-    }
+}
 
-    let index = record.cursor;
-    let page = &path[index];
-    let q = page.q;
-    if incoming.query.is_empty() {
-        return Reply::gemini(
-            10,
-            &capsule_meta(page, index, path.len(), token, None),
-            String::new(),
-        );
-    }
-
-    let value = capsule_value(&incoming.query);
-    let value = match q.kind {
-        Kind::YesNo | Kind::Acceptance => value.to_ascii_lowercase(),
-        _ => value,
-    };
-    if let Some(why) = flow_problem(page, &value, &app.reserved, q.required, &record.answers) {
-        return Reply::gemini(
-            10,
-            &capsule_meta(page, index, path.len(), token, Some(&why)),
-            String::new(),
-        );
-    }
-    match &page.mailbox {
-        Some(mailbox) => {
-            let address = if mailbox.address.is_empty() {
-                mailbox.name.clone()
-            } else {
-                mailbox.address.clone()
-            };
-            record.mail_keys.retain(|k| k.mailbox != mailbox.name);
-            record
-                .mail_keys
-                .push(keycheck::mail_key(mailbox.name.clone(), &address, &value));
-        }
-        None => {
-            record.answers.insert(q.id.clone(), value);
-        }
-    }
-    record.cursor = index + 1;
-
-    // The body's two line lists are checked together, because the fault is the
-    // count rather than either list. Re-ask the page just answered, so the
-    // applicant can correct it; nothing is saved until the pair agrees.
-    if q.id == "body_account_names"
-        && record.answers.get("whose").map(String::as_str) == Some("body")
-        && record.answers.contains_key("body_addresses")
-    {
-        let mut errors = Vec::new();
-        body_cross_checks(&record.answers, &mut errors);
-        if !errors.is_empty() {
-            record.cursor = index;
-            return Reply::gemini(
-                10,
-                &capsule_meta(page, index, path.len(), token, Some(&errors.join(" "))),
-                String::new(),
-            );
-        }
-    }
-
-    let next = flow_path(&app.questions, &record.answers);
-    if record.cursor >= next.len() {
-        return capsule_file(app, &record).await;
-    }
-    if let Err(e) = draft::save(&app.store, &mut record).await {
-        return respond(&Error::from(e), FrontEnd::Gemini);
-    }
-    capsule_redirect(token, record.cursor + 1)
+/// What one capsule answer decided, once the draft is out of the closure.
+enum Step {
+    File(draft::Draft),
+    Redirect(usize),
+    Ask(String),
 }
 
 /// Advance the cursor past key pages whose mailbox already holds a key, which

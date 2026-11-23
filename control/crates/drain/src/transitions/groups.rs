@@ -391,7 +391,7 @@ pub async fn provision_group(
             _ => intent.payment.stripe.clone(),
         },
     };
-    let group = GroupRecord {
+    let mut group = GroupRecord {
         version: 1,
         domain: intent.domain.clone(),
         name: intent.name.clone(),
@@ -407,7 +407,22 @@ pub async fn provision_group(
             .filter(|stamp| !stamp.is_empty())
             .unwrap_or_else(|| now.clone()),
     };
-    write_group_record(store, &group).await?;
+    let domain = group.domain.clone();
+    store
+        .update_group(&domain, move |current| {
+            // A later pass may have added a mailbox this record was built
+            // before; the intent does not own the whole list.
+            if let Some(existing) = current {
+                for mailbox in &existing.accounts {
+                    if !group.accounts.contains(mailbox) {
+                        group.accounts.push(mailbox.clone());
+                    }
+                }
+            }
+            *current = Some(group);
+            Ok::<(), Error>(())
+        })
+        .await?;
 
     let app_copy = application_copy(
         store,
@@ -570,18 +585,7 @@ async fn write_group_application(
         return Ok(());
     };
     store
-        .ensure_dir_owned(
-            &format!("accounts/{mailbox}"),
-            0o750,
-            store.dir_owner("accounts"),
-        )
-        .await?;
-    store
-        .write_record(
-            &format!("accounts/{mailbox}"),
-            "application.json",
-            copy.as_bytes(),
-        )
+        .write_application_copy(mailbox, copy.as_bytes())
         .await
         .map_err(Error::from)
 }
@@ -600,139 +604,72 @@ async fn write_group_account(
     let now = util::filed_at();
     // A new mailbox gets its own one-time link; a retry keeps the token the
     // first pass wrote, because the mail that carries it may already have left.
-    let password_link = match existing.as_ref().and_then(|a| a.password_link.clone()) {
-        Some(link) => link,
-        None => PasswordLink::fresh().await?,
+    let fresh = match existing.as_ref().and_then(|a| a.password_link.clone()) {
+        Some(_) => None,
+        None => Some(PasswordLink::fresh().await?),
     };
-    let account = Account {
-        version: 1,
-        username: mailbox.to_string(),
-        state: "active".to_string(),
-        decision: "approve".to_string(),
-        decided_at: existing
-            .as_ref()
-            .map(|a| a.decided_at.clone())
-            .unwrap_or_else(|| now.clone()),
-        rail: if payment.no_charge {
-            "no_charge".to_string()
-        } else {
-            payment.rail.clone()
-        },
-        no_charge: payment.no_charge,
-        created_at: existing
-            .as_ref()
-            .map(|a| a.created_at.clone())
-            .unwrap_or_else(|| now.clone()),
-        // The group holds the payment state, so the mailbox's record has no
-        // block for one at all rather than a paid-until that could be mistaken
-        // for an unpaid person's.
-        payment: None,
-        legacy_payment: FlatPayment::default(),
-        outside_address: None,
-        certificates: Vec::new(),
-        site_served: None,
-        capsule_served: None,
-        space_used: None,
-        upload_keys: Vec::new(),
-        mail_key: mail_key
-            .map(|key| key.fingerprint.clone())
-            .filter(|f| !f.is_empty())
-            .or_else(|| existing.as_ref().and_then(|a| a.mail_key.clone())),
-        rotation: existing.as_ref().and_then(|a| a.rotation.clone()),
-        suspension_reason: None,
-        password_link: Some(password_link),
-        group: Some(domain.to_string()),
-        closing_until: None,
-        grace_until: None,
-        notice_stopped: None,
+    let rail = if payment.no_charge {
+        "no_charge".to_string()
+    } else {
+        payment.rail.clone()
     };
-    let bytes = serde_json::to_vec_pretty(&account).map_err(|source| Error::Json {
-        context: "encode the account",
-        source,
-    })?;
+    let no_charge = payment.no_charge;
+    let fingerprint = mail_key
+        .map(|key| key.fingerprint.clone())
+        .filter(|f| !f.is_empty());
+    let domain = domain.to_string();
     store
-        .ensure_dir_owned(
-            &format!("accounts/{mailbox}"),
-            0o750,
-            store.dir_owner("accounts"),
-        )
-        .await?;
-    write_account_record(store, mailbox, &bytes).await
-}
-
-/// Write one group's record. The caller owns the directory name, which is the
-/// validated domain, so a record can never land outside `groups/`.
-pub(super) async fn write_group_record(store: &Store, group: &GroupRecord) -> Result<(), Error> {
-    let bytes = serde_json::to_vec_pretty(group).map_err(|source| Error::Json {
-        context: "encode the group record",
-        source,
-    })?;
-    store
-        .ensure_dir_owned(
-            &format!("groups/{}", group.domain),
-            0o750,
-            store.dir_owner("groups"),
-        )
-        .await?;
-    write_group_state(store, &group.domain, &bytes).await
-}
-
-/// Write one account's record, readable by the handler and not writable by it.
-/// The page is rendered by `_onboard`, which cannot read a 0600 root file, and
-/// the record holds no secret: the group's token stays in `tokens/` and the
-/// ledger. The directory's own group is the owner, so the deploy's modes are
-/// what decide who can read it rather than a second list here.
-pub async fn write_account_record(
-    store: &Store,
-    username: &str,
-    bytes: &[u8],
-) -> Result<(), Error> {
-    // The repair lives here, not only at creation: a directory an earlier build
-    // left at 0700 must become readable on the next record write.
-    store
-        .ensure_dir_owned(
-            &format!("accounts/{username}"),
-            0o750,
-            store.dir_owner("accounts"),
-        )
-        .await?;
-    store
-        .write_record_mode(
-            &format!("accounts/{username}"),
-            "account.json",
-            bytes,
-            store.dir_owner("accounts"),
-            0o640,
-        )
+        .update_account(mailbox, move |current| {
+            let existing = current.as_ref();
+            let Some(password_link) = existing
+                .and_then(|a| a.password_link.clone())
+                .or_else(|| fresh.clone())
+            else {
+                // The record was purged between this pass's read and its lock,
+                // and there is no link to carry over. The next pass remakes it.
+                return Err(Error::Failed(format!(
+                    "{mailbox} went while its group mailbox was being written"
+                )));
+            };
+            let account = Account {
+                version: 1,
+                username: mailbox.to_string(),
+                state: "active".to_string(),
+                decision: "approve".to_string(),
+                decided_at: existing
+                    .map(|a| a.decided_at.clone())
+                    .unwrap_or_else(|| now.clone()),
+                rail: rail.clone(),
+                no_charge,
+                created_at: existing
+                    .map(|a| a.created_at.clone())
+                    .unwrap_or_else(|| now.clone()),
+                // The group holds the payment state, so the mailbox's record has
+                // no block for one at all rather than a paid-until that could be
+                // mistaken for an unpaid person's.
+                payment: None,
+                legacy_payment: FlatPayment::default(),
+                outside_address: None,
+                certificates: Vec::new(),
+                site_served: None,
+                capsule_served: None,
+                space_used: None,
+                upload_keys: Vec::new(),
+                mail_key: fingerprint
+                    .clone()
+                    .or_else(|| existing.and_then(|a| a.mail_key.clone())),
+                rotation: existing.and_then(|a| a.rotation.clone()),
+                suspension_reason: None,
+                password_link: Some(password_link),
+                group: Some(domain.clone()),
+                closing_until: None,
+                grace_until: None,
+                notice_stopped: None,
+            };
+            *current = Some(account);
+            Ok::<(), Error>(())
+        })
         .await
-        .map_err(Error::from)
-}
-
-/// The same for a group's record, for the same reason: the account page of any
-/// mailbox in the group reads it, and a root-only 0600 file would leave the
-/// billing block blank.
-pub(super) async fn write_group_state(
-    store: &Store,
-    domain: &str,
-    bytes: &[u8],
-) -> Result<(), Error> {
-    store
-        .ensure_dir_owned(
-            &format!("groups/{domain}"),
-            0o750,
-            store.dir_owner("groups"),
-        )
-        .await?;
-    store
-        .write_record_mode(
-            &format!("groups/{domain}"),
-            "group.json",
-            bytes,
-            store.dir_owner("groups"),
-            0o640,
-        )
-        .await
-        .map_err(Error::from)
 }
 
 /// The lock every writer of a mail table holds: a `<table>.lock` directory with
@@ -1497,7 +1434,16 @@ pub async fn group_address(
             // tells a retry that an account on the box is this group's.
             if !in_group(&intent.mailbox) {
                 group.accounts.push(intent.mailbox.clone());
-                write_group_record(store, &group).await?;
+                store
+                    .update_group(&intent.domain, |current| {
+                        if let Some(current) = current {
+                            if !current.accounts.iter().any(|a| a == &intent.mailbox) {
+                                current.accounts.push(intent.mailbox.clone());
+                            }
+                        }
+                        Ok::<(), Error>(())
+                    })
+                    .await?;
             }
             let key = address_key(&intent)?;
             ensure_table_line(&cfg.virtuals, &entry, Some(&intent.mailbox))?;
@@ -1521,7 +1467,16 @@ pub async fn group_address(
         "upgrade" => {
             if !in_group(&intent.mailbox) {
                 group.accounts.push(intent.mailbox.clone());
-                write_group_record(store, &group).await?;
+                store
+                    .update_group(&intent.domain, |current| {
+                        if let Some(current) = current {
+                            if !current.accounts.iter().any(|a| a == &intent.mailbox) {
+                                current.accounts.push(intent.mailbox.clone());
+                            }
+                        }
+                        Ok::<(), Error>(())
+                    })
+                    .await?;
             }
             let key = address_key(&intent)?;
             publish_mail_keys(cfg, &intent.mailbox, std::slice::from_ref(&key)).await?;
@@ -1593,11 +1548,7 @@ pub async fn group_address(
                 // do next, because the handover gives them none. One who
                 // already has a key needs nothing. The fixed subject is the
                 // dedupe: a retry after a failed enqueue sends the one copy.
-                if store
-                    .read_record("keys", &format!("{replacement}.pub"))
-                    .await
-                    .is_none()
-                {
+                if store.public_key_text(replacement).await?.is_none() {
                     let to = dns_contact(store, &group).await?;
                     let subject = format!("You now own {}", intent.domain);
                     let body = format!(
@@ -1620,7 +1571,14 @@ pub async fn group_address(
                 }
             }
             group.accounts.retain(|a| a != &intent.mailbox);
-            write_group_record(store, &group).await?;
+            store
+                .update_group(&intent.domain, |current| {
+                    if let Some(current) = current {
+                        current.accounts.retain(|a| a != &intent.mailbox);
+                    }
+                    Ok::<(), Error>(())
+                })
+                .await?;
             let routes_changed = remove_addresses(&cfg.virtuals, &intent.domain, &intent.mailbox)?;
             // The sender identities go with the routes: an address left on the
             // mailbox's line after it has gone still lets it submit.
