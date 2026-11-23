@@ -706,6 +706,35 @@ test_sibling_sigchld(const char *fake)
 	(void)sigaction(SIGCHLD, &previous, NULL);
 }
 
+/* A host that ignores SIGCHLD must not hand that disposition to the encryptor:
+ * its own gpg child would be auto-reaped and waitpid would fail with ECHILD
+ * (#938). The fake forks and waits, as the real CLI does. */
+static void
+test_grandchild_with_ignored_sigchld(const char *fake)
+{
+	struct sigaction ignore, previous;
+	struct kyriakon_encrypt_result result;
+	unsigned char input[16];
+	bool ok;
+
+	memset(input, 'x', sizeof(input));
+	memset(&ignore, 0, sizeof(ignore));
+	ignore.sa_handler = SIG_IGN;
+	sigemptyset(&ignore.sa_mask);
+	if (sigaction(SIGCHLD, &ignore, &previous) < 0) {
+		expect(false, "the test can ignore SIGCHLD");
+		return;
+	}
+	mode("grandchild");
+	ok = kyriakon_encrypt_message(fake, "alice", "/keyring", "/gpg", input,
+				      sizeof(input), &result);
+	mode(NULL);
+	(void)sigaction(SIGCHLD, &previous, NULL);
+	expect(ok, "the encryptor waits for its own child under an ignored SIGCHLD");
+	if (ok)
+		free(result.ciphertext);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -815,6 +844,7 @@ main(int argc, char **argv)
 	test_stalled_child_timeout(fake);
 	test_child_inherited_fds(fake);
 	test_sibling_sigchld(fake);
+	test_grandchild_with_ignored_sigchld(fake);
 
 	free(input);
 	if (failures != 0)

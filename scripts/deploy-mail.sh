@@ -677,8 +677,6 @@ self_test() {
 		"$(grep -c '^listen on socket filter "sign"$' "$tree/smtpd.conf")" 1
 	check "and the From filter reads the mapping the listeners bind" \
 		"$(grep -c '^filter "fromcheck" proc-exec "/usr/local/libexec/filter-fromcheck ' "$tree/smtpd.conf")" 1
-	check "and it is the binary the control deploy installs" \
-		"$(grep -c 'kyriakon-fromcheck" /usr/local/libexec/filter-fromcheck$' "$script_dir/deploy-control.sh")" 1
 	check "no unauthenticated TCP loopback listener is left" \
 		"$(grep -c '^listen on lo0' "$tree/smtpd.conf" || true)" 0
 

@@ -27,8 +27,10 @@ fuzz_target!(|data: &[u8]| {
     for line in data.split(|byte| *byte == b'\n') {
         let mut message = b"filter|0.7|1|smtp-in|data-line|sid|t|".to_vec();
         message.extend_from_slice(line);
-        let answer = filter.handle(&message);
-        assert!(answer.starts_with(b"filter-dataline|sid|t|"));
+        let mut expected = b"filter-dataline|sid|t|".to_vec();
+        expected.extend_from_slice(line);
+        expected.push(b'\n');
+        assert_eq!(filter.handle(&message), expected);
     }
     let _ = filter.handle(b"filter|0.7|9|smtp-in|commit|sid|t");
 });

@@ -73,6 +73,16 @@ struct Session {
     transaction: Transaction,
 }
 
+impl Session {
+    fn new(local: bool) -> Self {
+        Self {
+            local,
+            transaction: Transaction::new(),
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Default)]
 struct Transaction {
     in_headers: bool,
@@ -205,14 +215,7 @@ impl Filter {
                 let _auth = params.next();
                 let source = params.next().unwrap_or(b"");
                 let local = source == b"local" || source.starts_with(b"unix:");
-                self.sessions.insert(
-                    session.to_vec(),
-                    Session {
-                        transaction: Transaction::new(),
-                        local,
-                        ..Session::default()
-                    },
-                );
+                self.sessions.insert(session.to_vec(), Session::new(local));
             }
             b"link-auth" => {
                 let mut params = rest.splitn(2, |byte| *byte == b'|');
@@ -221,10 +224,7 @@ impl Filter {
                 let entry = self
                     .sessions
                     .entry(session.to_vec())
-                    .or_insert_with(|| Session {
-                        transaction: Transaction::new(),
-                        ..Session::default()
-                    });
+                    .or_insert_with(|| Session::new(false));
                 entry.user = (result == b"pass" && !user.is_empty()).then(|| user.to_vec());
             }
             b"link-disconnect" => {
@@ -389,6 +389,7 @@ enum AtScan {
 fn has_at_outside_cfws(value: &[u8]) -> AtScan {
     let mut index = 0;
     let mut quoted = false;
+    let mut angle = false;
     let mut depth = 0usize;
     while index < value.len() {
         let byte = value[index];
@@ -418,12 +419,16 @@ fn has_at_outside_cfws(value: &[u8]) -> AtScan {
         match byte {
             b'(' => depth = 1,
             b'"' => quoted = true,
+            b'<' if angle => return AtScan::Unbalanced,
+            b'<' => angle = true,
+            b'>' if !angle => return AtScan::Unbalanced,
+            b'>' => angle = false,
             b'@' => return AtScan::Has,
             _ => {}
         }
         index += 1;
     }
-    if quoted || depth > 0 {
+    if quoted || angle || depth > 0 {
         AtScan::Unbalanced
     } else {
         AtScan::None
@@ -626,6 +631,8 @@ mod tests {
         assert!(enqueued("root (Cron Daemon)").ends_with("|proceed"));
         assert!(enqueued("root").ends_with("|proceed"));
         assert!(enqueued("root@mail.kyriakon.net").ends_with("|proceed"));
+        assert!(enqueued("<alice").contains("not a valid address list"));
+        assert!(enqueued("alice>").contains("not a valid address list"));
         assert!(enqueued("secretary@parish.example").contains("550 5.7.1 secretary@parish.example"));
         assert!(enqueued("x@evil.example (x <hello@kyriakon.net>)")
             .contains("550 5.7.1 x@evil.example"));

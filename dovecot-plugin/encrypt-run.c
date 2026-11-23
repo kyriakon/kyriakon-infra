@@ -52,6 +52,28 @@ remaining_ms(long long deadline)
 	return (int)left;
 }
 
+/* Wait until fd is ready for `events`. 1 is ready, 0 is the deadline, -1 is
+ * an error with errno set. */
+static int
+wait_ready(int fd, short events, long long deadline)
+{
+	for (;;) {
+		struct pollfd pollfd;
+		int left = remaining_ms(deadline);
+		int ret;
+
+		if (left == 0)
+			return 0;
+		pollfd.fd = fd;
+		pollfd.events = events;
+		pollfd.revents = 0;
+		ret = poll(&pollfd, 1, left);
+		if (ret < 0 && errno == EINTR)
+			continue;
+		return ret;
+	}
+}
+
 static void
 set_cloexec(int fd)
 {
@@ -111,7 +133,6 @@ write_all(int fd, const unsigned char *data, size_t size, int *error_r,
 
 	for (;;) {
 		ssize_t ret;
-		struct pollfd pollfd;
 
 		if (offset == size)
 			break;
@@ -123,25 +144,14 @@ write_all(int fd, const unsigned char *data, size_t size, int *error_r,
 		if (ret < 0 && errno == EINTR)
 			continue;
 		if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			int left = remaining_ms(deadline);
+			int ready = wait_ready(fd, POLLOUT, deadline);
 
-			if (left == 0) {
+			if (ready == 0) {
 				*timed_out = true;
 				*error_r = ETIMEDOUT;
 				break;
 			}
-			pollfd.fd = fd;
-			pollfd.events = POLLOUT;
-			pollfd.revents = 0;
-			ret = poll(&pollfd, 1, left);
-			if (ret < 0 && errno == EINTR)
-				continue;
-			if (ret == 0) {
-				*timed_out = true;
-				*error_r = ETIMEDOUT;
-				break;
-			}
-			if (ret < 0) {
+			if (ready < 0) {
 				*error_r = errno;
 				break;
 			}
@@ -172,7 +182,6 @@ read_all(int fd, unsigned char **data_r, size_t *size_r, int *error_r,
 	}
 	for (;;) {
 		ssize_t ret;
-		struct pollfd pollfd;
 
 		if (size == capacity) {
 			unsigned char *grown = realloc(data, capacity * 2);
@@ -193,27 +202,15 @@ read_all(int fd, unsigned char **data_r, size_t *size_r, int *error_r,
 		if (ret < 0 && errno == EINTR)
 			continue;
 		if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			int left = remaining_ms(deadline);
+			int ready = wait_ready(fd, POLLIN, deadline);
 
-			if (left == 0) {
+			if (ready == 0) {
 				*timed_out = true;
 				*error_r = ETIMEDOUT;
 				free(data);
 				return false;
 			}
-			pollfd.fd = fd;
-			pollfd.events = POLLIN;
-			pollfd.revents = 0;
-			ret = poll(&pollfd, 1, left);
-			if (ret < 0 && errno == EINTR)
-				continue;
-			if (ret == 0) {
-				*timed_out = true;
-				*error_r = ETIMEDOUT;
-				free(data);
-				return false;
-			}
-			if (ret < 0) {
+			if (ready < 0) {
 				*error_r = errno;
 				free(data);
 				return false;
@@ -262,18 +259,24 @@ wait_child(pid_t pid, int *status, long long deadline, bool *timed_out,
 	}
 }
 
-/* The child's side of the handoff. */
+/* The child's side of the handoff. exec resets a caught handler to default but
+ * preserves SIG_IGN, and an ignored SIGCHLD makes the encryptor's own children
+ * auto-reaped: gpg's wait then fails with ECHILD. Force the default here,
+ * whatever the mail process had, so the CLI can wait for its own child. */
 static void
-child_setup(int to_child_read, int from_child_write, bool restore_disposition,
-	    const struct sigaction *previous, bool restore_mask,
+child_setup(int to_child_read, int from_child_write, bool restore_mask,
 	    const sigset_t *mask)
 {
+	struct sigaction chld_default;
+
 	if (dup2(to_child_read, STDIN_FILENO) < 0 ||
 	    dup2(from_child_write, STDOUT_FILENO) < 0)
 		_exit(127);
 	close_extra_fds();
-	if (restore_disposition)
-		(void)sigaction(SIGCHLD, previous, NULL);
+	memset(&chld_default, 0, sizeof(chld_default));
+	chld_default.sa_handler = SIG_DFL;
+	sigemptyset(&chld_default.sa_mask);
+	(void)sigaction(SIGCHLD, &chld_default, NULL);
 	if (restore_mask)
 		(void)sigprocmask(SIG_SETMASK, mask, NULL);
 }
@@ -352,8 +355,8 @@ kyriakon_encrypt_message_timeout(const char *bin, const char *user,
 		goto cleanup;
 	}
 	if (pid == 0) {
-		child_setup(to_child[0], from_child[1], disposition_saved,
-			    &reaper_previous, mask_saved, &previous_mask);
+		child_setup(to_child[0], from_child[1], mask_saved,
+			    &previous_mask);
 		/* The save path's environment is Dovecot's; the encryptor's own
 		 * gpg call needs a PATH it can find. */
 		setenv("PATH", "/usr/local/bin:/usr/bin:/bin", 1);

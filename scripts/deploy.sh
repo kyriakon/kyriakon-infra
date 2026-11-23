@@ -173,8 +173,14 @@ classify_script() {
 # has no rule, so `plan` can refuse the run and name every unclassified path.
 classify() {
 	case "$1" in
+	# The filter is built by the control deploy and restarted by the mail
+	# deploy: a new binary is not running until smtpd restarts the filter.
+	control/crates/fromcheck/*) needs_control=yes; needs_mail=yes ;;
 	control/*) needs_control=yes ;;
-	kyriakon-encrypt/* | mailparse/* | dovecot-plugin/*) needs_mail=yes ;;
+	# The filter reads mailparse too, so a parser change rebuilds and restarts
+	# it as well as the encryptor.
+	mailparse/*) needs_mail=yes; needs_control=yes ;;
+	kyriakon-encrypt/* | dovecot-plugin/*) needs_mail=yes ;;
 	openbsd/dovecot/*) needs_mail=yes ;;
 	# Both deploys read the package table, and either side's rows can change.
 	openbsd/packages.tsv) needs_mail=yes; needs_control=yes ;;
@@ -716,6 +722,14 @@ self_test() {
 	classify 'openbsd/packages.tsv'
 	check 'a package table change plans both deploys' \
 		"$needs_mail $needs_control" 'yes yes'
+	reset_plan
+	classify 'control/crates/fromcheck/src/lib.rs'
+	check 'a filter change rebuilds it and restarts smtpd' \
+		"$needs_control $needs_mail" 'yes yes'
+	reset_plan
+	classify 'mailparse/src/message/header.rs'
+	check 'a shared parser change rebuilds the filter too' \
+		"$needs_control $needs_mail" 'yes yes'
 	reset_plan
 	classify 'scripts/kyriakon-authcheck.sh'
 	check 'the libexec install plans deploy-control' "$needs_control" yes

@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -105,6 +106,25 @@ main(void)
 		struct timespec nap = { 0, 300 * 1000 * 1000 };
 
 		nanosleep(&nap, NULL);
+	}
+	/* Forks and waits for a grandchild, as the real CLI waits for gpg. An
+	 * inherited SIG_IGN would auto-reap the grandchild and make this fail with
+	 * ECHILD before any ciphertext is written. */
+	if (mode != NULL && strcmp(mode, "grandchild") == 0) {
+		pid_t child = fork();
+		int status;
+
+		if (child < 0) {
+			free(input);
+			return 1;
+		}
+		if (child == 0)
+			_exit(0);
+		if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+		    WEXITSTATUS(status) != 0) {
+			free(input);
+			return 1;
+		}
 	}
 	/* Writes the descriptors it holds to KYRIAKON_FAKE_FD_LOG, then returns the
 	 * usual ciphertext. A descriptor the mail process opened must not be
