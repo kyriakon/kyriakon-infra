@@ -1408,7 +1408,9 @@ mod tests {
         let home = Home::new();
         let expected = home.key("sign");
         let hidden = home.key("sign");
-        let block = two_primary_block(&expected.public, &hidden.public);
+        // Two clean blocks, one per key: the point here is the expected
+        // fingerprint, and `inspect_single_cert` covers the one-block case.
+        let block = format!("{}\n{}", expected.public, hidden.public);
         let cert = home.cert(&block);
         let payload = b"the pending key's fingerprint";
 
