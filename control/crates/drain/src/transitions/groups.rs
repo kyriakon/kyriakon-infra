@@ -17,7 +17,7 @@ use super::boxrun::{
 use super::lifecycle::dns_contact;
 use super::Error;
 use super::{write_journal, Settlement};
-use kyriakon_control_core::account::state::{Standing, WindowState};
+use kyriakon_control_core::account::state::Standing;
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::questions;
 use kyriakon_control_core::flow::validate;
@@ -373,15 +373,15 @@ pub async fn provision_group(
         window: if intent.payment.no_charge {
             None
         } else {
-            match record.as_ref().and_then(|g| g.payment.window.clone()) {
-                Some(window) => Some(window),
-                None => Some(Window {
-                    opened_at: now.clone(),
-                    closes_at: util::after_days(14),
-                    state: WindowState::Open,
-                    extensions: 0,
-                }),
-            }
+            // The approval drew the window, hold dates included, and signed it
+            // into this intent; a retry keeps the group record's own copy. An
+            // intent filed before the hold existed carries none, so it opens at
+            // approval as it always did.
+            record
+                .as_ref()
+                .and_then(|g| g.payment.window.clone())
+                .or_else(|| intent.payment.window.clone())
+                .or_else(|| Some(Window::on_approval(OffsetDateTime::now_utc(), true)))
         },
         paid_until: record
             .as_ref()

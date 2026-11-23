@@ -141,7 +141,7 @@ async fn the_card_pages_carry_the_keyed_payment_link() {
             "acceptances":[],"question_list":"2026-10-13 test",
             "payment":{"token_ref":"KYR-AAAA-BBBB-CCCC",
                        "token_issued_at":"2026-10-02T09:00:00Z","paid_until":null,
-                       "window":{"opened_at":"2099-10-02T09:00:00Z",
+                       "window":{"opened_at":"2026-10-02T09:00:00Z",
                                  "closes_at":"2099-10-16T09:00:00Z",
                                  "state":"open","extensions":0}}}"#,
     )
@@ -176,7 +176,7 @@ async fn a_group_status_page_carries_the_group_payment_link() {
             "acceptances":[],"question_list":"2026-10-13 test",
             "payment":{"token_ref":"KYR-AAAA-BBBB-CCCC",
                        "token_issued_at":"2026-10-02T09:00:00Z","paid_until":null,
-                       "window":{"opened_at":"2099-10-02T09:00:00Z",
+                       "window":{"opened_at":"2026-10-02T09:00:00Z",
                                  "closes_at":"2099-10-16T09:00:00Z",
                                  "state":"open","extensions":0}}}"#,
     )

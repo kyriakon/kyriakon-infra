@@ -229,10 +229,12 @@ required = true
 # before payment: the express request to start now, and the acknowledgement that
 # digital content is supplied immediately and the right to cancel can be lost
 # once it is. One checkbox, because the member is asked to agree to the pair;
-# both are restated in the confirmation email.
+# both are restated in the confirmation email. It is optional: leaving it
+# unticked keeps the full fourteen-day cancellation right, so the account is
+# held and the payment window opens only after those days have passed.
 [[question]]
 id = "accept_supply"
-prompt = "I ask you to start now, and I acknowledge that digital content is supplied immediately and that the right to cancel can be lost once it is."
+prompt = "I ask you to start now, and I acknowledge that digital content is supplied immediately and that the right to cancel can be lost once it is. Leave this unticked to keep the full fourteen days."
 type = "acceptance"
 branch = "all"
-required = true
+required = false

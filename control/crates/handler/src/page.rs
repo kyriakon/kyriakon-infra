@@ -253,7 +253,8 @@ pub struct PaymentView {
     /// What still works and what stopped once the account has lapsed, in the
     /// lapse notice's words.
     pub lapsed_note: Option<String>,
-    /// The window's close date and the days left, while one runs.
+    /// The window's close date and the days left while one runs, or the date a
+    /// held window opens once the cancellation period has passed.
     pub window: Option<String>,
     /// The rail's own instructions, one line each.
     pub instructions: Vec<String>,
@@ -471,11 +472,20 @@ pub fn payment(
     let unpaid = payment.paid_until.is_none();
     let window = payment.window.as_ref().filter(|_| unpaid);
     let closes_on = window.map(|w| w.closes_at.get(..10).unwrap_or(&w.closes_at).to_string());
+    // A window whose open date is still ahead is the fourteen-day hold the
+    // terms describe: the cancellation period has not run, so the window has
+    // not started and is neither running nor lapsed.
+    let held = window.is_some_and(|w| {
+        w.state == kyriakon_control_core::account::state::WindowState::Open
+            && kyriakon_control_core::util::days_left(&w.opened_at, now)
+                .is_some_and(|days| days > 0)
+    });
     // A window whose state is still `open` after its close date has not been
     // swept yet, and the member reads the same `Lapsed` the sweep will write:
     // the date, not the sweep's own progress, is what the page is about.
     let running = window.is_some_and(|w| {
         w.state == kyriakon_control_core::account::state::WindowState::Open
+            && !held
             && kyriakon_control_core::util::days_left(&w.closes_at, now)
                 .is_some_and(|days| days > 0)
     });
@@ -486,6 +496,11 @@ pub fn payment(
                 .unwrap_or(0)
                 .max(0);
             format!("closes on {date}: {days} days left")
+        })
+    } else if held {
+        window.map(|w| {
+            let opens = w.opened_at.get(..10).unwrap_or(&w.opened_at);
+            format!("opens on {opens}: the fourteen days you have to cancel run first")
         })
     } else {
         None
@@ -510,13 +525,15 @@ pub fn payment(
     // A window that is closed, or open past its date and not yet swept, is the
     // lapse; a credit leaves the window paid and the date is what the page
     // shows instead.
-    let lapsed = if unpaid && !running {
+    let lapsed = if unpaid && !running && !held {
         closes_on.clone()
     } else {
         None
     };
     let lapsed_closed = lapsed.is_some();
-    let deadline = window_line.as_ref().map(|_| {
+    // A held window has not opened, so there is no deadline and no rail
+    // instructions yet: both belong to the window's own fourteen days.
+    let deadline = running.then(|| {
         format!(
             "The money must arrive before {}, or the account lapses: mail keeps \
              arriving and everything published stays up, and sending, uploading and \
@@ -855,7 +872,7 @@ mod tests {
                 "accept_supply",
                 Branch::All,
                 Kind::Acceptance,
-                true,
+                false,
                 Rule::None,
             ),
         ]
@@ -1137,6 +1154,50 @@ mod tests {
         .unwrap();
         assert!(html.contains("Paid until 2027-10-04"), "{html}");
         assert!(!html.contains("KYR-4F2M-9QH7-XT3B"), "{html}");
+    }
+
+    /// A window whose open date is ahead is the fourteen-day hold the terms
+    /// describe: the page names the day it opens, shows the token, and withholds
+    /// both the rail instructions and the lapse until the window starts.
+    #[test]
+    fn a_held_window_reads_as_not_yet_open() {
+        use kyriakon_control_core::store::{Payment, Window};
+        let now = OffsetDateTime::parse(
+            "2026-10-05T09:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let block = Payment {
+            token_ref: Some("KYR-4F2M-9QH7-XT3B".into()),
+            window: Some(Window {
+                opened_at: "2026-10-15T09:00:00Z".into(),
+                closes_at: "2026-10-29T09:00:00Z".into(),
+                state: kyriakon_control_core::account::state::WindowState::Open,
+                extensions: 0,
+            }),
+            ..Payment::default()
+        };
+        let view = payment(
+            "active",
+            "cash",
+            &block,
+            "20.00",
+            "1 Example Street",
+            None,
+            now,
+        );
+        assert!(view.lapsed.is_none(), "a held window has not lapsed");
+        assert_eq!(view.token.as_deref(), Some("KYR-4F2M-9QH7-XT3B"));
+        assert!(
+            view.window
+                .as_deref()
+                .unwrap()
+                .contains("opens on 2026-10-15"),
+            "{:?}",
+            view.window
+        );
+        assert!(view.instructions.is_empty(), "nothing is payable yet");
+        assert!(view.deadline.is_none(), "no close date is live yet");
     }
 
     /// The group's page state follows its one window: an open window is a

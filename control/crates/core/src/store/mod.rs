@@ -33,7 +33,7 @@ use std::path::PathBuf;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::account::state::{Standing, WindowState};
@@ -1551,6 +1551,13 @@ pub struct Acceptance {
     pub version: String,
 }
 
+/// The optional acceptance's document name: the express request to start now
+/// and the digital-content acknowledgement. One string, so the form that writes
+/// it and the approval that reads it cannot drift. An application without it
+/// has not asked for immediate supply, and its payment window opens after the
+/// fourteen-day cancellation period instead of at approval.
+pub const IMMEDIATE_SUPPLY: &str = "immediate supply and the digital-content acknowledgement";
+
 /// The filed application. This is `applications/<token>.json`, and it is what
 /// the status page renders and what the intent is built from.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1694,6 +1701,15 @@ impl ApplicationRef {
 }
 
 impl Record {
+    /// Whether the applicant asked us to start now and acknowledged immediate
+    /// supply. The acceptance list is the record of what was given, so an
+    /// unticked box is its absence and nothing else needs a second field.
+    pub fn immediate_supply(&self) -> bool {
+        self.acceptances
+            .iter()
+            .any(|a| a.document == IMMEDIATE_SUPPLY)
+    }
+
     /// The intent for a filed application. `id` is the ULID the directory sorts
     /// by.
     pub fn intent(&self, id: &str) -> Intent {
@@ -2593,6 +2609,32 @@ pub struct Window {
     /// The window's own standing, as the record writes it.
     pub state: WindowState,
     pub extensions: u32,
+}
+
+/// The consumer's cancellation period, and the length of the payment window
+/// itself. One number, because the hold and the window are the same fortnight.
+const CANCELLATION_DAYS: i64 = 14;
+
+impl Window {
+    /// The window a paid approval opens. It opens at the approval when the
+    /// applicant asked us to start now; without that request the terms hold the
+    /// account for the fourteen days they have to cancel, so the window opens
+    /// when those days are up and closes fourteen days after that. `opened_at`
+    /// is therefore a future date on a held approval, which is what every page
+    /// and notice reads the hold from.
+    pub fn on_approval(now: OffsetDateTime, immediate_supply: bool) -> Self {
+        let hold = if immediate_supply {
+            0
+        } else {
+            CANCELLATION_DAYS
+        };
+        Window {
+            opened_at: crate::util::stamp(now + Duration::days(hold)),
+            closes_at: crate::util::stamp(now + Duration::days(hold + CANCELLATION_DAYS)),
+            state: WindowState::Open,
+            extensions: 0,
+        }
+    }
 }
 
 /// `tokens/<token>.json`, the join from a token to what it pays for. Created at
@@ -4044,5 +4086,55 @@ mod tests {
             "{err}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The window a paid approval opens. With the immediate-supply request it
+    /// opens at approval; without it the fourteen cancellation days run first,
+    /// so the hold date is fourteen days out and the close fourteen after that.
+    #[test]
+    fn a_window_holds_the_cancellation_period_when_supply_was_not_requested() {
+        let now = OffsetDateTime::parse(
+            "2026-10-01T09:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+
+        let asked = Window::on_approval(now, true);
+        assert_eq!(asked.opened_at, "2026-10-01T09:00:00Z");
+        assert_eq!(asked.closes_at, "2026-10-15T09:00:00Z");
+        assert_eq!(asked.state, WindowState::Open);
+
+        let held = Window::on_approval(now, false);
+        assert_eq!(
+            held.opened_at, "2026-10-15T09:00:00Z",
+            "the window opens when the fourteen-day hold ends"
+        );
+        assert_eq!(held.closes_at, "2026-10-29T09:00:00Z");
+    }
+
+    /// The acceptance list is the record of the optional choice: an entry for
+    /// the supply document means it was given, and its absence means it was not.
+    #[test]
+    fn an_application_records_whether_immediate_supply_was_requested() {
+        let mut record: Record = serde_json::from_value(serde_json::json!({
+            "username": "secretary",
+            "status_token": "0123456789abcdefghjkmnpqrst",
+            "filed_at": "2026-10-01T09:00:00Z",
+            "front_end": "web",
+            "stage": "received",
+            "answers": {},
+            "mail_keys": [],
+            "rail": "cash",
+            "no_charge": false,
+            "acceptances": [{"document": "terms", "version": "v1"}],
+            "question_list": "v1"
+        }))
+        .unwrap();
+        assert!(!record.immediate_supply());
+        record.acceptances.push(Acceptance {
+            document: IMMEDIATE_SUPPLY.to_string(),
+            version: "v1".to_string(),
+        });
+        assert!(record.immediate_supply());
     }
 }

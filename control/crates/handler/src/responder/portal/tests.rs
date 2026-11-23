@@ -116,6 +116,28 @@ async fn the_portal_files_one_application_and_its_token_reads_the_stage() {
     );
 }
 
+/// The TUI walks the same optional checkbox: leaving the immediate-supply
+/// answer out files the application, and the record read back says the request
+/// was not given.
+#[tokio::test]
+async fn the_portal_files_an_application_that_left_the_supply_box_unticked() {
+    let (app, dir) = handler("portal-supply-optional").await;
+    let form: BTreeMap<String, String> = body_answers()
+        .into_iter()
+        .filter(|(k, _)| *k != "accept_supply")
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    let reply = portal_file(&app, "203.0.113.10", &serde_json::to_string(&form).unwrap()).await;
+    let token = ipc::parse_file_answer(&reply).unwrap();
+
+    let text =
+        std::fs::read_to_string(dir.join("applications").join(format!("{token}.json"))).unwrap();
+    let record: Record = serde_json::from_str(&text).unwrap();
+    assert!(!record.immediate_supply(), "{record:?}");
+    assert_eq!(record.acceptances.len(), 3, "{record:?}");
+}
+
 /// A bug in the portal cannot become a filed record the web form would have
 /// refused: the handler runs the same checks again and files nothing.
 #[tokio::test]

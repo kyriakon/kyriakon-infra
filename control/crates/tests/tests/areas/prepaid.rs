@@ -3386,3 +3386,43 @@ fn a_credit_through_a_flat_payment_record_keeps_the_token_and_dates() {
     );
     assert_eq!(payment_lines(&fix).len(), 1, "the ledger line");
 }
+
+/// An approval without the immediate-supply request holds the account for the
+/// fourteen days it has to cancel: the payment window opens on that day and
+/// closes fourteen days later. The ordinary applicant's window opens at
+/// approval, which the tests above already read.
+#[test]
+fn a_missing_immediate_supply_request_delays_the_payment_window() {
+    let fix = Fix::new("supply-hold");
+    let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    record["acceptances"] = json!([{"document": "terms", "version": "2026-10-01 abc1234"}]);
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    let window = &account["payment"]["window"];
+    let stamp = |field: &str| {
+        OffsetDateTime::parse(
+            window[field].as_str().expect(field),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    };
+    let opened = stamp("opened_at");
+    let closes = stamp("closes_at");
+    let today = OffsetDateTime::now_utc();
+    assert_eq!(
+        (opened.date() - today.date()).whole_days(),
+        14,
+        "the window opens when the fourteen-day hold ends: {account}"
+    );
+    assert_eq!(
+        (closes.date() - opened.date()).whole_days(),
+        14,
+        "the window still runs for fourteen days after it opens: {account}"
+    );
+}

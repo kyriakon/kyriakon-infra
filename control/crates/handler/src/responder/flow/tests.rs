@@ -242,7 +242,11 @@ async fn an_answer_the_page_does_not_offer_is_refused_rather_than_filed() {
 
     for (id, value, why) in [
         ("accept_terms", "no", "this has to be accepted"),
-        ("accept_supply", "no", "this has to be accepted"),
+        (
+            "accept_supply",
+            "no",
+            "answer yes to accept, or leave it unticked",
+        ),
         ("body_records", "maybe", "answer yes or no"),
     ] {
         let answers: Vec<(&str, &str)> = body_answers()
@@ -402,4 +406,38 @@ fn a_front_end_is_web_tui_or_capsule_and_nothing_else() {
         form.insert("front_end".to_string(), v.to_string());
         assert!(label(&form).is_err(), "{v:?} should be refused");
     }
+}
+
+/// The immediate-supply box is optional: leaving it out files the application
+/// with the three documents and no supply acceptance. The record's acceptance
+/// list is the evidence, so the drain can hold the account without a second
+/// field to keep in step.
+#[tokio::test]
+async fn an_unticked_supply_box_files_without_recording_the_acceptance() {
+    let (app, dir) = handler("supply-optional").await;
+    let answers: Vec<(&str, &str)> = body_answers()
+        .into_iter()
+        .filter(|(id, _)| *id != "accept_supply")
+        .collect();
+    let (code, page) = ask(&app, &httpd_post("/apply", &encoded(&answers))).await;
+    assert_eq!(code, 200, "{page}");
+
+    let entry = std::fs::read_dir(dir.join("applications"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(entry.path()).unwrap()).unwrap();
+    let documents: Vec<&str> = record["acceptances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["document"].as_str().unwrap())
+        .collect();
+    assert_eq!(documents.len(), 3, "{record}");
+    assert!(
+        !documents.contains(&kyriakon_control_core::store::IMMEDIATE_SUPPLY),
+        "an unticked box records no supply acceptance: {record}"
+    );
 }

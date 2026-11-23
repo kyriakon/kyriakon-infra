@@ -56,6 +56,10 @@ fn an_approval_sends_the_confirmation_to_the_outside_address() {
     record["acceptances"] = json!([
         {"document": "terms", "version": "2026-10-01 abc1234"},
         {"document": "privacy", "version": "2026-09-01 def5678"},
+        {
+            "document": kyriakon_control_core::store::IMMEDIATE_SUPPLY,
+            "version": "2026-10-01 abc1234"
+        },
     ]);
     fix.rewrite_record(&record);
     fix.file_application(&record);

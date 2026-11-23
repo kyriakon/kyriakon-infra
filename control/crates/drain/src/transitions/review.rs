@@ -15,7 +15,7 @@ use super::Error;
 use super::{write_journal, write_review_journal, Settlement};
 use kyriakon_control_core::account::dns;
 use kyriakon_control_core::account::sign;
-use kyriakon_control_core::account::state::{Standing, WindowState};
+use kyriakon_control_core::account::state::Standing;
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::questions;
 use kyriakon_control_core::flow::validate;
@@ -210,6 +210,14 @@ fn review_body(cfg: &DrainConfig, key: &[u8], record: &Record) -> Result<String,
     out.push_str(&format!(
         "No charge asked for: {}\n",
         if record.no_charge { "yes" } else { "no" }
+    ));
+    out.push_str(&format!(
+        "Immediate supply requested: {}\n",
+        if record.immediate_supply() {
+            "yes"
+        } else {
+            "no (the account is held for fourteen days)"
+        }
     ));
     out.push_str(&format!(
         "Domain: {}\n",
@@ -525,7 +533,8 @@ async fn approve(
         publish_mail_keys_publicly(cfg, username, &record.mail_keys).await?;
     }
 
-    let now = util::filed_at();
+    let now_at = OffsetDateTime::now_utc();
+    let now = util::stamp(now_at);
     let token_ref = if no_charge {
         None
     } else {
@@ -545,14 +554,10 @@ async fn approve(
             .as_ref()
             .and_then(|a| a.payment_state())
             .and_then(|p| p.window)
-            .or_else(|| {
-                Some(Window {
-                    opened_at: now.clone(),
-                    closes_at: util::after_days(14),
-                    state: WindowState::Open,
-                    extensions: 0,
-                })
-            })
+            // Without the immediate-supply request the cancellation period runs
+            // first: the window's own dates carry that hold, so every lapse,
+            // page and notice reads it without a second field.
+            .or_else(|| Some(Window::on_approval(now_at, record.immediate_supply())))
     };
     // The Monero quote is taken once, when the window opens, and honoured for
     // its fourteen days: a retry of the approval reuses the block already
@@ -894,7 +899,10 @@ async fn approve_group(
             .to_string(),
             no_charge,
             token_ref: None,
-            window: None,
+            // The same hold the person path applies: without the immediate-supply
+            // request the window opens after the fourteen days to cancel.
+            window: (!no_charge)
+                .then(|| Window::on_approval(OffsetDateTime::now_utc(), record.immediate_supply())),
             paid_until: None,
             stripe: Default::default(),
             monero: None,
@@ -970,22 +978,36 @@ async fn approve_group(
         None
     };
     let payment_note = match (&written.payment.token_ref, &written.payment.window) {
-        (Some(token), Some(window)) if !written.payment.no_charge => format!(
-            "\n\nThe amount is GBP {price} for the year, for the whole group. Your payment \
-             reference is {token}.\n{}\
-             \nThe money must arrive before {} or the whole group lapses: mail keeps \
-             arriving and everything published stays up, and sending, uploading and \
-             pushing stop. Nothing is deleted at that point.\n",
-            rail_instructions(
-                &written.payment.rail,
-                &cfg.postal_address,
-                link.as_deref(),
-                None,
-                price,
+        (Some(token), Some(window)) if !written.payment.no_charge => {
+            let held = util::days_left(&window.opened_at, OffsetDateTime::now_utc())
+                .is_some_and(|days| days > 0);
+            let hold = if held {
+                format!(
+                    "\nYou did not ask us to start now, so the payment window opens on {}: \
+                     the fourteen days you have to cancel run first, and nothing is due \
+                     before then.",
+                    &window.opened_at[..10.min(window.opened_at.len())]
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "\n\nThe amount is GBP {price} for the year, for the whole group. Your payment \
+                 reference is {token}.\n{}\
+                 \nThe money must arrive before {} or the whole group lapses: mail keeps \
+                 arriving and everything published stays up, and sending, uploading and \
+                 pushing stop. Nothing is deleted at that point.{hold}\n",
+                rail_instructions(
+                    &written.payment.rail,
+                    &cfg.postal_address,
+                    link.as_deref(),
+                    None,
+                    price,
+                )
+                .join("\n"),
+                &window.closes_at[..10.min(window.closes_at.len())]
             )
-            .join("\n"),
-            &window.closes_at[..10.min(window.closes_at.len())]
-        ),
+        }
         _ => "\n\nThe group was approved without charge: there is nothing to pay, no \
               payment window, and the group does not lapse.\n"
             .to_string(),
@@ -1231,12 +1253,29 @@ fn confirmation_subject(username: &str) -> String {
 /// Schedule 3 Part B form. The text here is the durable-medium copy of the
 /// contract summary, so it is complete without the applicant opening the site.
 fn confirmation_body(cfg: &DrainConfig, record: &Record, no_charge: bool) -> String {
-    let mut out = String::from(
-        "We are starting your account now, before the cancellation period ends:\n\
-         digital content is supplied immediately, and this does not take your right\n\
-         to cancel away.\n\n\
-         You accepted:\n\n",
-    );
+    let mut out = if record.immediate_supply() {
+        String::from(
+            "We are starting your account now, before the cancellation period ends:\n\
+             digital content is supplied immediately, and this does not take your right\n\
+             to cancel away.\n\n\
+             You accepted:\n\n",
+        )
+    } else {
+        // The terms say an application that gives neither consent is held until
+        // the fourteen days have passed. On a paid approval that is the payment
+        // window opening later; a free account has no window and nothing to
+        // bill, so the right is restated without claiming a hold that would not
+        // happen.
+        let hold = if no_charge {
+            "You did not ask us to start now, so the fourteen days you have to\n\
+             cancel run in full. There is no charge, so nothing is billed.\n\n"
+        } else {
+            "You did not ask us to start now, so we will hold the account for the\n\
+             fourteen days you have to cancel. The payment window opens after they\n\
+             have passed, and no money is due before then.\n\n"
+        };
+        format!("{hold}You accepted:\n\n")
+    };
     for acceptance in &record.acceptances {
         out.push_str(&format!(
             "  {}: {}\n",
@@ -1407,6 +1446,16 @@ fn decision_body(
     ) {
         out.push_str(&line);
         out.push('\n');
+    }
+    // A held window opens after the cancellation period, so the payment
+    // instructions above are not live yet. Say when they become live rather
+    // than let the applicant think a payment made now is expected.
+    if util::days_left(&window.opened_at, OffsetDateTime::now_utc()).is_some_and(|days| days > 0) {
+        out.push_str(&format!(
+            "\nYou did not ask us to start now, so the payment window opens on {}:\n\
+             the fourteen days you have to cancel run first. Nothing is due before then.\n",
+            &window.opened_at[..10]
+        ));
     }
     out.push_str(&format!(
         "\nThe money must arrive before {} or the account lapses: mail keeps arriving and\n\
@@ -1597,6 +1646,29 @@ mod tests {
         assert!(body.contains("Set your mail password"), "{body}");
         assert!(!body.contains("fourteen days to cancel"), "{body}");
         assert!(!body.contains("I give notice that I cancel"), "{body}");
+    }
+
+    /// The confirmation carries the choice in the applicant's own terms: with
+    /// the supply request it says supply starts now; without it, it says the
+    /// account is held and the payment window opens after the fourteen days.
+    #[test]
+    fn the_confirmation_states_whether_immediate_supply_was_asked_for() {
+        use kyriakon_control_core::store::{Acceptance, IMMEDIATE_SUPPLY};
+        let cfg = test_config();
+
+        let absent = confirmation_body(&cfg, &record(&[]), false);
+        assert!(!absent.contains("starting your account now"), "{absent}");
+        assert!(absent.contains("hold the account for the"), "{absent}");
+        assert!(absent.contains("payment window opens after"), "{absent}");
+
+        let mut given = record(&[]);
+        given.acceptances.push(Acceptance {
+            document: IMMEDIATE_SUPPLY.to_string(),
+            version: "v1".to_string(),
+        });
+        let present = confirmation_body(&cfg, &given, false);
+        assert!(present.contains("starting your account now"), "{present}");
+        assert!(!present.contains("hold the account"), "{present}");
     }
 
     #[test]
