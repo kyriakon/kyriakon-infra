@@ -803,6 +803,33 @@ self_test() {
 	check "and its pid is left alone" "$(cat "$tree/live.lock/pid")" "$$"
 	rm -rf "$tree/live.lock"
 
+	# write_atomic refuses the two destinations whose replacement would lose
+	# somebody else's file, and shapes the candidate before its validator runs.
+	printf 'old\n' > "$tree/atomic-old"
+	printf 'new\n' > "$tree/atomic-src"
+	ln -s atomic-old "$tree/atomic-symlink"
+	code=0
+	write_atomic "$tree/atomic-symlink" "" 0644 "$tree/atomic-src" >/dev/null 2>&1 || code=$?
+	check "a symlink destination is refused" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and its target is untouched" "$(cat "$tree/atomic-old")" old
+	ln "$tree/atomic-old" "$tree/atomic-hardlink"
+	code=0
+	write_atomic "$tree/atomic-old" "" 0644 "$tree/atomic-src" >/dev/null 2>&1 || code=$?
+	check "a two-link destination is refused" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and it keeps its bytes" "$(cat "$tree/atomic-old")" old
+	# shellcheck disable=SC2329 # invoked indirectly by write_atomic
+	atomic_mode_body() { printf 'mode\n'; }
+	# shellcheck disable=SC2329 # invoked indirectly by write_atomic
+	atomic_mode_check() { [ "$(stat -f '%Lp' "$1")" = 640 ]; }
+	code=0
+	write_atomic "$tree/atomic-mode" "" 0640 atomic_mode_body atomic_mode_check \
+		>/dev/null 2>&1 || code=$?
+	check "the candidate carries its mode before the validator" "$code" 0
+	check "and lands with that mode" "$(stat -f '%Lp' "$tree/atomic-mode")" 640
+	check "and the body's bytes" "$(cat "$tree/atomic-mode")" mode
+
 	# The fixture that motivated the helper: the last line has no newline, so a
 	# plain append joins the new entry to it and both keys stop matching.
 	printf 'hello: oliver\nsecretary@parish.example: parish' > "$tree/virtuals"

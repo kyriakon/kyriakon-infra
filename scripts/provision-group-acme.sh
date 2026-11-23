@@ -64,8 +64,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 # shellcheck disable=SC1091 # resolves at runtime from this script's directory
 . "$script_dir/lib.sh"
 acme_d=${ACME_D:-/etc/acme-client.d}
-ssl_dir=${SSL_DIR:-/etc/ssl}
-ssl_private=${SSL_PRIVATE_DIR:-/etc/ssl/private}
+tls_dirs
 public_root=${PUBLIC_ROOT:-/home/www}
 acme_queue=${ACME_QUEUE:-/root/bin/acme-queue.sh}
 # The mail table whose first line is the platform's own domain, read the way
@@ -105,7 +104,9 @@ domain_ok() {
 
 # The paths, as functions so the self-test rebinds the directory once.
 group_conf() { printf '%s/%s.conf' "$acme_d" "$domain"; }
+# shellcheck disable=SC2154 # ssl_dir and ssl_private are set by tls_dirs
 cert_file() { printf '%s/%s.fullchain.pem' "$ssl_dir" "$domain"; }
+# shellcheck disable=SC2154 # ssl_dir and ssl_private are set by tls_dirs
 key_file() { printf '%s/%s.key' "$ssl_private" "$domain"; }
 site_public() { printf '%s/%s.kyriakon.net' "$public_root" "$account"; }
 
@@ -179,9 +180,13 @@ self_test() {
 	tree=$self_test_work
 
 	acme_d="$tree/etc/acme-client.d"
+	SSL_DIR="$tree/etc/ssl"
+	SSL_PRIVATE_DIR="$tree/etc/ssl/private"
+	tls_dirs
 	public_root="$tree/home/www"
 	mail_domains="$tree/etc/mail/mail_domains"
-	install -d -m 0755 "$acme_d" "$public_root/parish-secretary.kyriakon.net" "$tree/etc/mail"
+	install -d -m 0755 "$acme_d" "$SSL_DIR" "$SSL_PRIVATE_DIR" \
+		"$public_root/parish-secretary.kyriakon.net" "$tree/etc/mail"
 	# The platform's own domain is the table's first line, as on the box.
 	printf 'kyriakon.net\n' > "$mail_domains"
 	conf_owner="$(id -un):$(stat -f '%Sg' "$acme_d")"
@@ -208,9 +213,9 @@ self_test() {
 	check "the challenge directory is the httpd one" \
 		"$(grep -c 'challengedir "/home/www/acme"' "$conf")" 1
 	check "the domain key is the pair's private half" \
-		"$(grep -c 'domain key "/etc/ssl/private/parish.example.key"' "$conf")" 1
+		"$(grep -cF "domain key \"$ssl_private/parish.example.key\"" "$conf")" 1
 	check "the full chain is the name relayd links from" \
-		"$(grep -c 'domain full chain certificate "/etc/ssl/parish.example.fullchain.pem"' "$conf")" 1
+		"$(grep -cF "domain full chain certificate \"$ssl_dir/parish.example.fullchain.pem\"" "$conf")" 1
 	check "the authority is the tracked one" "$(grep -c 'sign with letsencrypt' "$conf")" 1
 	check "and there is one block, not two" "$(grep -c '^domain ' "$conf")" 1
 	check "the file is mode 644 and the writer's" "$(stat -f '%Su:%Sg %Lp' "$conf")" "$conf_owner 644"

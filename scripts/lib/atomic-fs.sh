@@ -65,12 +65,6 @@ write_atomic() {
 		atomic_changed=no
 		return 0
 	fi
-	if [ "$#" -gt 0 ] && ! "$@" "$candidate" >/dev/null; then
-		rm -f "$candidate"
-		printf '%s fails its own check (%s); %s is unchanged\n' \
-			"$candidate" "$1" "$dst" >&2
-		return 1
-	fi
 	if [ -n "$owner" ] && ! chown "$owner" "$candidate"; then
 		rm -f "$candidate"
 		printf 'could not set the owner of %s; %s left as it was\n' "$candidate" "$dst" >&2
@@ -79,6 +73,12 @@ write_atomic() {
 	if ! chmod "$mode" "$candidate"; then
 		rm -f "$candidate"
 		printf 'could not set the mode of %s; %s left as it was\n' "$candidate" "$dst" >&2
+		return 1
+	fi
+	if [ "$#" -gt 0 ] && ! "$@" "$candidate" >/dev/null; then
+		rm -f "$candidate"
+		printf '%s fails its own check (%s); %s is unchanged\n' \
+			"$candidate" "$1" "$dst" >&2
 		return 1
 	fi
 	if ! mv "$candidate" "$dst"; then
@@ -201,12 +201,13 @@ install_smtpd_conf() {
 # be created or the pid cannot be written. A stale lock is reaped by renaming it
 # to a unique sibling and only then removing it: two reapers that both saw the
 # same dead pid cannot delete each other's fresh lock, because only one rename
-# succeeds and the renamed pid is compared with the dead one it observed. A lock
-# whose pid is gone, is 0 or 1, is not numeric, or has been held longer than
-# max-age (default 30 seconds) is stale.
+# succeeds and the renamed pid is compared with the pid it observed. A live pid
+# is never reaped, however long its holder takes. A missing or non-numeric pid
+# is stale only after max-age (default 30 seconds), so the gap between mkdir and
+# the pid write is not mistaken for a dead owner.
 lock_dir() {
 	typeset lock_path="$1" tries=0 limit="${2:-5}" interval="${3:-1}" max_age="${4:-30}"
-	typeset reason observed tomb taken
+	typeset reason observed tomb taken tomb_age
 	while [ "$tries" -lt "$limit" ]; do
 		if mkdir -m 0700 "$lock_path" 2>/dev/null; then
 			if ! printf '%s\n' "$$" >"$lock_path/pid"; then
@@ -226,12 +227,38 @@ lock_dir() {
 		if [ -n "$reason" ]; then
 			# A unique tomb: two reapers race to rename, and only one wins.
 			tomb="$lock_path.reap.$$"
-			taken=no
 			if mv "$lock_path" "$tomb" 2>/dev/null; then
+				taken=no
 				if [ "$(cat "$tomb/pid" 2>/dev/null || true)" = "$observed" ]; then
 					taken=yes
-				else
-					mv "$tomb" "$lock_path" 2>/dev/null || rm -rf "$tomb"
+					# An empty token also matches a fresh lock renamed before its
+					# pid write. Only an old tomb is the one this reaper observed
+					# as stale; a young one is somebody's live lock.
+					if [ -z "$observed" ]; then
+						tomb_age=$(lock_dir_age "$tomb")
+						if [ -z "$tomb_age" ] || [ "$tomb_age" -le "$max_age" ]; then
+							taken=no
+						fi
+					fi
+				fi
+				if [ "$taken" = no ]; then
+					# The path may have been recreated after the rename. Never
+					# move onto an existing directory, because mv would bury the
+					# tomb inside the fresh lock. Retry the restore once, then
+					# stop loudly with both paths still on disk.
+					restore_try=0
+					while [ "$restore_try" -lt 2 ]; do
+						if [ ! -e "$lock_path" ] &&
+							mv "$tomb" "$lock_path" 2>/dev/null; then
+							break
+						fi
+						restore_try=$((restore_try + 1))
+					done
+					if [ -e "$tomb" ]; then
+						printf 'could not restore the displaced lock %s: %s is occupied; remove %s and %s by hand\n' \
+							"$lock_path" "$lock_path" "$lock_path" "$tomb" >&2
+						return 2
+					fi
 				fi
 			fi
 			if [ "$taken" = yes ]; then
@@ -262,15 +289,20 @@ lock_dir_stale() {
 	lock_stale_pid=$pid
 	case "$pid" in
 	'')
-		# A lock between mkdir and its pid write: give a fresh one a moment.
+		# A lock between mkdir and its pid write: only max-age may call this
+		# stale, so a fresh writer is never mistaken for a dead one.
 		age=$(lock_dir_age "$lock_path")
-		if [ -n "$age" ] && [ "$age" -lt 2 ]; then
+		if [ -n "$age" ] && [ "$age" -le "$max_age" ]; then
 			return 0
 		fi
 		lock_stale_reason='the owner pid is not written'
 		return 0
 		;;
 	*[!0-9]*)
+		age=$(lock_dir_age "$lock_path")
+		if [ -n "$age" ] && [ "$age" -le "$max_age" ]; then
+			return 0
+		fi
 		lock_stale_reason="the owner pid \"$pid\" is not a number"
 		return 0
 		;;
@@ -280,11 +312,9 @@ lock_dir_stale() {
 		;;
 	esac
 	if kill -0 "$pid" 2>/dev/null; then
-		age=$(lock_dir_age "$lock_path")
-		if [ -n "$age" ] && [ "$age" -gt "$max_age" ]; then
-			lock_stale_reason="it has been held for $age seconds"
-		fi
-		# A live owner is holding it, however long the write is taking.
+		# A live owner is holding it, however long the write is taking. This is
+		# the rule the Rust drain's TableLock follows, so the two exclude each
+		# other rather than one reaping the other's lock.
 		return 0
 	fi
 	lock_stale_reason="the owner pid $pid is gone"

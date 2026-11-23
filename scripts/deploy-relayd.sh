@@ -65,8 +65,7 @@ httpd_port=8080
 # /etc/ssl/<name>.fullchain.pem and /etc/ssl/private/<name>.key. The key is
 # already in the place relayd looks, so only the public half needs a link, and a
 # link rather than a copy is what keeps a renewal on the acme-client name.
-ssl_dir=/etc/ssl
-ssl_private=/etc/ssl/private
+tls_dirs
 
 usage() {
 	printf 'usage: doas ksh deploy-relayd.sh [src_dir]\n' >&2

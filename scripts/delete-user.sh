@@ -79,8 +79,7 @@ httpd_d=${HTTPD_D:-/etc/httpd.d}
 gmid_d=${GMID_D:-/etc/gmid.d}
 acme_d=${ACME_D:-/etc/acme-client.d}
 authorized_keys_dir=${AUTHORIZED_KEYS_DIR:-/etc/ssh/authorized_keys}
-ssl_dir=${SSL_DIR:-/etc/ssl}
-ssl_private=${SSL_PRIVATE_DIR:-${SSL_PRIVATE:-/etc/ssl/private}}
+tls_dirs
 virtuals=${VIRTUALS:-/etc/mail/virtuals}
 mail_from=${MAIL_FROM:-/etc/mail/mail_from}
 onboard_store=${ONBOARD_STORE:-/var/db/onboard}
@@ -469,6 +468,7 @@ self_test() {
 		-u:alice) printf '1001\n' ;;
 		-u:root) printf '0\n' ;;
 		-u:*) return 1 ;;
+		-Gn:alice) printf 'alice members\n' ;;
 		-un:* | -gn:*) printf 'self-test\n' ;;
 		*) command id "$@" ;;
 		esac

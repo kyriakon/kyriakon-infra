@@ -91,8 +91,7 @@ httpd_d=${HTTPD_D:-/etc/httpd.d}
 gmid_d=${GMID_D:-/etc/gmid.d}
 static_hosts=${STATIC_HOSTS:-/etc/onboard/static-hosts}
 acme_d=${ACME_D:-/etc/acme-client.d}
-ssl_dir=${SSL_DIR:-/etc/ssl}
-ssl_private=${SSL_PRIVATE_DIR:-${SSL_PRIVATE:-/etc/ssl/private}}
+tls_dirs
 acme_queue_dir=${ACME_QUEUE_DIR:-/var/db/kyriakon-acme-queue}
 
 usage() {

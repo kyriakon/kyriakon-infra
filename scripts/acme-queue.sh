@@ -88,8 +88,8 @@
 #   spacing        202 minutes                      the CA's published refill
 #   alert age      1440 minutes (24 hours)          read by scripts/abuse-monitor.sh
 # The store and the client and resolver commands are overridable (ACME_QUEUE_DIR,
-# ACME_CLIENT, ACME_RESOLVER, ACME_SSL_DIR) so the queue can be exercised against
-# a copy or a stub without touching the live store or the CA.
+# ACME_CLIENT and ACME_RESOLVER) so the queue can be exercised against a copy or
+# a stub without touching the live store or the CA.
 #
 # What a successful attempt triggers. A certificate on disk is the member's site
 # half becoming due: scripts/provision-member-web.sh writes the block behind the
@@ -148,6 +148,17 @@ fi
 # shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
 . "$script_dir/lib.sh"
 
+# The shared ACME lock, released at script scope. A trap set inside run would be
+# scoped to that function by pdksh and never run, so this one is set before any
+# function and covers an errexit exit; run releases explicitly on normal returns.
+acme_lock_held=''
+release_acme_lock() {
+	[ -n "$acme_lock_held" ] || return 0
+	unlock_dir "$acme_lock_held"
+	acme_lock_held=''
+}
+trap 'release_acme_lock' EXIT
+
 queue_dir="${ACME_QUEUE_DIR:-/var/db/kyriakon-acme-queue}"
 pending_dir="$queue_dir/pending"
 # The attempt logs: one epoch line per attempt, pruned to the seven-day window
@@ -157,9 +168,9 @@ member_log="$queue_dir/attempts.kyriakon.net"
 own_log="$queue_dir/attempts.own-domain"
 client="${ACME_CLIENT:-acme-client}"
 resolver="${ACME_RESOLVER:-host}"
-# Where the certificate lands. A variable so the self-test can point attempt() at
-# a throwaway directory: the success path below checks the file is there.
-ssl_dir="${ACME_SSL_DIR:-/etc/ssl}"
+# Where the certificate lands, from the shared TLS directories so this lane
+# honours the same SSL_DIR as the provisioning lanes.
+tls_dirs
 
 # The directory the drain's privileged scripts are installed in. The apply hook
 # below runs the web lane and scripts/cron-apply.sh --web from there, because
@@ -624,25 +635,17 @@ run() {
 	# to do; the holder reports its own outcome.
 	lock=$(acme_lock_path)
 	lock_rc=0
-	# A pass may run for minutes across the CA, so a live pid is only reaped
-	# after six hours; a shorter age would let a second lane in alongside a
-	# healthy run.
-	lock_message=$(lock_dir "$lock" 1 1 21600 2>&1) || lock_rc=$?
+	lock_message=$(lock_dir "$lock" 1 2>&1) || lock_rc=$?
 	case "$lock_rc" in
 	0) ;;
 	1) return 0 ;;
 	*) die "$lock_message" ;;
 	esac
-	# The body runs in its own function and the wrapper releases the lock on
-	# every normal return: pdksh scopes a trap set inside a function to that
-	# function, so an EXIT trap here would never run.
-	run_rc=0
-	run_locked || run_rc=$?
-	unlock_dir "$lock"
-	return "$run_rc"
-}
-
-run_locked() {
+	# The pass body stays in this function and under errexit: it is not called
+	# in a tested list, so a failed substitution stops the pass. The lock is
+	# released before every normal return, and the script-scope EXIT trap above
+	# releases it when errexit ends the process.
+	acme_lock_held=$lock
 
 	now=$(date +%s)
 	# Each lane has its own window, and only the lanes decide whether this pass has
@@ -657,11 +660,13 @@ run_locked() {
 	member_wait=$(minutes_until_member_slot "$now")
 	own_wait=$(minutes_until_own_slot "$now")
 	if [ "$member_wait" -gt 0 ] && [ "$own_wait" -gt 0 ]; then
+		release_acme_lock
 		return 0
 	fi
 
 	list=$(pending_oldest_first)
 	if [ -z "$list" ]; then
+		release_acme_lock
 		return 0
 	fi
 
@@ -674,9 +679,11 @@ run_locked() {
 	# alert is what reports one that stays that way.
 	candidate=$(next_attempt "$list" "$member_wait" "$own_wait")
 	if [ -z "$candidate" ]; then
+		release_acme_lock
 		return 0
 	fi
 	attempt "$candidate"
+	release_acme_lock
 	return 0
 }
 

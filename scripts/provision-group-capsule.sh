@@ -66,8 +66,7 @@ umask 077
 openssl=/usr/bin/openssl
 
 gmid_d=/etc/gmid.d
-ssl_dir=${SSL_DIR:-/etc/ssl}
-ssl_private=${SSL_PRIVATE_DIR:-/etc/ssl/private}
+tls_dirs
 public_root=/home/www
 # Written by scripts/provision-group-web.sh; the capsule reads the same tree.
 static_hosts=/etc/onboard/static-hosts

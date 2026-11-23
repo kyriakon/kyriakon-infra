@@ -50,12 +50,18 @@ link_cert() {
 	printf 'linked %s -> %s\n' "$cert_link" "$cert_target"
 }
 
-# capsule_pair_present <cert> <key> <openssl>: both halves non-empty and the
-# certificate parseable. A truncated pair left by an interrupted run is not a
-# pair, so the next run regenerates it rather than serving it.
+# capsule_pair_present <cert> <key> <openssl>: both halves non-empty, both
+# parseable, and the key is the one the certificate carries. A truncated or
+# mismatched pair left by an interrupted run is not a pair, so the next run
+# regenerates it rather than serving it.
 capsule_pair_present() {
+	typeset cert_modulus key_modulus
 	[ -s "$1" ] && [ -s "$2" ] || return 1
-	"$3" x509 -in "$1" -noout >/dev/null 2>&1
+	"$3" x509 -in "$1" -noout >/dev/null 2>&1 || return 1
+	"$3" rsa -in "$2" -noout >/dev/null 2>&1 || return 1
+	cert_modulus=$("$3" x509 -in "$1" -noout -modulus 2>/dev/null) || return 1
+	key_modulus=$("$3" rsa -in "$2" -noout -modulus 2>/dev/null) || return 1
+	[ -n "$cert_modulus" ] && [ "$cert_modulus" = "$key_modulus" ]
 }
 
 # ensure_capsule_pair <cert> <key> <cnf> <openssl>: generate the self-signed
@@ -101,9 +107,17 @@ tls_ensure_capsule_pair() {
 		printf 'could not set the capsule pair mode; nothing was installed\n' >&2
 		return 1
 	fi
-	if ! mv "$key_candidate" "$key" || ! mv "$cert_candidate" "$cert"; then
-		rm -f "$cert_candidate" "$key_candidate"
-		printf 'could not rename the capsule pair into place\n' >&2
+	if ! mv "$key_candidate" "$key"; then
+		rm -f "$key_candidate" "$cert_candidate"
+		printf 'could not rename the capsule key into place\n' >&2
+		return 1
+	fi
+	if ! mv "$cert_candidate" "$cert"; then
+		# The key is already installed beside the old certificate. Remove both
+		# installed halves rather than leaving a mismatched pair that presence
+		# would mistake for complete.
+		rm -f "$cert_candidate" "$cert" "$key"
+		printf 'could not rename the capsule certificate into place; both halves were removed\n' >&2
 		return 1
 	fi
 	capsule_generated=yes

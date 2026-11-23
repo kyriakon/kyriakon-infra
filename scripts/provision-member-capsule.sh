@@ -81,8 +81,7 @@ umask 077
 openssl=/usr/bin/openssl
 
 gmid_d=/etc/gmid.d
-ssl_dir=${SSL_DIR:-/etc/ssl}
-ssl_private=${SSL_PRIVATE_DIR:-/etc/ssl/private}
+tls_dirs
 public_root=/home/www
 conf_owner="root:wheel"
 
@@ -363,6 +362,13 @@ self_test() {
 	check "and the key is mode 0600" "$(stat -f '%Lp' "$(capsule_key)")" 600
 	check "and it is a different pair" \
 		"$(printf '%s' "$before" | grep -c "^$(stat -f '%i' "$(capsule_cert)") " || true)" 0
+
+	# A mismatched key beside a valid certificate is not a pair either (#933).
+	"$openssl" genrsa -out "$(capsule_key)" 2048 2>/dev/null
+	check "a mismatched key is not a pair" \
+		"$(pair_present && echo yes || echo no)" no
+	ensure_capsule_pair > "$tree/mismatch.out" 2>&1
+	check "and the next run rebuilds it" "$(pair_present && echo yes || echo no)" yes
 
 	# 7. a member whose tree is not built is refused rather than served
 	user=nobody

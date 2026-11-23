@@ -114,6 +114,7 @@ self_test() {
 	id() {
 		case "$1:$2" in
 		-u:alice) printf '1001\n' ;;
+		-Gn:alice) printf 'alice members\n' ;;
 		*) return 1 ;;
 		esac
 	}
@@ -159,6 +160,20 @@ self_test() {
 		"$([ -f "$tree/elsewhere/authorized_keys" ] && printf yes || printf no)" yes
 	rm -f "$home_root/alice/.ssh"
 	mkdir -p "$home_root/alice/.ssh"
+
+	# A name held back in reserved-usernames.txt is refused even when every
+	# other phase would pass (#884).
+	printf 'alice\n' > "$tree/reserved"
+	# shellcheck disable=SC2034 # require_member reads it
+	RESERVED_USERNAMES="$tree/reserved"
+	set +e
+	( remove alice ) >"$tree/reserved.out" 2>&1
+	rc=$?
+	set -e
+	check "a reserved name is refused" "$rc" 2
+	check "and the refusal names the phase" \
+		"$(grep -c 'missing reserved' "$tree/reserved.out")" 1
+	unset RESERVED_USERNAMES
 
 	# A name that is not an account, and a name that is not a member name, both
 	# stop before any path is built.

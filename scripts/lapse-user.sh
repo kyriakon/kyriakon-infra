@@ -126,6 +126,7 @@ SH
 		-u:alice) printf '1001\n' ;;
 		-u:root) printf '0\n' ;;
 		-u:*) return 1 ;;
+		-Gn:alice) printf 'alice members\n' ;;
 		*) command id "$@" ;;
 		esac
 	}

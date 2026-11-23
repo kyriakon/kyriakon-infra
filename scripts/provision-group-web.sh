@@ -79,8 +79,7 @@ umask 077
 . "$(dirname "$0")/lib.sh"
 
 httpd_d=/etc/httpd.d
-ssl_dir=${SSL_DIR:-/etc/ssl}
-ssl_private=${SSL_PRIVATE_DIR:-/etc/ssl/private}
+tls_dirs
 public_root=/home/www
 # The responder's host-to-tree map: one file per domain whose files live in the
 # site owner's member tree rather than in a directory named after the domain.

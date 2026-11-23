@@ -41,6 +41,19 @@ require_member() {
 	member_uid=$(id -u "$member_user" 2>/dev/null) || return 1
 	case "$member_uid" in '' | *[!0-9]*) return 1 ;; esac
 	[ "$member_uid" -gt 0 ] || return 1
+	# The members group is what sshd's Match blocks key on, so an account
+	# outside it is not a member however its name is spelled.
+	member_phase=group
+	case " $(id -Gn "$member_user" 2>/dev/null) " in
+	*" members "*) ;;
+	*) return 1 ;;
+	esac
+	member_phase=reserved
+	member_reserved="${RESERVED_USERNAMES:-${ONBOARD_STORE:-/var/db/onboard}/reserved-usernames.txt}"
+	if [ -r "$member_reserved" ] &&
+		grep -qx "$member_user" "$member_reserved"; then
+		return 1
+	fi
 	member_phase=maildir
 	[ -d "$member_home/Maildir" ] || return 1
 	member_phase=record
