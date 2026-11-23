@@ -837,30 +837,47 @@ async fn target_for_application(
         return Ok(None);
     }
     // The root-only snapshot is written at review and again, carrying the
-    // payment block, at approval. The handler owns `applications/` and can
-    // rewrite it after the mail, so its payment block is not what decides where
-    // a card payment lands.
-    let snapshot = store.reviewed_application(application).await?;
-    let token = snapshot
-        .as_ref()
-        .and_then(|record| record.payment.as_ref())
-        .and_then(|payment| payment.token_ref.clone());
-    if let Some(token) = token {
+    // payment block, at approval. It is authoritative: a snapshot without a
+    // token is a free approval or an unapproved record, and the handler's copy
+    // cannot add one.
+    if let Some(record) = store.reviewed_application(application).await? {
+        let Some(token) = record.payment.and_then(|payment| payment.token_ref) else {
+            return Ok(None);
+        };
         return target_for_payment_reference(store, &token).await;
     }
-    // Transition: an approval that ran before the snapshot existed, and a
-    // review snapshot an old approval never updated, still resolve through the
-    // handler's record. New approvals always carry the root token above.
-    // shortcut: a handler-planted payment block can answer here until the
-    // record is approved once more; upgrade when the pre-upgrade applications
-    // have been purged.
-    let Some(record) = store.application(application).await? else {
-        return Ok(None);
-    };
-    let Some(token) = record.payment.and_then(|payment| payment.token_ref) else {
-        return Ok(None);
-    };
-    target_for_payment_reference(store, &token).await
+    // An approval that ran before the snapshot existed resolves from the
+    // root-owned account it wrote. `payment.application_ref` is the status token
+    // the card link carried, and the retained application copy inside the
+    // mailbox names a group's token. The handler's `applications/` file is never
+    // read here.
+    for username in store.list("accounts").await? {
+        let Some(account) = store.account(&username).await? else {
+            continue;
+        };
+        if let Some(payment) = account.payment_state() {
+            if payment.application_ref.as_deref() == Some(application) {
+                if let Some(token) = payment.token_ref.as_deref() {
+                    if let Some(target) = target_for_payment_reference(store, token).await? {
+                        return Ok(Some(target));
+                    }
+                }
+            }
+        }
+        let Some(domain) = account.group.as_deref() else {
+            continue;
+        };
+        let Some(copy) = store.account_application_text(&username).await? else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&copy) else {
+            continue;
+        };
+        if value.get("status_token").and_then(Value::as_str) == Some(application) {
+            return Ok(Some(TargetRef::Group(domain.to_string())));
+        }
+    }
+    Ok(None)
 }
 
 /// Attach a subscription and its customer to an account or a group, which is

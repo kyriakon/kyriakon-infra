@@ -62,7 +62,10 @@ ping_url() {
 			printf 'data-binary = "@%s"\n' "$body_file"
 		fi
 	} > "$conf"
-	curl -fsS -m 10 --retry 3 -K "$conf" >/dev/null 2>&1 || true
+	(
+		trap '[ -n "$body_file" ] && rm -f "$body_file"; rm -f "$conf"' EXIT HUP INT TERM
+		curl -fsS -m 10 --retry 3 -K "$conf" >/dev/null 2>&1 || true
+	)
 	rm -f "$conf" "$body_file"
 }
 

@@ -54,36 +54,60 @@ is_bcrypt() {
 	return 0
 }
 
-# set_hash <username>: replace that account's password field in master.passwd and
-# rebuild the databases. `hash` is read from the caller's environment, never from
-# argv; the private copy is written under the same directory so the final rename
-# cannot cross a filesystem.
+# set_hash <username>: replace that account's password field through vipw, which
+# takes the same lock as usermod and pwd_mkdb and therefore cannot lose a
+# concurrent add or delete. `hash` is read by the editor from a 0600 file, never
+# from argv or the environment.
 set_hash() {
 	user="$1"
 	master="${MASTER_PASSWD:-/etc/master.passwd}"
-	mkdb="${PWD_MKDB:-pwd_mkdb}"
+	editor_cmd="${VIPW:-vipw}"
 	dir=${master%/*}
 	[ "$dir" = "$master" ] && dir=.
 	hashfile=$(mktemp "$dir/.mail-password-hash.XXXXXX") || die "cannot make a private hash file"
-	tmp=$(mktemp "$dir/.master.passwd.XXXXXX") || {
+	editor=$(mktemp "$dir/.mail-password-editor.XXXXXX") || {
 		rm -f "$hashfile"
-		die "cannot make a private master.passwd copy"
+		die "cannot make a private editor"
 	}
-	trap 'rm -f "$hashfile" "$tmp"' EXIT HUP INT TERM
-	chmod 0600 "$hashfile" "$tmp"
+	trap 'rm -f "$hashfile" "$editor"' EXIT HUP INT TERM
+	chmod 0600 "$hashfile"
+	chmod 0700 "$editor"
 	printf '%s\n' "$hash" > "$hashfile" || die "cannot write the private hash file"
 	count=$(awk -F: -v u="$user" '$1 == u { n++ } END { print n + 0 }' "$master")
 	[ "$count" -eq 1 ] || die "there is no single master.passwd entry for $user"
-	awk -F: -v u="$user" '
-		BEGIN { OFS = ":" }
-		NR == FNR { password = $0; next }
-		$1 == u { $2 = password }
-		{ print }
-	' "$hashfile" "$master" > "$tmp" || die "cannot build the new master.passwd"
-	"$mkdb" -p -u "$user" "$tmp" || die "pwd_mkdb refused the new password database"
-	mv "$tmp" "$master" || die "cannot install the new master.passwd"
-	rm -f "$hashfile"
+	cat > "$editor" <<'EDITOR'
+#!/bin/sh
+set -e
+umask 077
+awk -F: -v u="$USER_NAME" '
+	BEGIN { OFS = ":" }
+	NR == FNR { password = $0; next }
+	$1 == u { $2 = password }
+	{ print }
+' "$HASH_FILE" "$1" > "$1.new"
+mv "$1.new" "$1"
+EDITOR
+	USER_NAME=$user
+	HASH_FILE=$hashfile
+	export USER_NAME HASH_FILE
+	EDITOR=$editor VISUAL=$editor "$editor_cmd" >/dev/null ||
+		die "vipw refused to update the password database"
+	unset USER_NAME HASH_FILE
+	rm -f "$hashfile" "$editor"
 	trap - EXIT HUP INT TERM
+}
+
+# read_hash: read exactly one line from stdin. `read` returns non-zero at EOF
+# even when it filled the variable, and the drain may write the bytes without a
+# trailing newline, so data is accepted whether or not the line ended.
+read_hash() {
+	hash=""
+	IFS= read -r hash || [ -n "$hash" ] || die "no bcrypt hash on stdin"
+	[ -n "$hash" ] || die "the bcrypt hash on stdin is empty"
+	if IFS= read -r extra; then
+		: "$extra"
+		die "stdin carries more than one line"
+	fi
 }
 
 self_test() {
@@ -106,33 +130,47 @@ self_test() {
 		"$(is_bcrypt "$old
 extra" && printf yes || printf no)" no
 
-	# The stdin and no-argv contract, against a private master.passwd and a
-	# pwd_mkdb that records its own argv. The hash must reach the file and never
-	# the command line.
+	# The stdin contract: the drain writes the hash bytes without a trailing
+	# newline, and `read` returns non-zero at EOF after filling the variable.
 	# shellcheck disable=SC2154 # set by self_test_begin
 	tree=$self_test_work
+	printf '%s' "$new" > "$tree/no-newline"
+	read_hash < "$tree/no-newline"
+	check "a hash with no trailing newline is accepted" "$hash" "$new"
+	printf '%s\n' "$new" > "$tree/with-newline"
+	read_hash < "$tree/with-newline"
+	check "a newline-terminated hash is accepted" "$hash" "$new"
+	printf '%s\nextra\n' "$new" > "$tree/two-lines"
+	if ( read_hash < "$tree/two-lines" ); then two_rc=0; else two_rc=$?; fi
+	check "more than one line on stdin is refused" "$two_rc" 1
+
+	# The stdin and no-argv contract, against a private master.passwd and a
+	# pwd_mkdb stub that renames its file argument as the real one does. The
+	# hash must reach the file and never the command line.
 	master=$tree/master.passwd
 	printf 'root:%s:0:0::0:0:root:/root:/bin/ksh\nalice:%s:1000:1000::0:0:Alice:/home/alice:/bin/ksh\n' \
 		"$old" "$old" > "$master"
-	mkdb_log=$tree/mkdb.argv
-	cat > "$tree/pwd_mkdb" <<'STUB'
+	mkdb_log=$tree/vipw.argv
+	cat > "$tree/vipw" <<'STUB'
 #!/bin/sh
-printf '%s\n' "$*" >>"$MKDB_LOG"
+printf 'EDITOR=%s\n' "$EDITOR" >>"$VIPW_LOG"
+"$EDITOR" "$MASTER_PASSWD"
 STUB
-	chmod 0700 "$tree/pwd_mkdb"
-	export MKDB_LOG=$mkdb_log
-	MASTER_PASSWD=$master PWD_MKDB=$tree/pwd_mkdb
+	chmod 0700 "$tree/vipw"
+	export VIPW_LOG=$mkdb_log
+	export MASTER_PASSWD=$master
+	VIPW=$tree/vipw
 	hash=$new
-	printf '%s\n' "$hash" | set_hash alice
+	printf '%s' "$hash" | set_hash alice
 	check "the stdin hash reached master.passwd" \
 		"$(awk -F: '$1 == "alice" { print $2 }' "$master")" "$new"
 	check "the root entry was left alone" \
 		"$(awk -F: '$1 == "root" { print $2 }' "$master")" "$old"
-	check "pwd_mkdb was asked for that user" \
-		"$(grep -c -- '-u alice' "$mkdb_log")" 1
+	check "vipw was given a private editor" \
+		"$(grep -c 'EDITOR=.*mail-password-editor' "$mkdb_log")" 1
 	check "the hash never reached a process argument" \
 		"$(grep -F -c -- "$hash" "$mkdb_log")" 0
-	unset MASTER_PASSWD PWD_MKDB MKDB_LOG
+	unset MASTER_PASSWD VIPW VIPW_LOG
 	self_test_end
 }
 
@@ -142,12 +180,7 @@ esac
 
 [ "$#" -eq 1 ] || die "usage: printf '%s\\n' <bcrypt-hash> | ksh $0 <username>"
 user="$1"
-IFS= read -r hash || die "no bcrypt hash on stdin"
-[ -n "$hash" ] || die "the bcrypt hash on stdin is empty"
-if IFS= read -r extra; then
-	: "$extra"
-	die "stdin carries more than one line"
-fi
+read_hash
 is_bcrypt "$hash" || die "stdin is not one bcrypt hash, so nothing was written to $user"
 id -u "$user" >/dev/null 2>&1 || die "there is no account named $user"
 home=$(getent passwd "$user" | cut -d: -f6)

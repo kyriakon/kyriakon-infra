@@ -1550,6 +1550,13 @@ fn an_approved_applications_answers_purge_after_ninety_days() {
         !fix.dir.join("store").join(&token).exists(),
         "the token record still holds the answers"
     );
+    assert!(
+        !fix.dir
+            .join("store")
+            .join(format!("reviewed/{TOKEN}.json"))
+            .exists(),
+        "the root review snapshot outlived the application"
+    );
     let account = fix.account("secretary");
     assert_eq!(
         account["outside_address"],
@@ -1650,6 +1657,15 @@ fn an_application_approved_on_the_purge_boundary_survives_its_open_window() {
     assert!(
         !copy_text.contains("cannot_pay") && !copy_text.contains("I have no money"),
         "the mailbox copy kept the answers: {copy_text}"
+    );
+    let snapshot_text = fix.read(&format!("reviewed/{TOKEN}.json"));
+    assert!(
+        snapshot_text.contains(&token_ref),
+        "the root snapshot lost the join: {snapshot_text}"
+    );
+    assert!(
+        !snapshot_text.contains("cannot_pay") && !snapshot_text.contains("I have no money"),
+        "the root snapshot kept the answers: {snapshot_text}"
     );
 
     // The card payment the mailed link opens still resolves through that

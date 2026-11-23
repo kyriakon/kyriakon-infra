@@ -147,6 +147,8 @@ pub(super) async fn spawn_script_with_stdin(
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin",
         )
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|source| Error::Spawn {
             script: path.clone(),

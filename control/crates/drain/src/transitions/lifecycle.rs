@@ -311,7 +311,8 @@ pub async fn set_password(
     store.write_record("spent", &spent, &marker).await?;
 
     let finished = async {
-        run_script_with_stdin(cfg, "set-mail-password.sh", &[username], hash.as_bytes()).await?;
+        let line = format!("{hash}\n");
+        run_script_with_stdin(cfg, "set-mail-password.sh", &[username], line.as_bytes()).await?;
 
         // One use: the mailbox keeps no link, so the page stops answering. Only
         // this link is cleared: a reset between the check above and this write
@@ -2341,11 +2342,12 @@ pub async fn change_password(
             return Ok(Settlement::refused(&e));
         }
     };
+    let line = format!("{hash}\n");
     run_script_with_stdin(
         cfg,
         "set-mail-password.sh",
         &[&account.username],
-        hash.as_bytes(),
+        line.as_bytes(),
     )
     .await?;
     // A password change is also the end of every page session: the record is
@@ -4276,6 +4278,7 @@ pub async fn purge_declined(
             .await?;
         }
         store.remove("applications", &name).await?;
+        store.remove("reviewed", &name).await?;
     }
     Ok(())
 }
@@ -4357,6 +4360,12 @@ async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result
     })?;
     store
         .write_filed_application(token, &bytes)
+        .await
+        .map_err(Error::from)?;
+    // The root snapshot keeps the same join and loses the same answers. Without
+    // this it would retain a second, un-purged copy of the application.
+    store
+        .write_reviewed_application(token, &bytes)
         .await
         .map_err(Error::from)
 }
@@ -4497,6 +4506,7 @@ pub async fn purge_applications(
         store
             .remove("applications", &format!("{token}.json"))
             .await?;
+        store.remove("reviewed", &format!("{token}.json")).await?;
         store
             .remove(&format!("accounts/{mailbox}"), "application.json")
             .await?;
@@ -4621,6 +4631,7 @@ pub async fn purge_applications(
             .await?;
         }
         store.remove("applications", &name).await?;
+        store.remove("reviewed", &name).await?;
     }
     Ok(())
 }

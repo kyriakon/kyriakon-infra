@@ -658,6 +658,11 @@ fn an_invoice_with_no_checkout_repairs_the_attachment_from_the_session() {
     account["payment"]["stripe"]["subscription"] = Value::Null;
     std::fs::write(&path, serde_json::to_vec_pretty(&account).unwrap()).unwrap();
     fix.application_record(TOKEN, "secretary", &token);
+    // The handler's copy is not consulted for a legacy status token either: the
+    // root-owned account's application_ref is what resolves it.
+    fix.amend_application(TOKEN, |record| {
+        record["payment"]["token_ref"] = json!("KYR-ZZZZ-ZZZZ-ZZZZ");
+    });
 
     fix.stripe_session_repair(TOKEN);
     fix.webhook("evt_repair", "invoice.paid", invoice("in_repair"));

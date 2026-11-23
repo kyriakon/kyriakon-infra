@@ -760,18 +760,7 @@ async fn approve(
     // The root snapshot with the payment block the approval just minted. The
     // webhook pass reads this, not the handler's copy, so a later rewrite of
     // `applications/<token>.json` cannot redirect the subscription or the year.
-    let mut reviewed = serde_json::to_value(&record).map_err(|source| Error::Json {
-        context: "encode the reviewed application",
-        source,
-    })?;
-    reviewed["status_link_until"] = json!(util::after_days(7));
-    if let Some(block) = &account.payment {
-        reviewed["payment"] = serde_json::to_value(block).map_err(|source| Error::Json {
-            context: "encode the payment block",
-            source,
-        })?;
-    }
-    snapshot_review_value(store, token, &reviewed).await?;
+    snapshot_review_payment(store, token, &record, account.payment.as_ref()).await?;
 
     // The decision email, recorded in the account's notices before it is
     // enqueued. The address outside the platform when one was given, and the
@@ -1001,19 +990,8 @@ async fn approve_group(
     // The root-only copy the webhook pass resolves this group's status token
     // through. Its `payment` block is root's, so the handler's own file cannot
     // move a card payment to another account or body.
-    let mut reviewed = serde_json::to_value(record).map_err(|source| Error::Json {
-        context: "encode the reviewed application",
-        source,
-    })?;
-    reviewed["status_link_until"] = json!(util::after_days(7));
-    if !written.payment.no_charge {
-        reviewed["payment"] =
-            serde_json::to_value(written.payment.as_payment()).map_err(|source| Error::Json {
-                context: "encode the payment block",
-                source,
-            })?;
-    }
-    snapshot_review_value(store, &record.status_token, &reviewed).await?;
+    let payment = (!written.payment.no_charge).then(|| written.payment.as_payment());
+    snapshot_review_payment(store, &record.status_token, record, payment.as_ref()).await?;
     let price = cfg.group_price_gbp.as_str();
     // A group on a cash rail has no Stripe link, and asking for one would fail
     // the approval of a body that never chose the card rail.
@@ -1229,10 +1207,28 @@ async fn decline(
 
 /// Write the root-only review snapshot from the reviewed record.
 async fn snapshot_review(store: &Store, token: &str, record: &Record) -> Result<(), Error> {
-    let value = serde_json::to_value(record).map_err(|source| Error::Json {
+    snapshot_review_payment(store, token, record, None).await
+}
+
+/// Write the snapshot with an approval's payment join, when it has one. One
+/// shape for the review, the person approval and the group approval.
+async fn snapshot_review_payment(
+    store: &Store,
+    token: &str,
+    record: &Record,
+    payment: Option<&Payment>,
+) -> Result<(), Error> {
+    let mut value = serde_json::to_value(record).map_err(|source| Error::Json {
         context: "encode the reviewed application",
         source,
     })?;
+    value["status_link_until"] = json!(util::after_days(7));
+    if let Some(payment) = payment {
+        value["payment"] = serde_json::to_value(payment).map_err(|source| Error::Json {
+            context: "encode the payment block",
+            source,
+        })?;
+    }
     snapshot_review_value(store, token, &value).await
 }
 
