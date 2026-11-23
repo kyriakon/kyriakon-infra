@@ -293,7 +293,11 @@ check_maildir_ciphertext "$target"
 repo_count=0
 for repo in "$target"/home/*/repos/*.git; do
 	[ -d "$repo" ] || continue
-	git --git-dir="$repo" fsck >/dev/null || die "git fsck failed: $repo"
+	# restic restores the member's uid and gid, so the drill runs as root on a
+	# repository owned by someone else; git refuses that as dubious ownership
+	# unless the path is named. The restored repository is the snapshot's, not
+	# a checkout, so the exception is this command only.
+	git -c safe.directory="$repo" --git-dir="$repo" fsck >/dev/null || die "git fsck failed: $repo"
 	repo_count=$(( repo_count + 1 ))
 done
 if [ "$repo_count" -eq 0 ]; then

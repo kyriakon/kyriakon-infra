@@ -18,7 +18,7 @@
 # naming core.fsmonitor) at /home/www/<user>.kyriakon.net/www/repo.git, then
 # push to it on 2222 and git runs the hook as the member. git-shell also runs
 # executables from ~/git-shell-commands as custom commands. This wrapper closes
-# both: it accepts the three git commands and nothing else, it refuses any
+# both: it accepts the two git commands and nothing else, it refuses any
 # repository outside ~/repos/<name>.git, and it turns hooks and the monitor
 # command off on the command line before git reads the repository's config.
 #
@@ -48,13 +48,12 @@
 # shortcut: nothing enforces that version floor; add the check when
 # install-packages.sh is next changed.
 #
-# The known exec channel the allowlist leaves open. A format defined by
-# tar.<format>.command runs through git-upload-archive, one of the three
-# allowlisted verbs, when the repository also sets tar.<format>.remote=true;
-# user-defined formats are not remote-enabled without it. That is an exec
-# channel for an account with no shell, so dropping upload-archive from the
-# allowlist is what closes it. It stays because the per-member hosting spec
-# names the verb, and changing the allowlist is a spec change, not a fix here.
+# Why upload-archive is not allowlisted. A format defined by
+# tar.<format>.command runs through git-upload-archive when the repository also
+# sets tar.<format>.remote=true; user-defined formats are not remote-enabled
+# without it. The repository config is the member's, so that is an exec channel
+# for an account with no shell. The verb is left out, and the session serves
+# push and fetch only.
 # Why the ForceCommand mode. Port 2222's block carries a ForceCommand of this
 # wrapper, which states the port's boundary in sshd_config rather than leaving it
 # to the login class. sshd runs the forced command through the login shell with
@@ -65,6 +64,11 @@
 # session on 2222 is refused as a non-git command whether its request was replaced
 # by the ForceCommand or handed to the login shell directly, and a git push
 # reaches the allowlist, path and git-config checks below unchanged.
+#
+# Sourced. The provisioning self-test sources this file, sets `home` to its
+# fixture and calls run_command, so a push crosses the same path rules and
+# dispatch a session does. The serve call at the bottom runs only when the file
+# is executed under its own name, so a sourced copy serves no session.
 #
 # Usage (sshd does this; a human only runs --self-test):
 #   member-git-shell.sh -c "git-receive-pack '/home/<user>/repos/<name>.git'"
@@ -84,7 +88,7 @@ home=''
 script_dir=$(cd "$(dirname "$0")" && pwd)
 
 usage() {
-	printf 'usage: %s -c "<git-receive-pack|git-upload-pack|git-upload-archive> <path>"\n' "$0" >&2
+	printf 'usage: %s -c "<git-receive-pack|git-upload-pack> <path>"\n' "$0" >&2
 	printf '       %s --self-test\n' "$0" >&2
 	exit 1
 }
@@ -171,14 +175,14 @@ run_command() {
 	typeset command sub rest repo cand verb
 	command=$1
 	sub=''
-	for cand in git-receive-pack git-upload-pack git-upload-archive; do
+	for cand in git-receive-pack git-upload-pack; do
 		if [ "${command#"$cand "}" != "$command" ]; then
 			sub=$cand
 			break
 		fi
 	done
 	[ -n "$sub" ] ||
-		die "refusing a command that is not git-receive-pack, git-upload-pack or git-upload-archive"
+		die "refusing a command that is not git-receive-pack or git-upload-pack"
 	rest=${command#"$sub "}
 	[ -n "$rest" ] || die "refusing $sub with no repository"
 	# git's client sq-quotes the path; the characters a quote could protect are
@@ -238,7 +242,8 @@ EOF
 
 	# A push or fetch naming anything but ~/repos/<name>.git is refused before
 	# git starts: the upload tree (outside this script's allowlist by design),
-	# `..` climbing, and a command that is not git.
+	# `..` climbing, a command that is not git, and upload-archive, which is not
+	# allowlisted because its tar format command is an exec channel.
 	for command in \
 		"git-receive-pack '/home/www/alice.kyriakon.net/www/repo.git'" \
 		"git-upload-pack '/home/www/alice.kyriakon.net/www/repo.git'" \
@@ -297,11 +302,13 @@ EOF
 		( run_command "git-upload-pack '$arg'" ) >/dev/null 2>&1 || rc=$?
 		check "accepts a fetch of $arg" "$rc" 0
 	done
+	# git-upload-archive is refused rather than accepted: a tar.<format>.command
+	# in the member-owned repository config would run through it.
 	rm -f "$tree/git.argv" "$tree/git.env"
-	( run_command "git-upload-archive '$home/repos/pass.git'" ) >/dev/null 2>&1 || true
-	check "accepts an archive read" \
-		"$(cat "$tree/git.argv" 2>/dev/null)" \
-		"-c core.hooksPath=/dev/null -c core.fsmonitor=false upload-archive $home/repos/pass.git"
+	rc=0
+	( run_command "git-upload-archive '$home/repos/pass.git'" ) >/dev/null 2>&1 || rc=$?
+	check "a repository archive read is refused" \
+		"$rc/$([ -e "$tree/git.argv" ] && printf ran || printf stopped)" '1/stopped'
 
 	# The member's global config defines a hook git runs on a fetch. The stub
 	# runs it only when GIT_CONFIG_GLOBAL is not /dev/null, so a wrapper that
@@ -324,7 +331,7 @@ EOF
 	out=$( (cd "$home" && run_command "$(client_command -c "$forced")") 2>&1) || rc=$?
 	check "a forced sftp subsystem request is refused as a non-git command" \
 		"$rc/$out" \
-		'1/kyriakon git shell: refusing a command that is not git-receive-pack, git-upload-pack or git-upload-archive'
+		'1/kyriakon git shell: refusing a command that is not git-receive-pack or git-upload-pack'
 	SSH_ORIGINAL_COMMAND="git-upload-pack '$home/repos/pass.git'"
 	rm -f "$tree/git.argv" "$tree/git.env"
 	rc=0
@@ -354,13 +361,24 @@ case "${1:-}" in
 	;;
 esac
 
-cmd=$(client_command "$@")
+# serve: the session path, run only by the name guard below.
+serve() {
+	typeset cmd user
+	cmd=$(client_command "$@")
 
-user=$(id -un) || die "cannot find the account name"
-home=$(getent passwd "$user" 2>/dev/null | awk -F: 'NR == 1 { print $6 }')
-[ -n "$home" ] || home=${HOME:-}
-[ -n "$home" ] || die "cannot find the home directory of $user"
-home=$(canonical "$home") || die "refusing: $home is not a directory"
+	user=$(id -un) || die "cannot find the account name"
+	home=$(getent passwd "$user" 2>/dev/null | awk -F: 'NR == 1 { print $6 }')
+	[ -n "$home" ] || home=${HOME:-}
+	[ -n "$home" ] || die "cannot find the home directory of $user"
+	home=$(canonical "$home") || die "refusing: $home is not a directory"
 
-[ -x "$git" ] || die "no git at $git"
-run_command "$cmd"
+	[ -x "$git" ] || die "no git at $git"
+	run_command "$cmd"
+}
+
+# ${0##*/} is this file's name when it is executed, whatever directory sshd or
+# a test reached it through. A sourced copy keeps its caller's $0, so it only
+# gets the functions above.
+case "${0##*/}" in
+member-git-shell.sh) serve "$@" ;;
+esac
