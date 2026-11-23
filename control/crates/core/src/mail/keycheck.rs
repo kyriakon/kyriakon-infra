@@ -190,34 +190,32 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Verify `payload` with the public key in `key_file`, in a scratch GNUPGHOME
-/// holding only that key, so a good signature is by that key and by nothing
-/// else. `signature` is a detached signature; `None` means `payload` is itself
-/// a clearsigned message. `Ok(Some(fingerprint))` names the signing key gpg
-/// reported, `Ok(None)` is a signature that does not verify, and `Err` is gpg
-/// failing to run or the key not importing.
-pub async fn verify_signature(
-    gpg: &str,
-    key_file: &Path,
-    payload: &[u8],
-    signature: Option<&[u8]>,
-) -> Result<Option<String>, Error> {
-    // gpg's agent socket lives under the homedir, and a UNIX socket path is
-    // bounded: a long per-user temp directory fails to connect the agent rather
-    // than failing to read the key. /tmp is short on every box this runs on.
-    let home = std::path::PathBuf::from("/tmp").join(format!("kyriakon-gpg-{}", ulid::Ulid::new()));
-    tokio::fs::create_dir_all(&home)
-        .await
-        .map_err(|e| Error::context(format!("cannot create {}", home.display()), e))?;
-    // gpg refuses a homedir another user could read, and the scratch directory
-    // is created with the process umask otherwise.
-    tokio::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
-        .await
-        .map_err(|e| Error::context(format!("cannot set the mode on {}", home.display()), e))?;
-    let run = async {
+/// A scratch GNUPGHOME holding exactly one public key, removed when it drops.
+/// gpg's agent socket lives under the homedir, and a UNIX socket path is
+/// bounded: a long per-user temp directory fails to connect the agent rather
+/// than failing to read the key. /tmp is short on every box this runs on.
+struct ScratchHome(PathBuf);
+
+impl ScratchHome {
+    async fn new(gpg: &str, key_file: &Path) -> Result<Self, Error> {
+        let home = PathBuf::from("/tmp").join(format!("kyriakon-gpg-{}", ulid::Ulid::new()));
+        tokio::fs::create_dir_all(&home)
+            .await
+            .map_err(|e| Error::context(format!("cannot create {}", home.display()), e))?;
+        let scratch = Self(home);
+        // gpg refuses a homedir another user could read, and the scratch
+        // directory is created with the process umask otherwise.
+        tokio::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| {
+                Error::context(
+                    format!("cannot set the mode on {}", scratch.path().display()),
+                    e,
+                )
+            })?;
         let import = Command::new(gpg)
             .args(["--batch", "--no-tty", "--no-options", "--homedir"])
-            .arg(&home)
+            .arg(scratch.path())
             .arg("--import")
             .arg(key_file)
             .output()
@@ -231,42 +229,127 @@ pub async fn verify_signature(
                 String::from_utf8_lossy(&import.stderr).trim()
             )));
         }
-        let message = home.join("message");
-        tokio::fs::write(&message, payload)
+        Ok(scratch)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn file(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for ScratchHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Verify `payload` with the public key in `key_file`, in a scratch GNUPGHOME
+/// holding only that key, so a good signature is by that key and by nothing
+/// else. `signature` is a detached signature; `None` means `payload` is itself
+/// a clearsigned message. `Ok(Some(fingerprint))` names the signing key gpg
+/// reported, `Ok(None)` is a signature that does not verify, and `Err` is gpg
+/// failing to run or the key not importing.
+pub async fn verify_signature(
+    gpg: &str,
+    key_file: &Path,
+    payload: &[u8],
+    signature: Option<&[u8]>,
+) -> Result<Option<String>, Error> {
+    let home = ScratchHome::new(gpg, key_file).await?;
+    let message = home.file("message");
+    tokio::fs::write(&message, payload)
+        .await
+        .map_err(|e| Error::context(format!("cannot write {}", message.display()), e))?;
+    let mut verify = Command::new(gpg);
+    verify
+        .args(["--batch", "--no-tty", "--no-options", "--homedir"])
+        .arg(home.path())
+        .args(["--status-fd", "1", "--verify"]);
+    if let Some(signature) = signature {
+        let sig = home.file("signature.asc");
+        tokio::fs::write(&sig, signature)
             .await
-            .map_err(|e| Error::context(format!("cannot write {}", message.display()), e))?;
-        let mut verify = Command::new(gpg);
-        verify
-            .args(["--batch", "--no-tty", "--no-options", "--homedir"])
-            .arg(&home)
-            .args(["--status-fd", "1", "--verify"]);
-        if let Some(signature) = signature {
-            let sig = home.join("signature.asc");
-            tokio::fs::write(&sig, signature)
-                .await
-                .map_err(|e| Error::context(format!("cannot write {}", sig.display()), e))?;
-            verify.arg(sig);
-        }
-        let out = verify
-            .arg(&message)
-            .output()
-            .await
-            .map_err(|e| Error::context(format!("cannot run {gpg}"), e))?;
-        if !out.status.success() {
-            return Ok(None);
-        }
-        // gpg's own report names the key that made the signature; the status
-        // line is `VALIDSIG <fingerprint> <date> ...`.
-        let status = String::from_utf8_lossy(&out.stdout);
-        Ok(status.lines().find_map(|line| {
-            line.strip_prefix("[GNUPG:] VALIDSIG ")
-                .and_then(|rest| rest.split_whitespace().next())
-                .map(str::to_string)
-        }))
+            .map_err(|e| Error::context(format!("cannot write {}", sig.display()), e))?;
+        verify.arg(sig);
+    }
+    let out = verify
+        .arg(&message)
+        .output()
+        .await
+        .map_err(|e| Error::context(format!("cannot run {gpg}"), e))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    // gpg's own report names the key that made the signature; the status
+    // line is `VALIDSIG <fingerprint> <date> ...`.
+    let status = String::from_utf8_lossy(&out.stdout);
+    Ok(status.lines().find_map(|line| {
+        line.strip_prefix("[GNUPG:] VALIDSIG ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_string)
+    }))
+}
+
+/// The plaintext GnuPG itself extracted from a clearsigned message, and the
+/// fingerprint it reported. Only this text is safe to show: the signature
+/// checked and the document printed are the same one, unlike the bytes between
+/// an armour marker and a signature marker found by searching the file (#924).
+#[derive(Debug)]
+pub struct Clearsigned {
+    pub fingerprint: String,
+    pub plaintext: String,
+}
+
+/// Verify a clearsigned message and return GnuPG's own plaintext for it. The
+/// plaintext is read only after gpg exits successfully and reports a valid
+/// signature; `Ok(None)` is a message that did not verify, and `Err` is gpg
+/// failing to run, a missing output, or plaintext that is not UTF-8.
+pub async fn verify_clearsigned(
+    gpg: &str,
+    key_file: &Path,
+    payload: &[u8],
+) -> Result<Option<Clearsigned>, Error> {
+    let home = ScratchHome::new(gpg, key_file).await?;
+    let message = home.file("message");
+    tokio::fs::write(&message, payload)
+        .await
+        .map_err(|e| Error::context(format!("cannot write {}", message.display()), e))?;
+    let output = home.file("plaintext");
+    let out = Command::new(gpg)
+        .args(["--batch", "--no-tty", "--no-options", "--homedir"])
+        .arg(home.path())
+        .args(["--status-fd", "1", "--output"])
+        .arg(&output)
+        .arg("--decrypt")
+        .arg(&message)
+        .output()
+        .await
+        .map_err(|e| Error::context(format!("cannot run {gpg}"), e))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let status = String::from_utf8_lossy(&out.stdout);
+    let Some(fingerprint) = status.lines().find_map(|line| {
+        line.strip_prefix("[GNUPG:] VALIDSIG ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_string)
+    }) else {
+        return Ok(None);
     };
-    let result = run.await;
-    let _ = tokio::fs::remove_dir_all(&home).await;
-    result
+    let plaintext = tokio::fs::read(&output)
+        .await
+        .map_err(|e| Error::context(format!("cannot read {}", output.display()), e))?;
+    let plaintext = String::from_utf8(plaintext).map_err(|_| {
+        Error::Failed("the clearsigned message's verified plaintext is not UTF-8".to_string())
+    })?;
+    Ok(Some(Clearsigned {
+        fingerprint,
+        plaintext,
+    }))
 }
 
 /// Inspect an OpenSSH public key: the shape sftp and git will accept. A shape

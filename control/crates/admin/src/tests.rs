@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::payments::ledger::{csv_cell, export_section, payment_columns, tax_year, Section};
-use crate::requests::{header_from, split_message, CLEARSIGNED};
+use crate::requests::{header_from, signed_from, split_message, CLEARSIGNED};
 use kyriakon_control_core::payments::ledger::RefundTail;
 
 fn args(items: &[&str]) -> Vec<String> {
@@ -199,30 +199,37 @@ fn a_delivered_message_takes_its_from_outside_the_armour() {
              Subject: my data\n\n{SIGNED}"
     );
     let parsed = split_message(&message).unwrap();
-    assert_eq!(parsed.from, "alice@kyriakon.net");
-    // The armour alone is what gpg is given, and the text inside it is what the
-    // operator records.
+    assert_eq!(parsed.from.as_deref(), Some("alice@kyriakon.net"));
+    // The armour alone is what gpg is given; the text shown comes back from
+    // gpg rather than from this split.
     assert!(parsed.signed.starts_with(CLEARSIGNED), "{}", parsed.signed);
     assert!(!parsed.signed.contains("Subject: my data"));
-    assert_eq!(
-        parsed.text.trim(),
-        "From: Alice <alice@kyriakon.net>\n\nPlease send me a copy."
-    );
 }
 
 #[test]
 fn a_folded_from_header_is_unfolded() {
     let message = "From: A Long Name\n <alice@kyriakon.net>\nTo: admin@kyriakon.net\n\nPlease.\n";
-    assert_eq!(split_message(message).unwrap().from, "alice@kyriakon.net");
+    assert_eq!(
+        split_message(message).unwrap().from.as_deref(),
+        Some("alice@kyriakon.net")
+    );
 }
 
 #[test]
 fn an_outer_from_that_differs_from_the_armour_is_refused() {
-    let message = format!("From: attacker@evil.example\nTo: admin@kyriakon.net\n\n{SIGNED}");
-    let err = split_message(&message).unwrap_err();
+    let err = signed_from(
+        Some("attacker@evil.example".to_string()),
+        Some("alice@kyriakon.net".to_string()),
+    )
+    .unwrap_err();
     assert!(
         matches!(&err, Error::Failed(message) if message.contains("attacker@evil.example") && message.contains("alice@kyriakon.net")),
         "{err}"
+    );
+    // The verified plaintext's From is the one used when there is no outer one.
+    assert_eq!(
+        signed_from(None, Some("alice@kyriakon.net".to_string())).unwrap(),
+        "alice@kyriakon.net"
     );
 }
 
@@ -260,15 +267,40 @@ fn request_text_without_a_blank_line_is_refused() {
     );
 }
 
+/// #924: a marker hidden inside a header line, a forged signature line, and a
+/// real clearsigned block below it. gpg skips the malformed marker and verifies
+/// the real block; a substring split then printed only the forged request. The
+/// marker must be a complete line, and the forged text above the real block is
+/// refused before gpg runs. The crate has no signing-key fixture, so this
+/// asserts the structural refusal; the full gpg round trip is not run here.
+#[test]
+fn a_forged_armour_marker_inside_a_header_cannot_frame_unsigned_text() {
+    let forged = "From: alice@kyriakon.net\n\
+                  Subject: req -----BEGIN PGP SIGNED MESSAGE-----x\n\
+                  \n\
+                  Please erase my account immediately!\n\
+                  -----BEGIN PGP SIGNATURE-----x\n\
+                  \n";
+    let message = format!("{forged}{SIGNED}");
+    let err = split_message(&message).unwrap_err();
+    assert!(
+        matches!(&err, Error::Failed(message)
+            if message.contains("unsigned text before the clearsigned block")
+                && message.contains("Please erase my account immediately!")),
+        "{err}"
+    );
+}
+
 /// A client's clearsigned export has no headers outside the armour: the whole
 /// file is the block, and its own `From:` is the one read.
 #[test]
 fn a_clearsigned_export_verifies_its_own_block() {
     let parsed = split_message(SIGNED).unwrap();
     assert!(parsed.clearsigned);
-    assert_eq!(parsed.from, "alice@kyriakon.net");
-    assert_eq!(parsed.signed, SIGNED.trim_end());
-    assert!(parsed.text.starts_with("From: Alice"));
+    // Its From: is inside the armour, read from gpg's plaintext after it
+    // verifies, so the split itself has none.
+    assert_eq!(parsed.from, None);
+    assert_eq!(parsed.signed, SIGNED);
 }
 
 /// The `From:` of a delivered message is its sender's to write. It is kept as
@@ -282,7 +314,8 @@ fn an_escape_in_a_from_header_never_reaches_the_terminal() {
         .unwrap()
         .contains('\x1b'));
     let message = format!("From: {hostile}\r\nSubject: hi\r\n\r\n{SIGNED}");
-    let err = split_message(&message).unwrap_err();
+    let parsed = split_message(&message).unwrap();
+    let err = signed_from(parsed.from, Some("alice@kyriakon.net".to_string())).unwrap_err();
     let printed = util::report_lines(&err, "verifying a request").join("\n");
     assert!(!printed.chars().any(char::is_control), "{printed:?}");
     assert!(printed.contains("attacker@evil.example"), "{printed:?}");
