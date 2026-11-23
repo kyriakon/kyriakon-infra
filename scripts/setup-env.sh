@@ -97,23 +97,71 @@ choose_tui_port() {
 	return 1
 }
 
-# merge_env <pairs>: rewrite $env_dst with each KEY=value line replaced by the
-# given one, appended when the file has never had it, and every other line —
+# value_problem <value>: print why <value> cannot be written as one
+# single-quoted KEY=value line, or nothing when it can. Both the argument check
+# and merge_env use this so their refusals cannot drift apart.
+value_problem() {
+	case "$1" in
+	*"'"*) printf 'a value contains a single quote, which this file cannot express' ;;
+	*'
+'*) printf 'a value contains a newline; the file is one KEY=value per line' ;;
+	esac
+}
+
+# env_file_reads <file>: true when a plain sh with cron's PATH can source it.
+# Deliberately no -e or -u: cron and check-hygiene source the installed file
+# that way, so a hand-added reference to an unset variable is not a refusal.
+env_file_reads() {
+	# shellcheck disable=SC2016 # $1 is for the inner sh, not this script
+	env -i PATH=/usr/bin:/bin /bin/sh -c '. "$1"' sh "$1" >/dev/null 2>&1
+}
+
+# env_file_sources <candidate> <destination>: refuse a candidate that does not
+# source cleanly. Every cron line and deploy sources $env_dst, so a bad line
+# here stops the whole box's scheduled work at 02:30; checking the candidate
+# before the rename turns that into a failed run of this script. When the
+# destination is already broken, the candidate is installed anyway: refusing it
+# would lock the operator out of the script that owns the file.
+env_file_sources() {
+	if env_file_reads "$1"; then
+		return 0
+	fi
+	if [ -f "$2" ] && ! env_file_reads "$2"; then
+		printf 'setup-env: warning: %s does not source cleanly; updating it anyway so it can be repaired\n' "$2" >&2
+		return 0
+	fi
+	printf 'setup-env: %s was not installed: the new file does not source cleanly\n' "$2" >&2
+	return 1
+}
+
+# merge_env <pairs...>: rewrite $env_dst with each KEY=value line replaced by
+# the given one, appended when the file has never had it, and every other line —
 # comments and the PATH block included — passed through untouched. Written
 # through install_staged, so the file the cron lines source is either the old one
-# or the whole new one and never a partial copy.
+# or the whole new one and never a partial copy. Pairs arrive as separate
+# arguments, not newline-separated text, so a newline in a value cannot become a
+# second KEY=value line.
 merge_env() {
-	typeset pairs="$1" tmp
+	typeset tmp pair problem
+	for pair in "$@"; do
+		problem=$(value_problem "${pair#*=}")
+		if [ -n "$problem" ]; then
+			printf 'setup-env: %s\n' "$problem" >&2
+			return 1
+		fi
+	done
 	tmp=$(mktemp)
-	# Through the environment rather than -v: awk reinterprets escape
-	# sequences in a -v assignment, and these pairs are newline-separated,
-	# which -v rejects outright.
-	PAIRS="$pairs" awk -v q="'" '
-		BEGIN { n = split(ENVIRON["PAIRS"], p, "\n")
-			for (i = 1; i <= n; i++) {
-				eq = index(p[i], "=")
-				if (eq > 0) want[substr(p[i], 1, eq - 1)] = substr(p[i], eq + 1)
-			} }
+	# The pairs are parsed in BEGIN and then replaced, so awk does not treat
+	# them as input files; the last argument is the file to read.
+	awk -v q="'" '
+		BEGIN {
+			for (i = 1; i < ARGC - 1; i++) {
+				eq = index(ARGV[i], "=")
+				if (eq > 0) want[substr(ARGV[i], 1, eq - 1)] = substr(ARGV[i], eq + 1)
+			}
+			ARGV[1] = ARGV[ARGC - 1]
+			ARGC = 2
+		}
 		{
 			for (k in want) {
 				if (index($0, "export " k "=") == 1) {
@@ -125,7 +173,11 @@ merge_env() {
 			print
 		}
 		END { for (k in want) print "export " k "=" q want[k] q }
-	' "$env_dst" > "$tmp"
+	' "$@" "$env_dst" > "$tmp"
+	env_file_sources "$tmp" "$env_dst" || {
+		rm -f "$tmp"
+		return 1
+	}
 	install_staged "$tmp" "$env_dst" -m 0600 || {
 		rm -f "$tmp"
 		return 1
@@ -143,6 +195,10 @@ append_env() {
 		cat "$env_dst"
 		printf '%s\n' "$block"
 	} > "$tmp"
+	env_file_sources "$tmp" "$env_dst" || {
+		rm -f "$tmp"
+		return 1
+	}
 	install_staged "$tmp" "$env_dst" -m 0600 || {
 		rm -f "$tmp"
 		return 1
@@ -172,8 +228,7 @@ export ALERT_EMAIL='old@example.invalid'
 EOF
 	env_dst=$fixture
 
-	merge_env "ALERT_EMAIL=new@example.invalid
-KYRIAKON_IPV6=2001:db8::10"
+	merge_env "ALERT_EMAIL=new@example.invalid" "KYRIAKON_IPV6=2001:db8::10"
 
 	check "the given value is replaced" \
 		"$(grep -c "^export ALERT_EMAIL='new@example.invalid'" "$fixture")" 1
@@ -259,6 +314,122 @@ EOF
 	check "and TUI_PORT is appended where it was absent" \
 		"$(grep -c '^export TUI_PORT=' "$broken")" 1
 	check "and TITAN_PORT too" "$(grep -c '^export TITAN_PORT=' "$broken")" 1
+
+	# A value carrying a quote used to be written unbalanced, which left the
+	# file every cron line sources unable to source at all. It is refused
+	# before the write, and the file is left as it was.
+	before=$(cat "$fixture")
+	code=0
+	KYRIAKON_ENV="$fixture" ksh "$script_dir/setup-env.sh" \
+		--postal-address "1 O'Brien Street" > "$tree/quote.out" 2>&1 || code=$?
+	check "a quote in the postal address is refused" "$code" 2
+	check "and the refusal names the quote" \
+		"$(grep -c 'contains a single quote' "$tree/quote.out")" 1
+	check "and the file is untouched" "$(cat "$fixture")" "$before"
+
+	# A newline would end the KEY=value line and start a second one, so it is
+	# refused before it can add a variable the operator did not give.
+	nl_value=$(printf '1 Example Street\nEVIL=1')
+	code=0
+	KYRIAKON_ENV="$fixture" ksh "$script_dir/setup-env.sh" \
+		--postal-address "$nl_value" > "$tree/newline.out" 2>&1 || code=$?
+	check "a newline in a value is refused" "$code" 2
+	check "and the refusal names the newline" \
+		"$(grep -c 'contains a newline' "$tree/newline.out")" 1
+	check "and the file is untouched" "$(cat "$fixture")" "$before"
+
+	# The written file has to source with the value it was given: every cron
+	# line and deploy reads it that way, not by parsing it.
+	KYRIAKON_ENV="$fixture" ksh "$script_dir/setup-env.sh" \
+		--postal-address '1 Example Street & Co' > "$tree/postal.out" 2>&1 || true
+	postal=$(
+		# shellcheck disable=SC1090 # the fixture path is built by this test
+		. "$fixture" >/dev/null 2>&1 || exit 1
+		printf '%s' "${POSTAL_ADDRESS:-}"
+	) || postal='SOURCE FAILED'
+	check "a value with shell metacharacters sources back unchanged" \
+		"$postal" '1 Example Street & Co'
+
+	# The source check is the backstop for a candidate the value checks missed.
+	printf "export BROKEN='unterminated\n" > "$tree/bad.env"
+	check "a candidate that does not source is refused" \
+		"$(env_file_sources "$tree/bad.env" "$fixture" 2>/dev/null && printf accepted || printf refused)" refused
+
+	# Cron and check-hygiene source the file with a plain sh, not with this
+	# script's -e and -u; an unset variable reference is valid there.
+	# shellcheck disable=SC2016 # the reference is the literal text to write
+	printf 'export X="$NOT_SET_ANYWHERE"\nexport Y=ok\n' > "$tree/unset-var.env"
+	check "a reference to an unset variable still sources" \
+		"$(env_file_sources "$tree/unset-var.env" "$fixture" && printf accepted || printf refused)" accepted
+
+	# merge_env is also called directly with pairs, so its own guard has to
+	# refuse a newline even though the argument loop would already have done it.
+	before=$(cat "$fixture")
+	code=0
+	( merge_env "ALERT_EMAIL=$nl_value" ) \
+		> "$tree/merge-newline.out" 2>&1 || code=$?
+	check "merge_env refuses a newline itself" "$code" 1
+	check "and names the newline" \
+		"$(grep -c 'contains a newline' "$tree/merge-newline.out")" 1
+	check "and the file is untouched" "$(cat "$fixture")" "$before"
+
+	# A padded base64 secret ends in '=', which used to make the whole-pair
+	# empty test skip the value.
+	KYRIAKON_ENV="$fixture" ksh "$script_dir/setup-env.sh" \
+		--tsig-secret 'c2VjcmV0==' > "$tree/tsig.out" 2>&1 || true
+	check "a padded base64 value is merged" \
+		"$(grep -c "^export KYRIAKON_TSIG_SECRET='c2VjcmV0=='" "$fixture")" 1
+
+	# Only the first '=' separates the key; the rest belongs to the value.
+	KYRIAKON_ENV="$fixture" ksh "$script_dir/setup-env.sh" \
+		--healthchecks-url 'https://hc-ping.com/x?token=a=b' \
+		> "$tree/equal.out" 2>&1 || true
+	check "a value containing = keeps the whole value" \
+		"$(grep -cF "HEALTHCHECKS_URL='https://hc-ping.com/x?token=a=b'" "$fixture")" 1
+	eq_value=$(
+		# shellcheck disable=SC1090 # the fixture path is built by this test
+		. "$fixture" >/dev/null 2>&1 || exit 1
+		printf '%s' "${HEALTHCHECKS_URL:-}"
+	) || eq_value='SOURCE FAILED'
+	check "and sources back unchanged" \
+		"$eq_value" 'https://hc-ping.com/x?token=a=b'
+
+	# An old broken line on a key the merge does not touch must not lock the
+	# operator out: the destination is already broken, so the candidate check
+	# warns and installs rather than refusing every later update.
+	old_broken=$tree/old-broken.env
+	cat > "$old_broken" <<'EOF'
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
+export PATH
+export ALERT_EMAIL='old@example.invalid'
+export HAND_ADDED='unterminated
+EOF
+	KYRIAKON_ENV="$old_broken" ksh "$script_dir/setup-env.sh" \
+		--healthchecks-url 'https://hc-ping.com/x' \
+		> "$tree/old-broken.out" 2>&1 || true
+	check "an already-broken file can still be updated" \
+		"$(grep -c "^export HEALTHCHECKS_URL='https://hc-ping.com/x'" "$old_broken")" 1
+	check "and the old file being broken is reported" \
+		"$(grep -q 'does not source cleanly' "$tree/old-broken.out" && printf yes || printf no)" yes
+
+	# A candidate that fails the source check must not replace a file that
+	# does source: the live file stays byte-identical and no candidate is left.
+	awk_stub=$tree/awk-stub
+	mkdir "$awk_stub"
+	cat > "$awk_stub/awk" <<'EOF'
+#!/bin/sh
+printf "export BROKEN='unterminated\n"
+EOF
+	chmod +x "$awk_stub/awk"
+	before=$(cat "$fixture")
+	code=0
+	# shellcheck disable=SC2030,SC2031 # the stub PATH is for this call only
+	( PATH="$awk_stub:$PATH"; merge_env "ALERT_EMAIL=lost@example.invalid" ) \
+		> "$tree/source-failed.out" 2>&1 || code=$?
+	check "a candidate that does not source is not installed" "$code" 1
+	check "and the live file is byte-identical" "$(cat "$fixture")" "$before"
+	check "and no candidate is left behind" \
+		"$(set -- "$tree"/.kyriakon.env.*; [ -e "$1" ] && printf yes || printf no)" no
 
 	# The registry, the template and deploy-control's required keys are one set
 	# of names; a value a deploy requires must be one setup-env can write.
@@ -446,11 +617,19 @@ if [ "$given" -gt 0 ]; then
 	*) printf 'setup-env: warning: %s does not look like a sub-account URL. The restore test must not hold the backup account credentials.\n' "$a_restrepo" >&2 ;;
 	esac
 	# The file expresses values as single-quoted shell words, so a value
-	# containing a quote cannot be represented in it.
-	for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" "$a_hc" "$a_keyring_hc" "$a_reh" "$a_hcloud" "$a_restrepo" "$a_resthc" "$a_postal" "$a_ico" "$a_rep" "$a_rep_contact"; do
-		case "$v" in
-		*"'"*) printf 'setup-env: a value contains a single quote, which this file cannot express\n' >&2; exit 2 ;;
-		esac
+	# containing a quote cannot be represented in it, and a newline would end
+	# the KEY=value line and start a second one. Refuse both before the write;
+	# the free-text values (a postal address, a representative's name) are the
+	# ones an operator is most likely to type a quote into.
+	for v in "$a_ipv4" "$a_ipv6" "$a_tsig" "$a_repo" "$a_pass" "$a_email" \
+		"$a_hc" "$a_keyring_hc" "$a_reh" "$a_hcloud" "$a_restrepo" \
+		"$a_resthc" "$a_postal" "$a_stripe" "$a_group_stripe" "$a_ico" \
+		"$a_rep" "$a_rep_contact"; do
+		problem=$(value_problem "$v")
+		if [ -n "$problem" ]; then
+			printf 'setup-env: %s\n' "$problem" >&2
+			exit 2
+		fi
 	done
 	for v in "$a_ico" "$a_rep" "$a_rep_contact"; do
 		[ -n "$v" ] || continue
@@ -463,7 +642,7 @@ if [ "$given" -gt 0 ]; then
 		# Merge. Each given value replaces its own line, or is appended if the
 		# file has never had it. Everything else, comments and the PATH block
 		# included, is passed through untouched.
-		pairs=""
+		set --
 		for kv in "KYRIAKON_IPV4=$a_ipv4" "KYRIAKON_IPV6=$a_ipv6" "KYRIAKON_TSIG_SECRET=$a_tsig" \
 			"RESTIC_REPOSITORY=$a_repo" "RESTIC_PASSWORD_FILE=$a_pass" "ALERT_EMAIL=$a_email" \
 			"HEALTHCHECKS_URL=$a_hc" "KEYRING_HEALTHCHECKS_URL=$a_keyring_hc" \
@@ -472,13 +651,12 @@ if [ "$given" -gt 0 ]; then
 			"POSTAL_ADDRESS=$a_postal" "STRIPE_PAYMENT_LINK=$a_stripe" \
 			"STRIPE_GROUP_PAYMENT_LINK=$a_group_stripe" "ICO_REFERENCE=$a_ico" \
 			"EU_REPRESENTATIVE=$a_rep" "EU_REPRESENTATIVE_CONTACT=$a_rep_contact"; do
-			case "$kv" in
-			*=) continue ;;
-			esac
-			pairs="$pairs
-$kv"
+			# The value, not the whole pair: a padded base64 secret ends
+			# in '=' and must still be merged.
+			[ -n "${kv#*=}" ] || continue
+			set -- "$@" "$kv"
 		done
-		merge_env "$pairs"
+		merge_env "$@"
 		printf 'updated %s with %s value(s); the rest kept what they had\n' "$env_dst" "$given"
 	else
 	tmp=$(mktemp)
@@ -511,6 +689,10 @@ $kv"
 		if [ -n "$a_rep" ]; then printf "export EU_REPRESENTATIVE='%s'\n" "$a_rep"; fi
 		if [ -n "$a_rep_contact" ]; then printf "export EU_REPRESENTATIVE_CONTACT='%s'\n" "$a_rep_contact"; fi
 	} > "$tmp"
+	if ! env_file_sources "$tmp" "$env_dst"; then
+		rm -f "$tmp"
+		exit 1
+	fi
 	if ! install_staged "$tmp" "$env_dst" -m 0600; then
 		rm -f "$tmp"
 		exit 1
@@ -523,6 +705,7 @@ elif [ ! -f "$env_dst" ]; then
 		printf 'setup-env: no %s, and no template at %s\n' "$env_dst" "$template" >&2
 		exit 1
 	}
+	env_file_sources "$template" "$env_dst" || exit 1
 	install_staged "$template" "$env_dst" -m 0600
 	printf 'installed %s from %s\n' "$env_dst" "$template"
 fi
