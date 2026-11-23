@@ -248,6 +248,15 @@ fn session_id(username: &str) -> Result<String, Error> {
     Ok(hex[..26].to_string())
 }
 
+/// The lock over one account's record, taken by the login that writes it and
+/// by the pass that removes it. A hidden name, so `Store::list` (which drops
+/// dotfiles) never reads it as a session. It is never removed: unlinking a lock
+/// another writer holds would let a third make a second lock file for the same
+/// record.
+fn lock_path(id: &str) -> String {
+    format!("sessions/.{id}.lock")
+}
+
 /// Open a session for `username` and return the cookie's value: the id, a dot,
 /// and the HMAC of the id under the session's own secret. `proof` is the token
 /// the root-side login check printed, which the drain reads back from its own
@@ -257,6 +266,11 @@ fn session_id(username: &str) -> Result<String, Error> {
 /// so this overwrites the previous login's record instead of adding a file, and
 /// never lists the directory. A failed login writes nothing, so a member who
 /// mistypes a password keeps the session they already had.
+///
+/// The record's lock serialises two logins for one account. `write_record`
+/// stages through a fixed `.tmp` name, so without it a double submit could
+/// unlink the other's temporary or publish a record whose secret the cookie it
+/// returned does not carry.
 pub async fn open(
     store: &Store,
     username: &str,
@@ -264,6 +278,7 @@ pub async fn open(
     now: OffsetDateTime,
 ) -> Result<String, Error> {
     let id = session_id(username)?;
+    let _lock = store.lock(&lock_path(&id)).await?;
     let secret = crate::store::status_token().await?;
     let expires = (now + Duration::hours(TTL_HOURS))
         .replace_nanosecond(0)
@@ -353,7 +368,14 @@ pub async fn prune(store: &Store, now: OffsetDateTime) {
         if !name.ends_with(".json") {
             continue;
         }
-        let Ok(Some(text)) = store.session_text(name.trim_end_matches(".json")).await else {
+        let id = name.trim_end_matches(".json");
+        // The login that rewrites this record takes the same lock. Without it,
+        // a fresh record written between this read and the removal would be
+        // deleted, and the cookie the login just returned would name nothing.
+        let Ok(_lock) = store.lock(&lock_path(id)).await else {
+            continue;
+        };
+        let Ok(Some(text)) = store.session_text(id).await else {
             continue;
         };
         let expired = serde_json::from_str::<Record>(&text)
@@ -378,6 +400,11 @@ pub fn id(cookie: &str) -> Option<&str> {
 /// record's own secret makes. A cookie that names nothing, or names a record
 /// without carrying that record's signature, is a no-op: logging out twice is
 /// not an error, and an id is not the authority the signature exists to prove.
+/// The record's lock covers the second read and the removal, so a login racing
+/// this logout either lands first (its new secret fails the check, and the new
+/// session survives) or lands after (the logout removed only its own record).
+/// The first read answers a cookie with no authority before the lock exists,
+/// so an unauthenticated logout cannot litter the directory with lock files.
 pub async fn close(store: &Store, cookie: &str) {
     let Some((id, sig)) = cookie.split_once('.') else {
         return;
@@ -392,6 +419,20 @@ pub async fn close(store: &Store, cookie: &str) {
         return;
     };
     if !sign::verify(record.secret.as_bytes(), id, sig) {
+        return;
+    }
+    let Ok(_lock) = store.lock(&lock_path(id)).await else {
+        return;
+    };
+    // The record can be replaced while this waits for the lock, and the cookie
+    // signs only the record it was issued for.
+    let Ok(Some(text)) = store.session_text(id).await else {
+        return;
+    };
+    let Ok(current) = serde_json::from_str::<Record>(&text) else {
+        return;
+    };
+    if !sign::verify(current.secret.as_bytes(), id, sig) {
         return;
     }
     let _ = store.remove("sessions", &format!("{id}.json")).await;
@@ -748,6 +789,21 @@ mod tests {
         );
         prune(&store, now()).await;
         assert!(!abandoned.exists(), "the scheduled prune left it behind");
+    }
+
+    /// The prune compares the record's own expiry: a live one stays and a
+    /// spent one goes, so an inverted comparison cannot pass this.
+    #[tokio::test]
+    async fn prune_keeps_a_live_record_and_removes_a_spent_one() {
+        let store = store("prune-clock");
+        let proof = mint(&store, "alice", now().unix_timestamp() + 3600);
+        let cookie = open(&store, "alice", &proof, now()).await.unwrap();
+        let id = cookie.split_once('.').unwrap().0;
+        let path = store.path("sessions").join(format!("{id}.json"));
+        prune(&store, now() + Duration::hours(11)).await;
+        assert!(path.exists(), "a live record was pruned");
+        prune(&store, now() + Duration::hours(13)).await;
+        assert!(!path.exists(), "a spent record survived the prune");
     }
 
     /// The drain prunes the proofs, because the handler cannot read the root

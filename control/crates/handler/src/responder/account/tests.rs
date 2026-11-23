@@ -153,12 +153,8 @@ async fn a_correct_mail_password_opens_a_session_and_a_wrong_one_does_not() {
 
     // The cookie it set opens the account page, and a wrong password sets
     // nothing and comes back as the login page.
-    let cookie = body
-        .split("Set-Cookie: __Host-kyriakon_session=")
-        .nth(1)
-        .and_then(|rest| rest.split(';').next())
-        .expect("the cookie value");
-    let (code, _) = ask(&app, &httpd_get_session("account", "", cookie)).await;
+    let cookie = session_cookie(&body);
+    let (code, _) = ask(&app, &httpd_get_session("account", "", &cookie)).await;
     assert_eq!(code, 200);
 
     let (code, wrong) = ask(
@@ -199,13 +195,7 @@ async fn a_second_login_ends_the_first_sessions_authority() {
         )
         .await;
         assert_eq!(code, 303, "{body}");
-        let cookie = body
-            .split("Set-Cookie: __Host-kyriakon_session=")
-            .nth(1)
-            .and_then(|rest| rest.split(';').next())
-            .expect("the cookie value")
-            .to_string();
-        cookies.push(cookie);
+        cookies.push(session_cookie(&body));
     }
     let records = std::fs::read_dir(dir.join("sessions"))
         .unwrap()

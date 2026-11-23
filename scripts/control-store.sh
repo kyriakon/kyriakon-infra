@@ -20,7 +20,7 @@
 # The split is the spec's. The unprivileged `_onboard` user writes exactly five
 # directories, intents/ (one JSON per submission, written by rename), drafts/
 # (the capsule and TUI's server-side state), applications/ (the record the status
-# page renders), sessions/ (one file per live account-page login) and webhooks/
+# page renders), sessions/ (one record per account's live page session) and webhooks/
 # (a webhook's raw body and signature header). It also owns mail/, the Maildir
 # the smtpd action for apply@ delivers into as that user. The rest belongs to the
 # root drain: accounts, groups, tokens, keys (the members' public upload keys,

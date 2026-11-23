@@ -193,9 +193,13 @@ fn a_password_change_revokes_the_live_page_session() {
     logging_script(&fix, "set-mail-password.sh");
     let old = fix.open_session("alice");
     assert!(fix.session_is_live(&old));
-    fix.file_page_action(
+    // Filed with the record this cookie belongs to. The helper's own login
+    // would replace that record on the way to filing, and the assertion below
+    // would then pass without `close_all` having run.
+    fix.file_page_action_with_session(
         "change-password",
         "alice",
+        Fix::session_id(&old),
         json!({"password": "a long new password"}),
     );
 
@@ -206,8 +210,10 @@ fn a_password_change_revokes_the_live_page_session() {
         "the cookie from before the change still opens the account"
     );
     assert!(
-        fix.names("sessions").is_empty(),
-        "a session survived the change: {:?}",
+        fix.names("sessions")
+            .iter()
+            .all(|name| !name.ends_with(".json")),
+        "a session record survived the change: {:?}",
         fix.names("sessions")
     );
     let fresh = fix.open_session("alice");
@@ -215,6 +221,73 @@ fn a_password_change_revokes_the_live_page_session() {
         fix.session_is_live(&fresh),
         "a login after the change was refused"
     );
+}
+
+/// An intent filed with a page session is refused after a later login replaced
+/// that account's record. The record instance, not the username's id, is the
+/// session the action was filed with, so a stolen cookie cannot ride a later
+/// login through a pending intent.
+#[test]
+fn an_intent_filed_before_a_later_login_is_refused() {
+    let fix = Fix::new("account-session-relogin");
+    fix.page_account("alice", json!({}));
+    let before = fix.read("accounts/alice/account.json");
+    let old = fix.open_session("alice");
+    let id = Fix::session_id(&old).to_string();
+
+    // Back-date the record's creation and file the intent an hour later, so the
+    // intent is the session's own. The fixture clock is the real one, so a
+    // later login is the only thing that can make the record newer.
+    let path = fix.dir.join("store/sessions").join(format!("{id}.json"));
+    let now = time::OffsetDateTime::now_utc();
+    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    record["created_at"] = json!(kyriakon_control_core::util::stamp(
+        now - time::Duration::hours(2)
+    ));
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let filed_at = kyriakon_control_core::util::stamp(now - time::Duration::hours(1));
+    fix.file_page_action_at(
+        "outside-address",
+        "alice",
+        &id,
+        &filed_at,
+        json!({"address": "stolen@example.invalid"}),
+    );
+
+    // A second login writes the same path with a new record. The pending
+    // intent names the old one.
+    let _fresh = fix.open_session("alice");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.journal()
+            .contains("the session was opened after the intent was filed"),
+        "{}",
+        fix.journal()
+    );
+    assert_eq!(
+        fix.read("accounts/alice/account.json"),
+        before,
+        "the refused intent reached the account"
+    );
+    assert!(fix.intents().is_empty(), "the refused intent is settled");
+}
+
+/// The drain's pass clears a page session once its twelve hours have run out,
+/// so the handler no longer has to walk the directory on a login.
+#[test]
+fn the_drain_clears_an_expired_page_session() {
+    let fix = Fix::new("account-session-prune");
+    let cookie = fix.open_session("alice");
+    let id = Fix::session_id(&cookie).to_string();
+    let path = fix.dir.join("store/sessions").join(format!("{id}.json"));
+    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    record["expires_at"] = json!("2020-01-01T00:00:00Z");
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(!path.exists(), "the pass left a spent session record");
 }
 
 /// One upload key serves sftp and git. Adding it writes the key the builder
@@ -949,7 +1022,23 @@ fn the_test_message_names_the_key_and_is_one_a_day() {
         json!({"mail_key": "SHA256:not-a-real-key-fingerprint"}),
     );
 
-    fix.file_page_action("test-mail", "alice", json!({}));
+    // The day is later than the session and later than this pass's clock, so a
+    // subject carrying it can only come from the intent. The handler stamps its
+    // real filing time; the test names one it can assert.
+    let day = kyriakon_control_core::util::date_after_days(1);
+    let filed_at = format!("{day}T09:05:00Z");
+    let file_test_mail = || {
+        let cookie = fix.open_session("alice");
+        fix.file_page_action_at(
+            "test-mail",
+            "alice",
+            Fix::session_id(&cookie),
+            &filed_at,
+            json!({}),
+        )
+    };
+
+    file_test_mail();
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     let sent = fix.sent();
@@ -963,7 +1052,7 @@ fn the_test_message_names_the_key_and_is_one_a_day() {
         "the message's own subject header: {sent}"
     );
     assert!(
-        head.contains("(2026-10-02)"),
+        head.contains(&format!("({day})")),
         "the subject's day is the intent's filing day, not this pass's clock: {sent}"
     );
     assert!(
@@ -983,7 +1072,7 @@ fn the_test_message_names_the_key_and_is_one_a_day() {
     assert!(fix.intents().is_empty(), "the applied intent is removed");
 
     // A second request the same day: the notice record refuses the message.
-    fix.file_page_action("test-mail", "alice", json!({}));
+    file_test_mail();
     assert!(fix.drain().status.success());
     assert_eq!(fix.sent(), sent, "one message a day");
     assert!(
@@ -995,7 +1084,7 @@ fn the_test_message_names_the_key_and_is_one_a_day() {
 
     // An account with no recorded key has nothing to encrypt to.
     fix.amend_account("alice", |account| account["mail_key"] = Value::Null);
-    fix.file_page_action("test-mail", "alice", json!({}));
+    file_test_mail();
     assert!(fix.drain().status.success());
     assert!(
         fix.journal().contains("no mail key recorded"),
