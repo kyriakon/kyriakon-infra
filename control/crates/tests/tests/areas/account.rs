@@ -8,7 +8,12 @@ use crate::common::*;
 /// call the transition made and in what order.
 fn logging_script(fix: &Fix, name: &str) -> String {
     let log = fix.path("scripts.log");
-    fix.script(name, &format!("#!/bin/sh\necho \"{name} $*\" >> '{log}'\n"));
+    fix.script(
+        name,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}.argv'\nprintf '%s %s\\n' '{name}' \"$*\" >> '{log}'\ncat >> '{log}.stdin'\n"
+        ),
+    );
     log
 }
 
@@ -147,18 +152,26 @@ fn a_password_change_hashes_the_plaintext_and_refuses_a_hash() {
     assert!(out.status.success(), "{}", body(&out));
     assert!(fix.intents().is_empty(), "the applied intent is removed");
     let written = std::fs::read_to_string(&log).unwrap();
-    let hash = written
-        .strip_prefix("set-mail-password.sh alice ")
-        .unwrap_or("")
-        .trim();
+    assert!(
+        written.contains("set-mail-password.sh alice"),
+        "the script did not see the account: {written}"
+    );
+    let stdin = std::fs::read_to_string(format!("{log}.stdin")).unwrap();
+    let hash = stdin.trim();
     assert!(
         kyriakon_control_core::account::password::is_hash(hash),
-        "{written}"
+        "{stdin}"
     );
     assert!(kyriakon_control_core::account::password::matches(
         "a long new password",
         hash
     ));
+    let argv = std::fs::read_to_string(format!("{log}.argv")).unwrap();
+    assert!(
+        !argv.contains(hash) && !written.contains(hash),
+        "the hash reached a process argument: {argv}"
+    );
+    assert!(argv.contains("alice"), "{argv}");
     assert!(!written.contains("a long new password"), "{written}");
     assert!(fix.journal().contains("\"outcome\":\"applied\""));
 

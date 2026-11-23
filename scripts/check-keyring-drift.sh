@@ -175,8 +175,7 @@ alert() {
 	when=$(date '+%F %T')
 	notify_operator keyring "$event" "$body"
 	if [ -n "${KEYRING_HEALTHCHECKS_URL:-}" ]; then
-		curl -fsS -m 10 --retry 3 --data "$when keyring $event: $body" "$KEYRING_HEALTHCHECKS_URL" \
-			>/dev/null 2>&1 || true
+		ping_url "$KEYRING_HEALTHCHECKS_URL" "$when keyring $event: $body"
 	fi
 }
 

@@ -802,7 +802,7 @@ fn a_card_invoice_appends_a_line_and_a_card_refund_names_it() {
     // A crash between the account save and the append leaves no line; the
     // invoice id is the dedup key that finishes it on the next pass.
     std::fs::write(fix.dir.join("store/ledger/payments.jsonl"), "").unwrap();
-    std::fs::remove_file(fix.dir.join("store/webhooks/processed.jsonl")).unwrap();
+    std::fs::remove_file(fix.dir.join("store/verified/processed.jsonl")).unwrap();
     fix.webhook("evt_card", "invoice.paid", invoice("in_card"));
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));

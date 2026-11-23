@@ -649,6 +649,22 @@ impl Fix {
             serde_json::to_vec_pretty(&record).unwrap(),
         )
         .unwrap();
+        // The root-owned account is what a legacy status token resolves
+        // through, so the fixture records the same join an approval writes.
+        let account_path = self
+            .dir
+            .join("store/accounts")
+            .join(username)
+            .join("account.json");
+        if let Ok(text) = std::fs::read_to_string(&account_path) {
+            if let Ok(mut account) = serde_json::from_str::<Value>(&text) {
+                if account.get("payment").is_some_and(Value::is_object) {
+                    account["payment"]["application_ref"] = json!(application);
+                    std::fs::write(&account_path, serde_json::to_vec_pretty(&account).unwrap())
+                        .unwrap();
+                }
+            }
+        }
     }
 
     /// Write the application record the handler would have written.

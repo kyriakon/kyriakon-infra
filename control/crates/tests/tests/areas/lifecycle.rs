@@ -87,7 +87,7 @@ fn a_password_link_applies_once_and_only_when_signed() {
     let log = fix.path("password.log");
     fix.script(
         "set-mail-password.sh",
-        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}.argv\nprintf '%s %s\\n' \"$1\" \"$(cat)\" >> {log}\n"),
     );
     let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
     let until = kyriakon_control_core::util::date_after_days(7);
@@ -220,7 +220,7 @@ fn a_damaged_spent_marker_refuses_the_pass_rather_than_replaying_the_link() {
     let log = fix.path("password.log");
     fix.script(
         "set-mail-password.sh",
-        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}.argv\nprintf '%s %s\\n' \"$1\" \"$(cat)\" >> {log}\n"),
     );
     let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
     let until = kyriakon_control_core::util::date_after_days(7);
@@ -286,7 +286,7 @@ fn a_password_link_cannot_be_pointed_at_another_account() {
     let log = fix.path("password.log");
     fix.script(
         "set-mail-password.sh",
-        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}.argv\nprintf '%s %s\\n' \"$1\" \"$(cat)\" >> {log}\n"),
     );
     let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
     let until = kyriakon_control_core::util::date_after_days(7);
@@ -376,7 +376,7 @@ fn a_password_intent_carrying_a_hash_is_refused() {
     let log = fix.path("password.log");
     fix.script(
         "set-mail-password.sh",
-        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}.argv\nprintf '%s %s\\n' \"$1\" \"$(cat)\" >> {log}\n"),
     );
     let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
     let until = kyriakon_control_core::util::date_after_days(7);
@@ -586,7 +586,7 @@ fn a_group_approval_issues_a_working_password_link_for_every_mailbox() {
     let log = fix.path("password.log");
     fix.script(
         "set-mail-password.sh",
-        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}.argv\nprintf '%s %s\\n' \"$1\" \"$(cat)\" >> {log}\n"),
     );
 
     let mut record = fix.filed_body("warden");
@@ -680,7 +680,7 @@ fn the_console_issues_a_fresh_password_link_and_refuses_an_unknown_name() {
     let log = fix.path("password.log");
     fix.script(
         "set-mail-password.sh",
-        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}.argv\nprintf '%s %s\\n' \"$1\" \"$(cat)\" >> {log}\n"),
     );
 
     let record = fix.filed_with(
@@ -792,7 +792,7 @@ fn a_failed_password_pass_is_retried_after_the_backoff() {
     let log = fix.path("password.log");
     fix.script(
         "set-mail-password.sh",
-        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n"),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}.argv\nprintf '%s %s\\n' \"$1\" \"$(cat)\" >> {log}\n"),
     );
     let key = sign::read_key(std::path::Path::new(&fix.path("key"))).unwrap();
     let until = kyriakon_control_core::util::date_after_days(7);
@@ -1700,6 +1700,13 @@ fn an_approved_applications_answers_purge_after_ninety_days() {
         !fix.dir.join("store").join(&token).exists(),
         "the token record still holds the answers"
     );
+    assert!(
+        !fix.dir
+            .join("store")
+            .join(format!("reviewed/{TOKEN}.json"))
+            .exists(),
+        "the root review snapshot outlived the application"
+    );
     let account = fix.account("secretary");
     assert_eq!(
         account["outside_address"],
@@ -1800,6 +1807,15 @@ fn an_application_approved_on_the_purge_boundary_survives_its_open_window() {
     assert!(
         !copy_text.contains("cannot_pay") && !copy_text.contains("I have no money"),
         "the mailbox copy kept the answers: {copy_text}"
+    );
+    let snapshot_text = fix.read(&format!("reviewed/{TOKEN}.json"));
+    assert!(
+        snapshot_text.contains(&token_ref),
+        "the root snapshot lost the join: {snapshot_text}"
+    );
+    assert!(
+        !snapshot_text.contains("cannot_pay") && !snapshot_text.contains("I have no money"),
+        "the root snapshot kept the answers: {snapshot_text}"
     );
 
     // The card payment the mailed link opens still resolves through that

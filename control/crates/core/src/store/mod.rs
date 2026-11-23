@@ -164,18 +164,76 @@ impl Store {
         }
     }
 
-    /// One record's bytes, `Ok(None)` only when the file is absent. An IO error
-    /// other than not-found is an error naming the file.
-    async fn record_text(&self, rel: &str) -> Result<Option<String>, Error> {
-        match tokio::fs::read_to_string(self.root.join(rel)).await {
-            Ok(text) => Ok(Some(text)),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(Error::Io {
+    /// The bytes of one store file, read only when it is a regular file.
+    ///
+    /// `O_NOFOLLOW` refuses a symlink and `O_NONBLOCK` keeps a planted FIFO
+    /// from holding the root pass open; the descriptor's own metadata then
+    /// refuses anything that is not a regular file. This is the read every
+    /// privileged reader uses, including the ones over directories the
+    /// unprivileged handler owns (`applications/`, `intents/`, `webhooks/`).
+    async fn record_bytes(&self, rel: &str) -> Result<Option<Vec<u8>>, Error> {
+        let path = self.root.join(rel);
+        let mut file = match tokio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .await
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                if source.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(Error::Refused(format!(
+                        "a symlink is planted at {}; it is not read",
+                        path.display()
+                    )));
+                }
+                return Err(Error::Io {
+                    action: Action::Read,
+                    path: rel.into(),
+                    source,
+                });
+            }
+        };
+        if !file
+            .metadata()
+            .await
+            .map_err(|source| Error::Io {
                 action: Action::Read,
                 path: rel.into(),
                 source,
-            }),
+            })?
+            .is_file()
+        {
+            return Err(Error::Refused(format!(
+                "a symlink or non-regular file is planted at {}; it is not read",
+                path.display()
+            )));
         }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .await
+            .map_err(|source| Error::Io {
+                action: Action::Read,
+                path: rel.into(),
+                source,
+            })?;
+        Ok(Some(bytes))
+    }
+
+    /// One record's bytes, `Ok(None)` only when the file is absent. An IO error
+    /// other than not-found is an error naming the file.
+    async fn record_text(&self, rel: &str) -> Result<Option<String>, Error> {
+        let Some(bytes) = self.record_bytes(rel).await? else {
+            return Ok(None);
+        };
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|source| Error::Io {
+                action: Action::Read,
+                path: rel.into(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+            })
     }
 
     /// Read one record as its own type. `Ok(None)` only when the file is not
@@ -253,6 +311,27 @@ impl Store {
         self.typed_record(&format!("verified/{id}.json")).await
     }
 
+    /// The application record as the review saw it, `reviewed/<token>.json`.
+    /// Root writes this once before the review mail and again, with the
+    /// payment block, at approval; `_onboard` can neither read nor rewrite the
+    /// directory. A decision still verifies the signed payload against the
+    /// handler's record, so a mutation is refused there; this copy is what the
+    /// webhook pass resolves a payment through, where the handler's word is
+    /// no longer enough.
+    pub async fn reviewed_application(&self, token: &str) -> Result<Option<Record>, Error> {
+        self.typed_record(&format!("reviewed/{token}.json")).await
+    }
+
+    /// Write the root-only review snapshot. A retry leaves an existing snapshot
+    /// alone unless it is the approval's own update, which the caller signals by
+    /// writing the payment-bearing copy itself.
+    pub async fn write_reviewed_application(&self, token: &str, bytes: &[u8]) -> Result<(), Error> {
+        check_name(token)?;
+        self.ensure_dir("reviewed").await?;
+        self.write_record("reviewed", &format!("{token}.json"), bytes)
+            .await
+    }
+
     /// One spent one-time password link, `spent/<token>.json`. The directory is
     /// root-owned, so the handler cannot plant or rewrite a marker. A damaged
     /// file is an error rather than no record: reading it as unspent would let a
@@ -308,18 +387,10 @@ impl Store {
     /// shapes and read as empty, as they always did.
     pub async fn read_webhook_pair(&self, id: &str) -> Result<Option<WebhookPair>, Error> {
         check_name(id)?;
-        let body =
-            match tokio::fs::read(self.root.join("webhooks").join(format!("{id}.body"))).await {
-                Ok(body) => body,
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(source) => {
-                    return Err(Error::Io {
-                        action: Action::Read,
-                        path: format!("webhooks/{id}.body").into(),
-                        source,
-                    })
-                }
-            };
+        let body = match self.record_bytes(&format!("webhooks/{id}.body")).await? {
+            Some(body) => body,
+            None => return Ok(None),
+        };
         let signature = self
             .record_text(&format!("webhooks/{id}.sig"))
             .await?

@@ -550,8 +550,7 @@ alert() {
 	if [ -n "${HEALTHCHECKS_URL:-}" ]; then
 		check_url="$HEALTHCHECKS_URL"
 		[ "${5:-ok}" = "fail" ] && check_url="$HEALTHCHECKS_URL/fail"
-		curl -fsS -m 10 --retry 3 --data "$when $component" \
-			"$check_url" >/dev/null 2>&1 || true
+		ping_url "$check_url" "$when $component"
 	fi
 }
 
@@ -870,13 +869,22 @@ STUB
 	enforce_sender_cap 50 "" "$cap_members" >"$work/cap.out" 2>&1
 	check "a run with no attributable recipient does not alert" "$(cat "$work/cap.out")" ""
 	# The external check must not be marked up by the alert on a failed lapse.
-	# curl is stubbed, and the last argument is the URL it was asked to ping.
+	# curl is stubbed to read the 0600 config it is handed, so the URL never
+	# appears in argv and the stub can still see what was pinged.
 	mkdir -p "$work/bin"
 	cat > "$work/bin/curl" <<'STUB'
 #!/bin/sh
-last=""
-for arg in "$@"; do last=$arg; done
-printf '%s\n' "$last" >>"$CURL_LOG"
+conf=""
+prev=""
+for arg in "$@"; do
+	[ "$prev" = "-K" ] && conf=$arg
+	prev=$arg
+done
+[ -n "$conf" ] || exit 0
+printf '%s\n' "$@" >>"$CURL_LOG.argv"
+sed -n 's/^url = "\(.*\)"$/\1/p' "$conf" >>"$CURL_LOG"
+body=$(sed -n 's/^data-binary = "@\(.*\)"$/\1/p' "$conf")
+[ -n "$body" ] && cat "$body" >>"$CURL_LOG.body"
 STUB
 	chmod 0700 "$work/bin/curl"
 	export CURL_LOG="$work/curl.log"
@@ -899,6 +907,8 @@ STUB
 	check "a successful lapse after a failed one is not in its cooldown" \
 		"$(grep -c 'kyriakon: mail: sender cap carol' "$work/cap.out")" "1"
 	check "a successful lapse leaves the external check up" "$(cat "$CURL_LOG")" "$health_url"
+	check "the ping URL never reaches curl's argv" \
+		"$(grep -F -c -- "$health_url" "$CURL_LOG.argv" 2>/dev/null || true)" "0"
 	unset HEALTHCHECKS_URL
 
 	# The safety filter: an account the breaker must not touch is alerted, not
@@ -1031,23 +1041,33 @@ STUB
 
 	# The Healthchecks body is a third party's, and the operator's notice names
 	# only Stripe and Hetzner: an alert that names an account and an address must
-	# send neither. curl is stubbed to record its whole command line, and the
-	# operator mail is captured separately by notify_operator's ALERT_EMAIL-unset
-	# fallback, so the detail can only be in the mail.
+	# send neither. curl is stubbed to read the config and the body file it
+	# names, and the operator mail is captured separately by notify_operator's
+	# ALERT_EMAIL-unset fallback, so the detail can only be in the mail.
 	cat > "$work/bin/curl" <<'STUB'
 #!/bin/sh
-printf '%s\n' "$*" >>"$CURL_LOG"
+conf=""
+prev=""
+for arg in "$@"; do
+	[ "$prev" = "-K" ] && conf=$arg
+	prev=$arg
+done
+[ -n "$conf" ] || exit 0
+printf '%s\n' "$@" >>"$CURL_LOG.argv"
+sed -n 's/^url = "\(.*\)"$/\1/p' "$conf" >>"$CURL_LOG"
+body=$(sed -n 's/^data-binary = "@\(.*\)"$/\1/p' "$conf")
+[ -n "$body" ] && cat "$body" >>"$CURL_LOG.body"
 STUB
 	chmod 0700 "$work/bin/curl"
-	rm -f "$CURL_LOG"
+	rm -f "$CURL_LOG" "$CURL_LOG.body"
 	export HEALTHCHECKS_URL="$health_url"
 	alert mail "sender cap bob" \
 		"bob submitted 55 recipients since last run (max 50) from 203.0.113.9" \
 		>"$work/privacy.out" 2>&1
 	check "the check is still pinged" "$(grep -c "$health_url" "$CURL_LOG")" "1"
-	check "the check body carries no username" "$(grep -c 'bob' "$CURL_LOG")" "0"
+	check "the check body carries no username" "$(grep -c 'bob' "$CURL_LOG.body" 2>/dev/null || true)" "0"
 	check "the check body carries no address" \
-		"$(grep -c '203\.0\.113\.9' "$CURL_LOG")" "0"
+		"$(grep -c '203\.0\.113\.9' "$CURL_LOG.body" 2>/dev/null || true)" "0"
 	check "the operator mail still names the account" \
 		"$(grep -c 'sender cap bob' "$work/privacy.out")" "1"
 	unset HEALTHCHECKS_URL
@@ -1635,7 +1655,7 @@ fi
 # Healthchecks alerts on silence. This is the channel that survives a
 # compromised box, unlike the alert mail this same script sends.
 if [ -n "${HEALTHCHECKS_URL:-}" ]; then
-	curl -fsS -m 10 --retry 3 "$HEALTHCHECKS_URL" >/dev/null 2>&1 || true
+	ping_url "$HEALTHCHECKS_URL"
 fi
 
 # crontab (root): every 15 min; the interval is the detection window. Install it
