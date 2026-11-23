@@ -69,6 +69,18 @@ STUB
 	unset GH_HEAD_AFTER
 
 	rm -f "$GH_MERGED" "$GH_VIEWED"
+	GH_HEAD=
+	if "$0" 42 >/dev/null 2>&1; then
+		printf 'self-test: an empty head was accepted\n' >&2
+		exit 1
+	fi
+	[ ! -f "$GH_MERGED" ] || {
+		printf 'self-test: a PR with no head commit was merged\n' >&2
+		exit 1
+	}
+	GH_HEAD=1111111111111111111111111111111111111111
+
+	rm -f "$GH_MERGED" "$GH_VIEWED"
 	printf 'IN_PROGRESS onboard crate\nSUCCESS shell scripts\n' > "$GH_CHECKS"
 	if "$0" 42 >/dev/null 2>&1; then
 		printf 'self-test: a running check was accepted\n' >&2
@@ -100,7 +112,12 @@ if [ -z "$pr" ]; then
 fi
 
 GH=${GH:-gh}
-head=$("$GH" pr view "$pr" --json headRefOid --jq .headRefOid)
+
+pr_head() {
+	"$GH" pr view "$pr" --json headRefOid --jq .headRefOid
+}
+
+head=$(pr_head)
 if [ -z "$head" ]; then
 	printf 'merge-pr: #%s reports no head commit; refusing to merge\n' "$pr" >&2
 	exit 1
@@ -118,7 +135,7 @@ if [ -n "$not_green" ]; then
 	exit 1
 fi
 
-head_now=$("$GH" pr view "$pr" --json headRefOid --jq .headRefOid)
+head_now=$(pr_head)
 if [ "$head_now" != "$head" ]; then
 	printf 'merge-pr: #%s head moved from %s to %s while checks ran; refusing to merge\n' \
 		"$pr" "$head" "$head_now" >&2
