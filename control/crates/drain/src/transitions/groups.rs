@@ -14,7 +14,7 @@ use super::boxrun::{
     cancel_stripe_if_active, publish_mail_keys, publish_mail_keys_publicly, run_script,
     run_script_tolerating, write_public_key,
 };
-use super::lifecycle::dns_contact;
+use super::lifecycle::{close_box_account, dns_contact};
 use super::Error;
 use super::{write_journal, Settlement};
 use kyriakon_control_core::account::state::Standing;
@@ -1185,18 +1185,13 @@ pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Error
         .map_err(Error::from)
 }
 
-/// The three steps that close one mailbox: its name held for ninety days, its
-/// stored upload key dropped, and scripts/delete-user.sh, which removes the box
-/// account, its tree, its quota record and its store record. Shared by a
-/// mailbox leaving a group and a whole group going, so the two cannot disagree
-/// about what a closed account is. The caller removes the virtual entry first,
-/// because it is the one that knows which table line belongs to the account.
+/// Close one mailbox through the same five steps `delete_account` takes, so a
+/// name reused after the hold can publish again and the two paths cannot
+/// disagree about what a closed account is. Shared by a mailbox leaving a group
+/// and a whole group going. The caller removes the virtual entry first, because
+/// it is the one that knows which table line belongs to the account.
 async fn close_mailbox(cfg: &DrainConfig, store: &Store, username: &str) -> Result<(), Error> {
-    hold_name(store, username).await?;
-    store.remove("keys", &format!("{username}.pub")).await?;
-    run_script(cfg, "delete-user.sh", &[username])
-        .await
-        .map_err(Error::from)
+    close_box_account(cfg, store, username).await
 }
 
 /// The mail key a new mailbox carries, checked before anything is written: the
@@ -1299,6 +1294,19 @@ pub async fn group_address(
                 intent.address
             )));
         }
+    }
+    if intent.action == "remove" && !intent.address.is_empty() {
+        // The console refuses `--address` with a removal. An intent that
+        // carries one anyway (filed by an older console, or signed by the
+        // approval key) would close the mailbox while the address it also names
+        // went untouched, so settle the contradiction rather than let it look
+        // like the address was the thing removed. A refusal, not an error: no
+        // retry can change it.
+        return Ok(Settlement::refused(format!(
+            "the removal of the mailbox {} also names the address {}@{}; a removal takes no \
+             address, so nothing was deleted",
+            intent.mailbox, intent.address, intent.domain
+        )));
     }
 
     let entry = format!("{}@{}", intent.address, intent.domain);
@@ -1523,10 +1531,14 @@ pub async fn group_address(
         "remove" => {
             // What this pass actually closes. A mistyped name that is neither in
             // the group nor on the box closes nothing, so it must not start a
-            // ninety-day hold either.
+            // ninety-day hold either. A hold is what a retry has left after a
+            // pass removed the record and the account but failed the unpublish,
+            // so the close steps run again rather than settling over a key still
+            // published.
             let closing = in_group(&intent.mailbox)
                 || store.account(&intent.mailbox).await?.is_some()
-                || account_on_box(cfg, &intent.mailbox)?;
+                || account_on_box(cfg, &intent.mailbox)?
+                || name_held(store, &intent.mailbox).await?.is_some();
             // Only a pass that still sees the departing mailbox owning the site
             // moves the lanes. Once the group record names the replacement, a
             // retry must not re-root anything: an intent that merely named the
@@ -1611,10 +1623,6 @@ pub async fn group_address(
                 // the lines have gone here, so this pass makes them live.
                 run_script(cfg, "reload-smtpd.sh", &[]).await?;
             }
-            // The box keyring entry stays, as delete-user.sh leaves it:
-            // check-keyring-drift.sh reports a published key absent from the
-            // box, and the published key's removal is the operator's step
-            // (there is no unpublish path in this tree yet).
             if intent.site_owner.is_some() {
                 // After the record names the replacement and before the old
                 // tree goes: the vhost root must not point at a directory
@@ -1696,7 +1704,7 @@ async fn mail_password_link(
 /// The order is the deletion transition's. The host files go first through
 /// scripts/remove-group.sh, then the index and reload pass, so nothing is
 /// served from a tree the accounts' deletion is about to remove. The accounts
-/// close through the same three steps a mailbox leaving a group takes, and the
+/// close through the same sequence a mailbox leaving a group takes, and the
 /// group record is the last store write: while it is there a retry can still
 /// find every account it has to close.
 ///

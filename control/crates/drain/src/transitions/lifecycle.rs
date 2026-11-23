@@ -6,7 +6,8 @@
 //! body returns a [`Settlement`](super::Settlement) and the seam journals it.
 
 use super::boxrun::{
-    cancel_stripe_if_active, outside_address, publish_mail_keys, run_script, write_public_key,
+    cancel_stripe_if_active, outside_address, publish_mail_keys, run_script, run_script_with_stdin,
+    write_public_key,
 };
 use super::groups::{
     account_on_box, application_token, close_group_tokens, group_record, hold_name,
@@ -310,7 +311,8 @@ pub async fn set_password(
     store.write_record("spent", &spent, &marker).await?;
 
     let finished = async {
-        run_script(cfg, "set-mail-password.sh", &[username, &hash]).await?;
+        let line = format!("{hash}\n");
+        run_script_with_stdin(cfg, "set-mail-password.sh", &[username], line.as_bytes()).await?;
 
         // One use: the mailbox keeps no link, so the page stops answering. Only
         // this link is cleared: a reset between the check above and this write
@@ -2037,17 +2039,7 @@ pub async fn delete_account(
         }
     }
 
-    hold_name(store, username).await?;
-    store.remove("keys", &format!("{username}.pub")).await?;
-    run_script(cfg, "delete-user.sh", &[username]).await?;
-    // The published set holds the key forever otherwise, and a name reused after
-    // the hold would meet a publish that refuses to replace it. The removal
-    // change goes first so the drift check never sees a key that is published
-    // and no longer served.
-    remove_published_key(cfg, username).await?;
-    // The box keyring entry goes now, not before the account: the encryptor
-    // failing closed for a mailbox that still exists would bounce its mail.
-    remove_keyring_entry(cfg, username).await?;
+    close_box_account(cfg, store, username).await?;
     close_group_tokens(store, &[username.to_string()]).await?;
 
     write_journal(
@@ -2061,6 +2053,32 @@ pub async fn delete_account(
         Some("the account, its home and its store record were removed; the ledger line stays"),
     )
     .await
+}
+
+/// The five steps every closed account takes: hold its name for ninety days,
+/// drop the stored upload key, run scripts/delete-user.sh, publish the mail
+/// key's removal, and drop the box keyring entry. Shared by `delete_account`
+/// and a group mailbox's closure, so the two cannot disagree about a closed
+/// account and a name reused after the hold can publish again.
+///
+/// The publish removal goes before the keyring entry because
+/// scripts/check-keyring-drift.sh alerts on a published key the box no longer
+/// serves: publishing first leaves only the seven days the check allows a key
+/// on the box and not yet in the published set. The keyring entry goes after
+/// the account, because the encryptor failing closed for a mailbox that still
+/// exists would bounce its mail. A missing key, publication or keyring entry is
+/// already done, which is what makes a retry safe.
+pub(super) async fn close_box_account(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+) -> Result<(), Error> {
+    hold_name(store, username).await?;
+    store.remove("keys", &format!("{username}.pub")).await?;
+    run_script(cfg, "delete-user.sh", &[username]).await?;
+    remove_published_key(cfg, username).await?;
+    remove_keyring_entry(cfg, username).await?;
+    Ok(())
 }
 
 /// The refund fact the erasure answer carries: the token's recorded refund, or
@@ -2095,7 +2113,7 @@ async fn erasure_refund(store: &Store, account: &Account) -> Result<Option<Strin
 /// `scripts/check-keyring-drift.sh` alerts on a published key the box no longer
 /// serves: publishing the removal first keeps that signal to the window the
 /// change takes to merge.
-async fn remove_published_key(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
+pub(super) async fn remove_published_key(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
     run_script(
         cfg,
         "publish-mail-key.sh",
@@ -2107,7 +2125,7 @@ async fn remove_published_key(cfg: &DrainConfig, username: &str) -> Result<(), E
 
 /// Drop one account's published key from the box keyring. A missing directory or
 /// file is already done, which is what makes a retry safe.
-async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
+pub(super) async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
     let path = kyriakon_control_core::mail::keycheck::keyring_file(&cfg.keyring_dir, username);
     match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),
@@ -2340,7 +2358,14 @@ pub async fn change_password(
             return Ok(Settlement::refused(&e));
         }
     };
-    run_script(cfg, "set-mail-password.sh", &[&account.username, &hash]).await?;
+    let line = format!("{hash}\n");
+    run_script_with_stdin(
+        cfg,
+        "set-mail-password.sh",
+        &[&account.username],
+        line.as_bytes(),
+    )
+    .await?;
     // A password change is also the end of every page session: the record is
     // the whole of what a cookie proves, so a cookie copied before the change
     // must not keep the account page open. A new login makes a new record.
@@ -4083,7 +4108,13 @@ pub(super) async fn erase_half_made(
     journal: &Journal,
     username: &str,
 ) -> Result<bool, Error> {
-    if store.account(username).await?.is_some() {
+    if let Some(account) = store.account(username).await? {
+        // A group mailbox carries this name but is another transition's
+        // account. A failed person approval began under the same name, and
+        // erasing the group's mailbox would take its mail with it.
+        if account.group.is_some() {
+            return Ok(false);
+        }
         // Before the deletion, so the drift check never sees a key that is
         // published and no longer served.
         remove_published_key(cfg, username).await?;
@@ -4169,15 +4200,22 @@ async fn release_username(
     Ok(true)
 }
 
-/// Clear away every declined application whose week is up, and release the
-/// username. Run once per drain pass, after the intents: this is what carries
-/// the decline's week out without the application being touched again.
+/// Clear away every declined application once ADR 0005's ninety days are up,
+/// and release the username. Run once per drain pass, after the intents: this
+/// is what carries the decline out without the application being touched again.
+///
+/// The status link is the shorter window: it stops answering a week after the
+/// decision while the record itself is application data, which the privacy
+/// notice holds for ninety days. A decision taken late can leave the link
+/// answering after the ninety days, so the answers are cleared on time and only
+/// the shell the page renders stays until the week is over.
 pub async fn purge_declined(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
 ) -> Result<(), Error> {
     let now = OffsetDateTime::now_utc();
+    let today = now.date();
     for name in store.list("applications").await? {
         if !name.ends_with(".json") {
             continue;
@@ -4193,9 +4231,16 @@ pub async fn purge_declined(
         let Some(decided_at) = record.decided_at.as_deref() else {
             continue;
         };
-        // The status link's own window is the week: inside it the record
-        // answers and nothing is purged.
+        // The link's week and ADR 0005's ninety days are both promises. Before
+        // the ninety days end the record is held whatever the link does.
+        if !purge_due(&record.filed_at, today) {
+            continue;
+        }
+        // A decision taken late can leave the link answering after the ninety
+        // days. Keep the facts the status page renders and clear the answers,
+        // so the data ends on time without cutting the week short.
         if util::link_answers(decided_at, now) {
+            keep_record_join(store, &record.status_token, &record).await?;
             continue;
         }
         // The record was written by the unprivileged half, so the username is
@@ -4228,7 +4273,7 @@ pub async fn purge_declined(
                     "decline",
                     &app,
                     "applying",
-                    Some("the week passed; the username is being released"),
+                    Some("ADR 0005's ninety days are up; the username is being released"),
                 )
                 .await?;
             }
@@ -4263,6 +4308,7 @@ pub async fn purge_declined(
             .await?;
         }
         store.remove("applications", &name).await?;
+        store.remove("reviewed", &name).await?;
     }
     Ok(())
 }
@@ -4326,8 +4372,9 @@ async fn keep_copy_join(
         .map_err(Error::from)
 }
 
-/// Write the shared record back with its answers gone and its payment join
-/// kept, so the card pass can still resolve a payment through it.
+/// Write the shared record back with its answers gone, keeping the payment join
+/// and the domain, so the card pass can resolve a payment through it and a
+/// declined body is still known to be a body.
 async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result<(), Error> {
     let mut kept = record.clone();
     kept.answers.clear();
@@ -4335,7 +4382,6 @@ async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result
     kept.upload_key = None;
     kept.acceptances.clear();
     kept.outside_address = None;
-    kept.domain = None;
     kept.password_link = None;
     kept.confirmation_at = None;
     let bytes = serde_json::to_vec_pretty(&kept).map_err(|source| Error::Json {
@@ -4344,6 +4390,12 @@ async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result
     })?;
     store
         .write_filed_application(token, &bytes)
+        .await
+        .map_err(Error::from)?;
+    // The root snapshot keeps the same join and loses the same answers. Without
+    // this it would retain a second, un-purged copy of the application.
+    store
+        .write_reviewed_application(token, &bytes)
         .await
         .map_err(Error::from)
 }
@@ -4484,6 +4536,7 @@ pub async fn purge_applications(
         store
             .remove("applications", &format!("{token}.json"))
             .await?;
+        store.remove("reviewed", &format!("{token}.json")).await?;
         store
             .remove(&format!("accounts/{mailbox}"), "application.json")
             .await?;
@@ -4529,9 +4582,9 @@ pub async fn purge_applications(
             continue;
         }
         // A declined record belongs to [`purge_declined`], which owns its
-        // seven-day window and its release; one still here after ninety days is
-        // a release that keeps failing, and clearing it here would lose the
-        // release rather than complete it.
+        // ninety-day window and its release; one still here is a release that
+        // keeps failing or a late decision's link still answering, and clearing
+        // it here would lose the release rather than complete it.
         if record.stage.starts_with("declined") {
             continue;
         }
@@ -4608,6 +4661,7 @@ pub async fn purge_applications(
             .await?;
         }
         store.remove("applications", &name).await?;
+        store.remove("reviewed", &name).await?;
     }
     Ok(())
 }

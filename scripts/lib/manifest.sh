@@ -4,8 +4,11 @@
 #
 # scripts/install-set.tsv is the box manifest, one row per installed file:
 #
-#   script        the file in scripts/, or a compiled binary for a binary row
-#   destination   where it lands, or - for a source read from the checkout
+#   script        the file in scripts/, a path from the repository root when it
+#                 starts with openbsd/ (a caller resolves it as $repo_dir/$script),
+#                 or a compiled binary for a binary row
+#   destination   where it lands, or - for a source read from the checkout. A
+#                 path under /home/www is a document root that httpd serves.
 #   schedule      the five cron fields, or - when nothing schedules it
 #   args          the arguments the cron line passes, or omitted
 #   deploy_route  the deploys (and manual steps) a change to it needs,
@@ -95,11 +98,12 @@ manifest_targets_route() {
 	[ -n "$rows" ] || return 0
 	printf '%s\n' "$rows" | awk -F'\t' -v d="$2" -v r="$3" '
 		$2 != d { next }
-		route = "," $5 ","
-		if (index(route, "," r ",") == 0) next
-		name = ($6 == "" || $6 == "-" ? $1 : $6)
-		print $1 "\t" name
-	}'
+		{
+			route = "," $5 ","
+			if (index(route, "," r ",") == 0) next
+			name = ($6 == "" || $6 == "-" ? $1 : $6)
+			print $1 "\t" name
+		}'
 }
 
 # manifest_retired_names <table> <destination>: installed names the retired

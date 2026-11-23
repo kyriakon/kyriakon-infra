@@ -20,7 +20,7 @@
 # The split is the spec's. The unprivileged `_onboard` user writes exactly five
 # directories, intents/ (one JSON per submission, written by rename), drafts/
 # (the capsule and TUI's server-side state), applications/ (the record the status
-# page renders), sessions/ (one file per live account-page login) and webhooks/
+# page renders), sessions/ (one record per account's live page session) and webhooks/
 # (a webhook's raw body and signature header). It also owns mail/, the Maildir
 # the smtpd action for apply@ delivers into as that user. The rest belongs to the
 # root drain: accounts, groups, tokens, keys (the members' public upload keys,
@@ -145,6 +145,37 @@ settle_lock() {
 	fi
 }
 
+# migrate_processed: move the card pass's old seen-set out of the handler-owned
+# `webhooks/` directory into the root-only one. The drain now reads only
+# `verified/processed.jsonl`; without this a deployed box would start with an
+# empty set and could apply a re-delivered invoice twice. The old file is
+# appended, never overwritten, and removed only after the append succeeds.
+migrate_processed() {
+	old="$store/webhooks/processed.jsonl"
+	new="$store/verified/processed.jsonl"
+	[ -e "$old" ] || [ -L "$old" ] || return 0
+	if [ -L "$old" ] || [ ! -f "$old" ]; then
+		changed=1
+		rm -f "$old"
+		return 0
+	fi
+	if [ -L "$new" ]; then
+		fail "$new is a symlink; refusing to migrate the processed log into it"
+	fi
+	if [ ! -e "$new" ]; then
+		: >"$new" || fail "cannot create $new"
+	fi
+	if [ -s "$old" ]; then
+		cat "$old" >>"$new" || fail "cannot migrate $old into $new"
+	fi
+	chmod 0600 "$new"
+	if [ "$(id -u)" -eq 0 ]; then
+		chown root:wheel "$new"
+	fi
+	rm -f "$old"
+	changed=1
+}
+
 # The guard's own check: a symlink planted at a store entry is refused, and the
 # target it points at keeps its mode. Runs as the invoking user in a scratch
 # store, so it needs no root and no box; the live call sites pass `_onboard` and
@@ -180,6 +211,19 @@ self_test() {
 		"$([ -e "$tree/store/.lock" ] && printf no || printf yes)" yes
 	check "the original record keeps its owner, mode and inode" \
 		"$(stat -f '%Su %Sg %Lp %i' "$tree/record.json")" "$before"
+
+	# The old handler-owned seen-set is folded into the root-only one, and the
+	# old file goes, so a re-delivered event is still deduplicated after upgrade.
+	mkdir -p "$tree/store/webhooks" "$tree/store/verified"
+	printf '{"event":"evt_old"}\n' >"$tree/store/webhooks/processed.jsonl"
+	printf '{"event":"evt_new"}\n' >"$tree/store/verified/processed.jsonl"
+	( migrate_processed ) >/dev/null 2>&1 || true
+	check "the processed log was migrated" \
+		"$(grep -c '"event":"evt_' "$tree/store/verified/processed.jsonl")" 2
+	check "the old processed log is gone" \
+		"$([ -e "$tree/store/webhooks/processed.jsonl" ] && printf no || printf yes)" yes
+	check "the root processed log is private" \
+		"$(stat -f '%Lp' "$tree/store/verified/processed.jsonl")" 600
 	self_test_end
 }
 
@@ -228,7 +272,8 @@ store_dir tokens       root wheel 750
 store_dir keys         root wheel 750
 store_dir holds        root wheel 750
 store_dir ledger       root wheel 750
-store_dir verified     root wheel 750
+store_dir verified     root wheel 700
+store_dir reviewed     root wheel 700
 store_dir spent        root wheel 750
 store_dir rates        root wheel 750
 
@@ -271,6 +316,7 @@ settle_lock "$store/drafts/.lock" "$onboard_user" "$onboard_user"
 settle_lock "$store/applications/.confirmation.lock" "$onboard_user" "$onboard_user"
 settle_lock "$store/ledger/payments.jsonl.lock" root wheel
 settle_lock "$store/ledger/unattributed.jsonl.lock" root wheel
+migrate_processed
 
 # mail/ is _onboard's, not the root drain's, and with the Maildir's three
 # subdirectories. The smtpd action for apply@ runs the delivery as _onboard

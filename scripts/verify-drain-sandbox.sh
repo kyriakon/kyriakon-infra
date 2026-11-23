@@ -307,7 +307,7 @@ file_export() {
 	proof=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 	printf '{"username":"alice","expires":%s}\n' "$(( $(date +%s) + 3600 ))" \
 		> "$tree/logins/$proof"
-	printf '{"proof":"%s"}\n' "$proof" > "$tree/store/sessions/$session.json"
+	printf '{"created_at":"2026-11-01T09:00:00Z","proof":"%s"}\n' "$proof" > "$tree/store/sessions/$session.json"
 	printf '{"id":"09ZZZZZZZZZZZZZZZZZZZZZZZZ","kind":"export","filed_at":"2026-11-01T09:05:00Z","username":"alice","session":"%s"}\n' \
 		"$session" > "$tree/store/intents/09ZZZZZZZZZZZZZZZZZZZZZZZZ.json"
 }

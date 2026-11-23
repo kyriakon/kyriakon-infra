@@ -48,7 +48,7 @@ const WEBHOOK_TOLERANCE: i64 = 300;
 /// forged or replayed delivery is. A pair proven before keeps its queue entry if
 /// a later check fails: the bytes or the secret changed, and a money-bearing
 /// event is not root's to drop. A verified event is deduplicated on its id and
-/// on `(type, object.id)`, applied, recorded in `webhooks/processed.jsonl`, and
+/// on `(type, object.id)`, applied, recorded in root-only `verified/processed.jsonl`, and
 /// only then removed.
 ///
 /// An event that cannot be applied yet — the Stripe API unreachable for an
@@ -236,7 +236,7 @@ pub async fn stripe_webhooks(
                     // A pair whose record cannot be written is left in place:
                     // the event is settled and must be retried, and dropping
                     // the webhook here would apply it twice.
-                    if let Err(e) = store.log("webhooks/processed.jsonl").append(&bytes).await {
+                    if let Err(e) = store.log("verified/processed.jsonl").append(&bytes).await {
                         e.report(&format!(
                             "webhook {id} ({kind}) could not be recorded as processed; it will be retried"
                         ));
@@ -411,7 +411,7 @@ fn invoice_pair(kind: &str, object: &str) -> Option<String> {
 async fn processed_events(store: &Store) -> Result<HashSet<String>, Error> {
     let mut seen = HashSet::new();
     for value in store
-        .log("webhooks/processed.jsonl")
+        .log("verified/processed.jsonl")
         .jsonl::<Value>()
         .await?
     {
@@ -836,13 +836,48 @@ async fn target_for_application(
     if !store::is_status_token(application) {
         return Ok(None);
     }
-    let Some(record) = store.application(application).await? else {
-        return Ok(None);
-    };
-    let Some(token) = record.payment.and_then(|payment| payment.token_ref) else {
-        return Ok(None);
-    };
-    target_for_payment_reference(store, &token).await
+    // The root-only snapshot is written at review and again, carrying the
+    // payment block, at approval. It is authoritative: a snapshot without a
+    // token is a free approval or an unapproved record, and the handler's copy
+    // cannot add one.
+    if let Some(record) = store.reviewed_application(application).await? {
+        let Some(token) = record.payment.and_then(|payment| payment.token_ref) else {
+            return Ok(None);
+        };
+        return target_for_payment_reference(store, &token).await;
+    }
+    // An approval that ran before the snapshot existed resolves from the
+    // root-owned account it wrote. `payment.application_ref` is the status token
+    // the card link carried, and the retained application copy inside the
+    // mailbox names a group's token. The handler's `applications/` file is never
+    // read here.
+    for username in store.list("accounts").await? {
+        let Some(account) = store.account(&username).await? else {
+            continue;
+        };
+        if let Some(payment) = account.payment_state() {
+            if payment.application_ref.as_deref() == Some(application) {
+                if let Some(token) = payment.token_ref.as_deref() {
+                    if let Some(target) = target_for_payment_reference(store, token).await? {
+                        return Ok(Some(target));
+                    }
+                }
+            }
+        }
+        let Some(domain) = account.group.as_deref() else {
+            continue;
+        };
+        let Some(copy) = store.account_application_text(&username).await? else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&copy) else {
+            continue;
+        };
+        if value.get("status_token").and_then(Value::as_str) == Some(application) {
+            return Ok(Some(TargetRef::Group(domain.to_string())));
+        }
+    }
+    Ok(None)
 }
 
 /// Attach a subscription and its customer to an account or a group, which is

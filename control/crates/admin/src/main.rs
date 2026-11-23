@@ -20,7 +20,8 @@
 //!   kyriakon-admin [--config PATH] password reset <username>
 //!   kyriakon-admin [--config PATH] address --domain <domain> --action <change> \
 //!       --mailbox <account> [--address <localpart>] [--key-file <path>] \
-//!       [--site-owner <account>]
+//!       [--site-owner <account>] \
+//!       [--confirm-remove (required with --action remove)]
 //!   kyriakon-admin [--config PATH] group remove <domain>
 //!   kyriakon-admin [--config PATH] token resend <username>
 //!   kyriakon-admin [--config PATH] notice resend <username> [--to <address>] \
@@ -214,7 +215,8 @@ fn usage() -> String {
        kyriakon-admin export <username> [--by-mail] [--request <id>]
        kyriakon-admin address --domain <domain> \
      --action <add-alias|add-mailbox|upgrade|remove> --mailbox <account> \
-     [--address <localpart>] [--key-file <path>] [--site-owner <account>]
+     [--address <localpart>] [--key-file <path>] [--site-owner <account>] \
+     [--confirm-remove]
        kyriakon-admin group remove <domain>
        kyriakon-admin request list
        kyriakon-admin request record --username <u> --kind <access|erasure|rectification> \

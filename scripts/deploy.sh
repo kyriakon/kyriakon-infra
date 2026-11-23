@@ -171,6 +171,10 @@ classify() {
 	# key-walkthrough.md into the capsule and stamps the release, so a docs change
 	# is that deploy; `*.md` below is the rest of the tree's markdown.
 	docs/*) needs_control=yes ;;
+	# The restore installer's response file is served from the landing site's
+	# document root, which deploy-mail installs it into, so a change is that
+	# deploy. The rest of the template is used at build time and never deployed.
+	openbsd/restore-template/install.conf) needs_mail=yes ;;
 	.github/* | .githooks/* | .omp/* | openbsd/restore-template/*) : ;;
 	*.md) : ;;
 	*) return 1 ;;
@@ -688,12 +692,15 @@ self_test() {
 	root_bin_rows=$(awk -F'\t' '!/^#/ && $2 == "/root/bin" && $7 == "active" { print $1 }' "$install_set")
 	libexec_rows=$(awk -F'\t' '!/^#/ && $2 == "/usr/local/libexec" && $7 == "active" { print $1 }' "$install_set")
 	libexec_mail_rows=$(awk -F'\t' '!/^#/ && $2 == "/usr/local/libexec" && $7 == "active" && $5 ~ /(^|,)mail(,|$)/ { print $1 }' "$install_set")
+	docroot_rows=$(awk -F'\t' '!/^#/ && $2 ~ /^\/home\/www\// && $7 == "active" { print $1 }' "$install_set")
 	check 'the table names drain scripts' \
 		"$([ -n "$drain_rows" ] && printf yes || printf no)" yes
 	check 'the table names /root/bin scripts' \
 		"$([ -n "$root_bin_rows" ] && printf yes || printf no)" yes
 	check 'the table names /usr/local/libexec scripts' \
 		"$([ -n "$libexec_rows" ] && printf yes || printf no)" yes
+	check 'the table names a document root file' \
+		"$([ -n "$docroot_rows" ] && printf yes || printf no)" yes
 	for installed in $drain_rows; do
 		reset_plan
 		classify "scripts/$installed"
@@ -708,6 +715,14 @@ self_test() {
 		reset_plan
 		classify "scripts/$installed"
 		check "scripts/$installed plans deploy-mail" "$needs_mail" yes
+	done
+	# A document-root row names its source from the repo root, so it is classified
+	# as that path. A row whose path has no arm fails here rather than planning
+	# nothing and leaving a served file stale.
+	for served in $docroot_rows; do
+		reset_plan
+		classify "$served"
+		check "$served plans deploy-mail" "$needs_mail" yes
 	done
 	reset_plan
 	classify 'scripts/install-set.tsv'

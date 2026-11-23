@@ -307,15 +307,26 @@ jobs:
             # same reason the responder is.
             cargo build --release --manifest-path control/Cargo.toml -p kyriakon-control-drain -p kyriakon-admin
             ksh scripts/verify-drain-sandbox.sh
+            # #952 narrows the other network-facing programs the same way. Only
+            # a real kernel proves it: a missing promise aborts the process. The
+            # probe is an example built from the shared wrapper, so the run also
+            # proves a locked list blocks a path and a pledge kills a forbidden
+            # syscall, not merely that the calls returned zero.
+            cargo build --release --manifest-path control/Cargo.toml -p kyriakon-control-handler -p kyriakon-control-tui -p kyriakon-control-fromcheck
+            cargo build --release --manifest-path control/Cargo.toml -p kyriakon-control-core --example sandbox-probe
+            ( cd kyriakon-encrypt && cargo build --release )
+            ksh scripts/verify-binary-sandbox.sh
             # The unit tests gated on OpenBSD and `test` cannot run in the
             # Ubuntu control job, and this is the only host whose kernel
             # behaviour they exercise. `--lib` keeps it to the crate's own
             # tests; the acceptance suite runs its Linux half above.
             cargo test --manifest-path control/Cargo.toml -p kyriakon-control-drain --lib
+            # The shared wrapper's tests are cfg(openbsd), so the drain's run
+            # alone never compiled them. Filter keeps this to the sandbox module.
+            cargo test --manifest-path control/Cargo.toml -p kyriakon-control-core --lib -- sandbox::
             # The fromcheck sandbox is cfg(openbsd), so only this run compiles
             # it. The plugin test also runs here because OpenBSD is the host
             # whose SIGCHLD disposition rules the grandchild case exercises.
-            cargo build --release --manifest-path control/Cargo.toml -p kyriakon-control-fromcheck
             make -C dovecot-plugin test
 
   terraform:

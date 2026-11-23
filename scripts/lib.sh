@@ -36,10 +36,37 @@ for lib_module in atomic-fs tls-acme identity manifest paths; do
 done
 unset lib_module lib_sh_dir
 
-# ping_url <url> — best-effort GET that never fails the caller. A monitoring ping
+# ping_url <url> [body] — best-effort GET that never fails the caller. A monitoring ping
 # must not turn a transient curl failure into a script failure / cron mail storm.
+#
+# The URL is a bearer secret: whoever holds it can keep the external dead-man's
+# switch green. It goes in a mode-0600 curl config rather than argv, where every
+# local account can read it with ps(1). A non-empty body is written to a private
+# file the config names, so it stays off the command line too.
 ping_url() {
-	curl -fsS -m 10 --retry 3 "$1" >/dev/null 2>&1 || true
+	typeset conf body_file="" escaped
+	conf=$(mktemp "${TMPDIR:-/tmp}/kyriakon-ping.XXXXXX") || return 0
+	chmod 0600 "$conf"
+	if [ "$#" -ge 2 ] && [ -n "$2" ]; then
+		body_file=$(mktemp "${TMPDIR:-/tmp}/kyriakon-ping-body.XXXXXX") || {
+			rm -f "$conf"
+			return 0
+		}
+		chmod 0600 "$body_file"
+		printf '%s' "$2" > "$body_file"
+	fi
+	escaped=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+	{
+		printf 'url = "%s"\n' "$escaped"
+		if [ -n "$body_file" ]; then
+			printf 'data-binary = "@%s"\n' "$body_file"
+		fi
+	} > "$conf"
+	(
+		trap '[ -n "$body_file" ] && rm -f "$body_file"; rm -f "$conf"' EXIT HUP INT TERM
+		curl -fsS -m 10 --retry 3 -K "$conf" >/dev/null 2>&1 || true
+	)
+	rm -f "$conf" "$body_file"
 }
 
 # hc_fail <url> — ping Healthchecks /fail and exit 1. Wired to the ERR trap so a
@@ -924,6 +951,36 @@ self_test() {
 		"$(wc -l < "$tree/concurrent" | tr -d ' ')" 3
 	check "and the lock is released" \
 		"$([ -d "$tree/concurrent.lock" ] && printf held || printf free)" free
+
+	# manifest_targets_route is the join every deploy that shares a destination
+	# reads. It used to carry a statement at awk top level after a bare rule,
+	# which awk rejects, so it exited 2 and printed nothing; a caller read that
+	# as "no row" and either installed nothing or reported the table as empty.
+	printf 'lib.sh\t/root/bin\t-\t\tmail\t-\tactive\nopenbsd/restore-template/install.conf\t/home/www/kyriakon.net/www\t-\t\tmail\tinstall.conf\tactive\nother.conf\t/home/www/kyriakon.net/www\t-\t\tcontrol\tother.conf\tactive\n' \
+		>"$tree/route-table.tsv"
+	check "the route query returns the mail row" \
+		"$(manifest_targets_route "$tree/route-table.tsv" /home/www/kyriakon.net/www mail)" \
+		"$(printf 'openbsd/restore-template/install.conf\tinstall.conf')"
+	check "and omits the row for another deploy" \
+		"$(manifest_targets_route "$tree/route-table.tsv" /home/www/kyriakon.net/www mail |
+			grep -c '^other\.conf' || true)" 0
+	# A table that cannot be read is a failure, not an empty set.
+	code=0
+	manifest_targets_route "$tree/no-such-table.tsv" /root/bin mail >/dev/null 2>&1 || code=$?
+	check "a missing table is an error, not an empty set" "$code" 1
+	# So is an awk that cannot run. The query's output is empty either way, and
+	# only the exit status tells the caller which happened.
+	mkdir "$tree/broken-bin"
+	printf '#!/bin/sh\nexit 2\n' >"$tree/broken-bin/awk"
+	chmod 0755 "$tree/broken-bin/awk"
+	old_path=$PATH
+	PATH="$tree/broken-bin:$PATH"
+	code=0
+	manifest_targets_route "$tree/route-table.tsv" /home/www/kyriakon.net/www mail \
+		>"$tree/broken.out" 2>&1 || code=$?
+	PATH=$old_path
+	check "a query that cannot run is an error" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
 
 	self_test_end
 }

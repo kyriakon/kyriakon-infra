@@ -3,11 +3,11 @@
 //! Login is by the mail password alone, and the platform holds no second copy
 //! of it: the check is `doveadm auth test`, run as root through the one fixed
 //! `doas` rule the deploy documents, by a fixed-argument checker the handler
-//! cannot turn into an arbitrary `doveadm` subcommand. A page session is a file
-//! under `sessions/` named by 128 random bits, and the cookie carries that name
-//! and an HMAC of it under a secret stored in the same file. Neither key is a
-//! credential: the mail key protects mail, the upload key protects sftp and git,
-//! and nothing here reads either.
+//! cannot turn into an arbitrary `doveadm` subcommand. A page session is one
+//! file per account under `sessions/`, named by a derivation of the username,
+//! and the cookie carries that name and an HMAC of it under a secret stored in
+//! the same file. Neither key is a credential: the mail key protects mail, the
+//! upload key protects sftp and git, and nothing here reads either.
 //!
 //! The signature is over the id with a per-session secret rather than a
 //! long-lived service key, so the handler still holds no key of its own and a
@@ -43,7 +43,7 @@ pub const TTL_HOURS: i64 = 12;
 pub const AUTHCHECK: &str = "/usr/local/libexec/kyriakon-authcheck";
 
 /// The `doas` the box installs.
-const DOAS: &str = "/usr/bin/doas";
+pub const DOAS: &str = "/usr/bin/doas";
 
 /// The command that verifies a mail password: `doas` in production, and the
 /// checker directly in a test, where a root rule cannot exist.
@@ -236,22 +236,49 @@ pub struct Session {
     pub username: String,
 }
 
+/// The one record an account may hold: `sessions/<id>.json`, where the id is
+/// derived from the username so a second login replaces the first's file. The
+/// derivation is an HMAC under a fixed, published key: the id is a filename,
+/// not a capability (the record's own secret signs the cookie), so a guessable
+/// id grants nothing. Its 104 bits put an accidental collision between two
+/// accounts out of reach, and its lowercase-hex alphabet is a subset of the
+/// status-token alphabet the drain checks.
+fn session_id(username: &str) -> Result<String, Error> {
+    let hex = sign::sign(b"kyriakon account page session id", username)?;
+    Ok(hex[..26].to_string())
+}
+
+/// The lock over one account's record, taken by the login that writes it and
+/// by the pass that removes it. A hidden name, so `Store::list` (which drops
+/// dotfiles) never reads it as a session. It is never removed: unlinking a lock
+/// another writer holds would let a third make a second lock file for the same
+/// record.
+fn lock_path(id: &str) -> String {
+    format!("sessions/.{id}.lock")
+}
+
 /// Open a session for `username` and return the cookie's value: the id, a dot,
 /// and the HMAC of the id under the session's own secret. `proof` is the token
 /// the root-side login check printed, which the drain reads back from its own
 /// proof directory; the handler stores it and cannot mint one.
+///
+/// An account has one live session: the record's name comes from the username,
+/// so this overwrites the previous login's record instead of adding a file, and
+/// never lists the directory. A failed login writes nothing, so a member who
+/// mistypes a password keeps the session they already had.
+///
+/// The record's lock serialises two logins for one account. `write_record`
+/// stages through a fixed `.tmp` name, so without it a double submit could
+/// unlink the other's temporary or publish a record whose secret the cookie it
+/// returned does not carry.
 pub async fn open(
     store: &Store,
     username: &str,
     proof: &str,
     now: OffsetDateTime,
 ) -> Result<String, Error> {
-    // A new login is where the old sessions are cleared. Nothing else walks the
-    // directory, and an id is random, so an expired file would never be reused.
-    // The proofs are pruned by the drain instead: that directory is root's, and
-    // the handler cannot read it.
-    prune(store, now).await;
-    let id = crate::store::status_token().await?;
+    let id = session_id(username)?;
+    let _lock = store.lock(&lock_path(&id)).await?;
     let secret = crate::store::status_token().await?;
     let expires = (now + Duration::hours(TTL_HOURS))
         .replace_nanosecond(0)
@@ -281,9 +308,9 @@ pub async fn open(
 }
 
 /// The session a cookie names, when it is live and its signature is the one the
-/// record's own secret makes. An expired session answers nothing; its file is
-/// removed by the next `open`, which is the only walk of the directory. A cookie
-/// naming no record answers nothing.
+/// record's own secret makes. An expired session answers nothing; the drain's
+/// scheduled [`prune`] removes its file. A cookie naming no record answers
+/// nothing.
 pub async fn lookup(store: &Store, cookie: &str, now: OffsetDateTime) -> Option<Session> {
     let (id, sig) = cookie.split_once('.')?;
     // The id is a store token: 26 lowercase Crockford characters. A cookie of
@@ -328,9 +355,11 @@ pub async fn close_all(store: &Store, username: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Remove the session records whose expiry has passed. One unreadable file is
-/// skipped rather than failing every login: the directory holds only what this
-/// module wrote, and a partial record is not a session either.
+/// Remove the session records whose expiry has passed. The drain runs it on
+/// every pass, because the handler no longer walks the directory on login: a
+/// login touches only its own account's record. One unreadable file is skipped
+/// rather than failing every pass: the directory holds only what this module
+/// wrote, and a partial record is not a session either.
 pub async fn prune(store: &Store, now: OffsetDateTime) {
     let Ok(names) = store.list("sessions").await else {
         return;
@@ -339,7 +368,14 @@ pub async fn prune(store: &Store, now: OffsetDateTime) {
         if !name.ends_with(".json") {
             continue;
         }
-        let Ok(Some(text)) = store.session_text(name.trim_end_matches(".json")).await else {
+        let id = name.trim_end_matches(".json");
+        // The login that rewrites this record takes the same lock. Without it,
+        // a fresh record written between this read and the removal would be
+        // deleted, and the cookie the login just returned would name nothing.
+        let Ok(_lock) = store.lock(&lock_path(id)).await else {
+            continue;
+        };
+        let Ok(Some(text)) = store.session_text(id).await else {
             continue;
         };
         let expired = serde_json::from_str::<Record>(&text)
@@ -364,6 +400,11 @@ pub fn id(cookie: &str) -> Option<&str> {
 /// record's own secret makes. A cookie that names nothing, or names a record
 /// without carrying that record's signature, is a no-op: logging out twice is
 /// not an error, and an id is not the authority the signature exists to prove.
+/// The record's lock covers the second read and the removal, so a login racing
+/// this logout either lands first (its new secret fails the check, and the new
+/// session survives) or lands after (the logout removed only its own record).
+/// The first read answers a cookie with no authority before the lock exists,
+/// so an unauthenticated logout cannot litter the directory with lock files.
 pub async fn close(store: &Store, cookie: &str) {
     let Some((id, sig)) = cookie.split_once('.') else {
         return;
@@ -378,6 +419,20 @@ pub async fn close(store: &Store, cookie: &str) {
         return;
     };
     if !sign::verify(record.secret.as_bytes(), id, sig) {
+        return;
+    }
+    let Ok(_lock) = store.lock(&lock_path(id)).await else {
+        return;
+    };
+    // The record can be replaced while this waits for the lock, and the cookie
+    // signs only the record it was issued for.
+    let Ok(Some(text)) = store.session_text(id).await else {
+        return;
+    };
+    let Ok(current) = serde_json::from_str::<Record>(&text) else {
+        return;
+    };
+    if !sign::verify(current.secret.as_bytes(), id, sig) {
         return;
     }
     let _ = store.remove("sessions", &format!("{id}.json")).await;
@@ -691,26 +746,64 @@ mod tests {
         );
     }
 
+    /// One account holds one session: a second login replaces the first's
+    /// record rather than adding another, the first cookie stops answering, and
+    /// the id keeps the status-token shape the drain's `verify_session` checks.
     #[tokio::test]
-    async fn the_next_login_removes_an_expired_session_and_keeps_a_live_one() {
-        let store = store("prune");
-        let stale_proof = mint(&store, "alice", now().unix_timestamp() - 1);
-        let stale = open(&store, "alice", &stale_proof, now() - Duration::hours(24))
+    async fn a_second_login_replaces_the_first_and_keeps_one_file() {
+        let store = store("cap");
+        let proof = mint(&store, "alice", now().unix_timestamp() + 3600);
+        let first = open(&store, "alice", &proof, now()).await.unwrap();
+        let id = first.split_once('.').unwrap().0;
+        assert!(crate::store::is_status_token(id), "{id}");
+        let second = open(&store, "alice", &proof, now() + Duration::seconds(1))
             .await
             .unwrap();
-        let live_proof = mint(
-            &store,
-            "bob",
-            (now() + Duration::hours(TTL_HOURS)).unix_timestamp(),
-        );
-        let live = open(&store, "bob", &live_proof, now()).await.unwrap();
-        assert!(lookup(&store, &stale, now()).await.is_none());
-        assert!(lookup(&store, &live, now()).await.is_some());
         assert_eq!(
-            store.list("sessions").await.unwrap().len(),
-            1,
-            "only the live session file remains"
+            second.split_once('.').unwrap().0,
+            id,
+            "a login no longer draws a new name"
         );
+        assert!(lookup(&store, &first, now()).await.is_none());
+        assert!(lookup(&store, &second, now()).await.is_some());
+        assert_eq!(
+            store.list("sessions").await.unwrap(),
+            vec![format!("{id}.json")],
+            "a repeated login left a second record"
+        );
+    }
+
+    /// A login touches one record and neither lists nor prunes the directory,
+    /// so its cost does not grow with the sessions other accounts hold. The
+    /// drain's scheduled pass is what clears a spent record; a login leaves it.
+    #[tokio::test]
+    async fn a_login_leaves_the_other_sessions_alone_and_prune_clears_them() {
+        let store = store("no-walk");
+        let abandoned = store.path("sessions").join("abandoned.json");
+        std::fs::write(&abandoned, b"{\"not\":\"a session\"}").unwrap();
+        let proof = mint(&store, "alice", now().unix_timestamp() + 3600);
+        open(&store, "alice", &proof, now()).await.unwrap();
+        assert!(
+            abandoned.exists(),
+            "the login walked and pruned the directory"
+        );
+        prune(&store, now()).await;
+        assert!(!abandoned.exists(), "the scheduled prune left it behind");
+    }
+
+    /// The prune compares the record's own expiry: a live one stays and a
+    /// spent one goes, so an inverted comparison cannot pass this.
+    #[tokio::test]
+    async fn prune_keeps_a_live_record_and_removes_a_spent_one() {
+        let store = store("prune-clock");
+        let proof = mint(&store, "alice", now().unix_timestamp() + 3600);
+        let cookie = open(&store, "alice", &proof, now()).await.unwrap();
+        let id = cookie.split_once('.').unwrap().0;
+        let path = store.path("sessions").join(format!("{id}.json"));
+        prune(&store, now() + Duration::hours(11)).await;
+        assert!(path.exists(), "a live record was pruned");
+        prune(&store, now() + Duration::hours(13)).await;
+        assert!(!path.exists(), "a spent record survived the prune");
     }
 
     /// The drain prunes the proofs, because the handler cannot read the root

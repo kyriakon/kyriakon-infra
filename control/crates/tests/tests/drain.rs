@@ -28,5 +28,7 @@ mod lifecycle;
 mod monero;
 #[path = "areas/prepaid.rs"]
 mod prepaid;
+#[path = "areas/privsep.rs"]
+mod privsep;
 #[path = "areas/refund.rs"]
 mod refund;

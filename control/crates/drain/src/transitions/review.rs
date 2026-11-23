@@ -152,6 +152,13 @@ pub async fn filed_application(
             util::clean(&intent.application.username)
         )));
     }
+    // Root's copy of the record the review mail describes. The payment block
+    // is added at approval; after that the card rail resolves a status token
+    // through this copy rather than the handler's file. Writing it before the
+    // journal line means the retry that lacks the line also lacks nothing here.
+    if store.reviewed_application(token).await?.is_none() {
+        snapshot_review(store, token, &record).await?;
+    }
 
     // One review email per application, not per intent: the journal is the
     // record and it is written before the send, so a crash loses an email
@@ -461,6 +468,18 @@ async fn approve(
     }
     let retry = begun.is_some();
     let existing = store.account(username).await?;
+    // A retry adopts an account only when it is this application's own person
+    // account. A group mailbox that appeared under the name is another
+    // transition's, and overwriting it would take the group's account and mail.
+    if retry
+        && existing
+            .as_ref()
+            .is_some_and(|account| account.group.is_some())
+    {
+        return Err(Error::Failed(format!(
+            "the account {username} belongs to a group, not to this application; the intent is left in place"
+        )));
+    }
 
     // An account record that this application never began is a second
     // application for a username that already has one. Nothing here is this
@@ -513,6 +532,15 @@ async fn approve(
     // record's own verdict field. It runs only when something would be
     // installed: the already-member and name refusals above make no account.
     for key in &record.mail_keys {
+        // A person's key is published under the account's own localpart. The
+        // group path names one mailbox per key; here any other name would let a
+        // filed application install a key into another member's keyring entry.
+        if !key.mailbox.is_empty() && key.mailbox != *username {
+            return Err(Error::Failed(format!(
+                "the application's mail key names the mailbox {:?}, not the account {username}",
+                util::clean(&key.mailbox)
+            )));
+        }
         let checked = kyriakon_control_core::mail::pgp::public_key(&key.material)
             .map_err(|e| Error::context("the application's mail key", e))?;
         if let Some(why) = checked.refusal() {
@@ -794,6 +822,10 @@ async fn approve(
     })?;
     store.write_application_copy(username, &copy_bytes).await?;
     store.write_filed_application(token, &copy_bytes).await?;
+    // The root snapshot with the payment block the approval just minted. The
+    // webhook pass reads this, not the handler's copy, so a later rewrite of
+    // `applications/<token>.json` cannot redirect the subscription or the year.
+    snapshot_review_payment(store, token, &record, account.payment.as_ref()).await?;
 
     // The decision email, recorded in the account's notices before it is
     // enqueued. The address outside the platform when one was given, and the
@@ -1078,6 +1110,11 @@ async fn approve_group(
             .write_filed_payment(&record.status_token, &written.payment.as_payment())
             .await?;
     }
+    // The root-only copy the webhook pass resolves this group's status token
+    // through. Its `payment` block is root's, so the handler's own file cannot
+    // move a card payment to another account or body.
+    let payment = (!written.payment.no_charge).then(|| written.payment.as_payment());
+    snapshot_review_payment(store, &record.status_token, record, payment.as_ref()).await?;
     let price = cfg.group_price_gbp.as_str();
     // A group on a cash rail has no Stripe link, and asking for one would fail
     // the approval of a body that never chose the card rail.
@@ -1400,8 +1437,9 @@ pub async fn provision_held(
     Ok(())
 }
 
-/// The decline: no reason, a message that offers the way back, the application
-/// held a week, and only a monastic decline says what is missing.
+/// The decline: no reason, a message that offers the way back, the record held
+/// inside ADR 0005's ninety days while the status link answers for a week, and
+/// only a monastic decline says what is missing.
 async fn decline(
     cfg: &DrainConfig,
     store: &Store,
@@ -1521,6 +1559,45 @@ async fn decline(
         intent.application.clone(),
         None,
     ))
+}
+
+/// Write the root-only review snapshot from the reviewed record.
+async fn snapshot_review(store: &Store, token: &str, record: &Record) -> Result<(), Error> {
+    snapshot_review_payment(store, token, record, None).await
+}
+
+/// Write the snapshot with an approval's payment join, when it has one. One
+/// shape for the review, the person approval and the group approval.
+async fn snapshot_review_payment(
+    store: &Store,
+    token: &str,
+    record: &Record,
+    payment: Option<&Payment>,
+) -> Result<(), Error> {
+    let mut value = serde_json::to_value(record).map_err(|source| Error::Json {
+        context: "encode the reviewed application",
+        source,
+    })?;
+    value["status_link_until"] = json!(util::after_days(7));
+    if let Some(payment) = payment {
+        value["payment"] = serde_json::to_value(payment).map_err(|source| Error::Json {
+            context: "encode the payment block",
+            source,
+        })?;
+    }
+    snapshot_review_value(store, token, &value).await
+}
+
+/// Write a snapshot value, root-owned 0600, under `reviewed/`.
+async fn snapshot_review_value(store: &Store, token: &str, value: &Value) -> Result<(), Error> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|source| Error::Json {
+        context: "encode the reviewed application",
+        source,
+    })?;
+    store
+        .write_reviewed_application(token, &bytes)
+        .await
+        .map_err(Error::from)
 }
 
 /// The application record a decision acts on, or an error naming what is
@@ -1815,9 +1892,8 @@ fn decline_body(record: &Record) -> String {
     let monastic = questions::is_monastic(record.answers.get("orders").map(String::as_str));
     let mut out = format!(
         "Your application for {} was not accepted this time.\n\n\
-         We hold it for a week in case a word arrives, and then it is cleared away\n\
-         and the name is free again. To have us look again, reply if we wrote to you,\n\
-         or write to admin@kyriakon.net from anywhere.\n",
+         The status link answers for a week. To have us look again, reply if we wrote\n\
+         to you, or write to admin@kyriakon.net from anywhere.\n",
         record.username
     );
     if monastic {
