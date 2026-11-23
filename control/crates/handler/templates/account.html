@@ -113,6 +113,9 @@
 {% endif %}
 {% if let Some(token) = g.token %}
 <p>Your payment reference is <span class="mono">{{ token }}</span>.</p>
+{% if let Some(opens) = g.window_opens %}
+<p>The payment window opens on {{ opens }}: the fourteen days to cancel run first, and nothing is due before then.</p>
+{% endif %}
 {% if let Some(closes) = g.window_closes %}
 <p>The payment window closes on {{ closes }}. If nothing arrives, the whole group lapses together: mail keeps arriving and everything published stays up, and sending, uploading and pushing stop.</p>
 {% endif %}

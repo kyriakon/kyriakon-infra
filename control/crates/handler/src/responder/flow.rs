@@ -237,7 +237,7 @@ pub(super) fn build_record(
         .collect();
     if form.get("accept_supply").map(|v| v.trim()) == Some("yes") {
         acceptances.push(Acceptance {
-            document: "immediate supply and the digital-content acknowledgement".to_string(),
+            document: kyriakon_control_core::store::IMMEDIATE_SUPPLY.to_string(),
             version: app.cfg.release.clone(),
         });
     }
@@ -255,6 +255,7 @@ pub(super) fn build_record(
         // Both are the drain's to write when it decides: the handler files an
         // undecided application and has no decision to record.
         decided_at: None,
+        status_link_until: None,
         password_link: None,
         domain: body
             .then(|| {

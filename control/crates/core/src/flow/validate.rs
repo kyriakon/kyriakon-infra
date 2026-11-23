@@ -49,7 +49,15 @@ pub fn reason(
     // value the other refuses.
     if let Some(why) = match q.kind {
         Kind::YesNo => (!matches!(v, "yes" | "no")).then(|| "answer yes or no".to_string()),
-        Kind::Acceptance => (v != "yes").then(|| "this has to be accepted".to_string()),
+        // An optional acceptance is unticked by leaving it empty; a value the
+        // page never offers is still refused, and says what the page does offer.
+        Kind::Acceptance => (v != "yes").then(|| {
+            if required {
+                "this has to be accepted".to_string()
+            } else {
+                "answer yes to accept, or leave it unticked".to_string()
+            }
+        }),
         _ => None,
     } {
         return Some(why);

@@ -128,6 +128,29 @@ fn a_decided_application_answers_for_seven_days_and_then_reads_as_unknown() {
     );
 }
 
+/// A held approval writes its own end for the status link, so the page still
+/// answers when the hold ends and the password link appears. Without the field
+/// the seven days from `decided_at` would have run out during the hold.
+#[test]
+fn a_held_application_keeps_its_status_link_past_the_decision_window() {
+    let mut record = decided(
+        "approved: the account is held until 2026-10-15",
+        Some("2026-10-01T09:00:00Z"),
+        None,
+    );
+    record.status_link_until = Some("2026-10-22T09:00:00Z".to_string());
+
+    let during_hold = status_page(Some(record.clone()), None, at("2026-10-16T09:00:00Z"));
+    assert_eq!(during_hold.notice, "", "the held page still answers");
+    assert_eq!(
+        during_hold.stage,
+        "approved: the account is held until 2026-10-15"
+    );
+
+    let after = status_page(Some(record), None, at("2026-10-22T09:00:00Z"));
+    assert_eq!(after.notice, UNKNOWN_TOKEN);
+}
+
 /// The card pages show the same keyed Payment Link the approval email carried,
 /// rather than promising one in a later message. The status page and both
 /// account pages share this PaymentView, so one check covers the three.
@@ -141,7 +164,7 @@ async fn the_card_pages_carry_the_keyed_payment_link() {
             "acceptances":[],"question_list":"2026-10-13 test",
             "payment":{"token_ref":"KYR-AAAA-BBBB-CCCC",
                        "token_issued_at":"2026-10-02T09:00:00Z","paid_until":null,
-                       "window":{"opened_at":"2099-10-02T09:00:00Z",
+                       "window":{"opened_at":"2026-10-02T09:00:00Z",
                                  "closes_at":"2099-10-16T09:00:00Z",
                                  "state":"open","extensions":0}}}"#,
     )
@@ -176,7 +199,7 @@ async fn a_group_status_page_carries_the_group_payment_link() {
             "acceptances":[],"question_list":"2026-10-13 test",
             "payment":{"token_ref":"KYR-AAAA-BBBB-CCCC",
                        "token_issued_at":"2026-10-02T09:00:00Z","paid_until":null,
-                       "window":{"opened_at":"2099-10-02T09:00:00Z",
+                       "window":{"opened_at":"2026-10-02T09:00:00Z",
                                  "closes_at":"2099-10-16T09:00:00Z",
                                  "state":"open","extensions":0}}}"#,
     )

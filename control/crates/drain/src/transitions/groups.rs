@@ -17,7 +17,7 @@ use super::boxrun::{
 use super::lifecycle::{close_box_account, dns_contact};
 use super::Error;
 use super::{write_journal, Settlement};
-use kyriakon_control_core::account::state::{Standing, WindowState};
+use kyriakon_control_core::account::state::Standing;
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::questions;
 use kyriakon_control_core::flow::validate;
@@ -373,15 +373,15 @@ pub async fn provision_group(
         window: if intent.payment.no_charge {
             None
         } else {
-            match record.as_ref().and_then(|g| g.payment.window.clone()) {
-                Some(window) => Some(window),
-                None => Some(Window {
-                    opened_at: now.clone(),
-                    closes_at: util::after_days(14),
-                    state: WindowState::Open,
-                    extensions: 0,
-                }),
-            }
+            // The approval drew the window, hold dates included, and signed it
+            // into this intent; a retry keeps the group record's own copy. An
+            // intent filed before the hold existed carries none, so it opens at
+            // approval as it always did.
+            record
+                .as_ref()
+                .and_then(|g| g.payment.window.clone())
+                .or_else(|| intent.payment.window.clone())
+                .or_else(|| Some(Window::on_approval(OffsetDateTime::now_utc(), true)))
         },
         paid_until: record
             .as_ref()
@@ -654,6 +654,9 @@ async fn write_group_account(
                 created_at: existing
                     .map(|a| a.created_at.clone())
                     .unwrap_or_else(|| now.clone()),
+                // A group's mailbox is made at approval: a body is not a
+                // consumer and no cancellation-period hold applies to it.
+                hold_until: None,
                 // The group holds the payment state, so the mailbox's record has
                 // no block for one at all rather than a paid-until that could be
                 // mistaken for an unpaid person's.
@@ -1916,6 +1919,7 @@ mod tests {
             front_end: "web".into(),
             stage: "received".into(),
             decided_at: None,
+            status_link_until: None,
             password_link: None,
             domain: Some("parish.example".into()),
             outside_address: None,

@@ -3386,3 +3386,143 @@ fn a_credit_through_a_flat_payment_record_keeps_the_token_and_dates() {
     );
     assert_eq!(payment_lines(&fix).len(), 1, "the ledger line");
 }
+
+/// An approval without the immediate-supply request holds the account for the
+/// fourteen days it has to cancel: the record is `held`, nothing is made on the
+/// box, and the payment window opens on the day the hold ends. The sweep then
+/// supplies it, and the approval mail carries the password link.
+#[test]
+fn an_approval_without_immediate_supply_holds_the_account_then_supplies_it() {
+    let fix = Fix::new("supply-hold");
+    let mut record = fix.filed("secretary", "cash", &[("rail", "cash")]);
+    record["acceptances"] = json!([{"document": "terms", "version": "2026-10-01 abc1234"}]);
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("approve", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("held"), "{account}");
+    let hold = account["hold_until"]
+        .as_str()
+        .expect("a held account has a date");
+    let hold = kyriakon_control_core::util::parse_date(hold).expect("the hold date parses");
+    let today = OffsetDateTime::now_utc().date();
+    assert_eq!(
+        (hold - today).whole_days(),
+        14,
+        "the hold ends after the cancellation period: {account}"
+    );
+    assert!(
+        account["password_link"].is_null(),
+        "a held account has no password link yet: {account}"
+    );
+    assert!(
+        !fix.scripts_log().contains("provision-member.sh"),
+        "nothing was supplied: {}",
+        fix.scripts_log()
+    );
+    let window = &account["payment"]["window"];
+    let stamp = |field: &str| {
+        OffsetDateTime::parse(
+            window[field].as_str().expect(field),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    };
+    let opened = stamp("opened_at");
+    let closes = stamp("closes_at");
+    assert_eq!(
+        (opened.date() - today).whole_days(),
+        14,
+        "the window opens when the hold ends: {account}"
+    );
+    assert_eq!(
+        (closes.date() - opened.date()).whole_days(),
+        14,
+        "the window still runs for fourteen days after it opens: {account}"
+    );
+
+    // The hold ends. The sweep supplies the account and mints the link; a
+    // second pass does not provision again or send a second approval mail.
+    fix.amend_account("secretary", |account| {
+        account["hold_until"] = json!(kyriakon_control_core::util::date_after_days(0));
+    });
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("active"), "{account}");
+    assert!(
+        account["password_link"].is_object(),
+        "the supplied account has its link: {account}"
+    );
+    assert!(account.get("hold_until").is_none(), "{account}");
+    assert!(
+        fix.scripts_log().contains("provision-member.sh"),
+        "the member was made: {}",
+        fix.scripts_log()
+    );
+    assert!(
+        fix.sent().contains("Set your mail password"),
+        "the approval mail went: {}",
+        fix.sent()
+    );
+
+    let scripts = fix.scripts_log();
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.scripts_log(),
+        scripts,
+        "a second pass provisioned again"
+    );
+    assert_eq!(
+        fix.sent().matches("Set your mail password").count(),
+        1,
+        "the approval mail was sent twice: {}",
+        fix.sent()
+    );
+}
+
+/// The cancellation right is about supply, not payment, so a free approval
+/// without the immediate-supply request is held too. It has no payment window;
+/// the hold date alone decides when the mailbox is made.
+#[test]
+fn a_free_approval_without_immediate_supply_is_held_too() {
+    let fix = Fix::new("supply-hold-free");
+    let mut record = fix.filed("secretary", "no_charge", &[("rail", "no_charge")]);
+    record["acceptances"] = json!([{"document": "terms", "version": "2026-10-01 abc1234"}]);
+    fix.rewrite_record(&record);
+    fix.file_application(&record);
+    assert!(fix.drain().status.success());
+    fix.decide("provision", "secretary");
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("held"), "{account}");
+    assert!(
+        account["payment"].is_null(),
+        "a free account has no block: {account}"
+    );
+    assert!(account["hold_until"].is_string(), "{account}");
+    assert!(
+        !fix.scripts_log().contains("provision-member.sh"),
+        "nothing was supplied"
+    );
+
+    fix.amend_account("secretary", |account| {
+        account["hold_until"] = json!(kyriakon_control_core::util::date_after_days(0));
+    });
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("active"), "{account}");
+    assert!(account["payment"].is_null(), "{account}");
+    assert!(
+        fix.sent().contains("There is no charge"),
+        "the free approval mail says so: {}",
+        fix.sent()
+    );
+}

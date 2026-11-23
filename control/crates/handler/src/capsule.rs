@@ -296,6 +296,12 @@ pub fn account(
         }
         if let Some(token) = &g.token {
             out.push_str(&format!("Your payment reference is {token}.\n"));
+            if let Some(opens) = &g.window_opens {
+                out.push_str(&format!(
+                    "The payment window opens on {opens}: the fourteen days to cancel run \
+                     first, and nothing is due before then.\n"
+                ));
+            }
             if let Some(closes) = &g.window_closes {
                 out.push_str(&format!(
                     "The payment window closes on {closes}. If nothing arrives, the whole \

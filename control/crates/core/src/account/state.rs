@@ -22,9 +22,13 @@ use crate::Error;
 
 /// The account's own word, as the record writes it. `closing` is the one
 /// standing with fields of its own, and they sit beside it on the record.
+/// `held` is an approval without the immediate-supply request: the record
+/// exists, nothing has been made on the box yet, and the hold date on the
+/// account says when the drain may supply it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Standing {
+    Held,
     Active,
     Lapsed,
     Suspended,
@@ -34,6 +38,7 @@ pub enum Standing {
 impl Standing {
     pub fn word(self) -> &'static str {
         match self {
+            Standing::Held => "held",
             Standing::Active => "active",
             Standing::Lapsed => "lapsed",
             Standing::Suspended => "suspended",
@@ -77,6 +82,7 @@ impl fmt::Display for WindowState {
 /// One account standing with the closing details beside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccountState {
+    Held,
     Active,
     Lapsed,
     Suspended,
@@ -94,6 +100,7 @@ pub enum AccountState {
 impl AccountState {
     pub fn word(&self) -> &'static str {
         match self {
+            AccountState::Held => "held",
             AccountState::Active => "active",
             AccountState::Lapsed => "lapsed",
             AccountState::Suspended => "suspended",
@@ -154,6 +161,7 @@ impl Account {
     /// The record's standing with the closing details as one value.
     pub fn lifecycle(&self) -> AccountState {
         match self.state {
+            Standing::Held => AccountState::Held,
             Standing::Active => AccountState::Active,
             Standing::Lapsed => AccountState::Lapsed,
             Standing::Suspended => AccountState::Suspended,
@@ -267,6 +275,7 @@ mod tests {
     #[test]
     fn every_record_state_reads_and_writes_the_same_wire_word() {
         let records = [
+            ("held", None, None, None, AccountState::Held),
             ("active", None, None, None, AccountState::Active),
             ("lapsed", None, None, None, AccountState::Lapsed),
             ("suspended", None, None, None, AccountState::Suspended),
@@ -378,6 +387,10 @@ mod tests {
         assert_eq!(account.serving(), (false, false));
         account.resume(false).unwrap();
         assert_eq!(account.serving(), (true, true));
+        // A held account has no box account and no vhost, so neither lane is
+        // served even though the application carried an upload key.
+        account.state = Standing::Held;
+        assert_eq!(account.serving(), (false, false));
     }
 
     /// An old closure of a group mailbox has no payment block; the grace date

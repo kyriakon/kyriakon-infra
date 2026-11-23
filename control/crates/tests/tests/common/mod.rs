@@ -731,7 +731,15 @@ impl Fix {
             "upload_key": upload_key,
             "rail": rail,
             "no_charge": rail == "no_charge",
-            "acceptances": [{"document": "terms", "version": "2026-10-01 abc1234"}],
+            "acceptances": [
+                {"document": "terms", "version": "2026-10-01 abc1234"},
+                // The ordinary applicant asked us to start now; a test about
+                // the fourteen-day hold removes this entry before filing.
+                {
+                    "document": kyriakon_control_core::store::IMMEDIATE_SUPPLY,
+                    "version": "2026-10-01 abc1234"
+                }
+            ],
             "question_list": "2026-10-01 abc1234",
         });
         std::fs::write(
@@ -1059,7 +1067,15 @@ impl Fix {
             },
             "rail": "cash",
             "no_charge": false,
-            "acceptances": [{"document": "terms", "version": "2026-10-01 abc1234"}],
+            "acceptances": [
+                {"document": "terms", "version": "2026-10-01 abc1234"},
+                // The ordinary applicant asked us to start now; a test about
+                // the fourteen-day hold removes this entry before filing.
+                {
+                    "document": kyriakon_control_core::store::IMMEDIATE_SUPPLY,
+                    "version": "2026-10-01 abc1234"
+                }
+            ],
             "question_list": "2026-10-01 abc1234",
         });
         std::fs::write(
