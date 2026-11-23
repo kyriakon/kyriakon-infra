@@ -124,6 +124,27 @@ remove_legacy() {
 	changed=1
 }
 
+# settle_lock <path> <owner> <group>: a lock file the service takes, left by an
+# earlier run or by the other half. Every append and every rewrite takes the
+# record's own lock, `<record>.lock`, and the ones below live in a directory the
+# handler owns: a root-owned one there locks the handler out of that record until
+# root happens to take the same lock again, which is a deploy rather than a
+# request. So the layout settles them here. Only a plain, singly-linked file
+# already owned by the expected account is left; anything else is removed and
+# never repaired, because the deploy has the service stopped and the lock is
+# disposable. chown would hand `_onboard` the inode of a planted hardlink:
+# OpenBSD has no protected_hardlinks, so drafts/.lock can name a root-owned
+# account.json and a chown there makes it writable by the handler.
+settle_lock() {
+	[ -e "$1" ] || [ -L "$1" ] || return 0
+	if [ -L "$1" ] || [ ! -f "$1" ] ||
+		[ "$(stat -f '%l' "$1")" -ne 1 ] ||
+		[ "$(stat -f '%Su %Sg' "$1")" != "$2 $3" ]; then
+		changed=1
+		rm -f "$1"
+	fi
+}
+
 # The guard's own check: a symlink planted at a store entry is refused, and the
 # target it points at keeps its mode. Runs as the invoking user in a scratch
 # store, so it needs no root and no box; the live call sites pass `_onboard` and
@@ -144,6 +165,21 @@ self_test() {
 	check "and the target keeps its mode" "$(stat -f '%Lp' "$tree/target")" 755
 	check "the refusal names the link" \
 		"$(grep -c 'is a symlink' "$tree/err")" 1
+
+	# #925: a hardlink planted at a lock path is unlinked, never chowned. The
+	# record is root-owned on the root OpenBSD self-test and the invoking user's
+	# on a macOS run; the expected account matches it either way, so the link
+	# count is the only reason to remove. A chowning settle_lock repairs the
+	# inode in place instead and changes its mode.
+	printf '{"no_charge":false}\n' >"$tree/record.json"
+	chmod 0640 "$tree/record.json"
+	ln "$tree/record.json" "$tree/store/.lock"
+	before=$(stat -f '%Su %Sg %Lp %i' "$tree/record.json")
+	( settle_lock "$tree/store/.lock" "$(id -un)" "$(id -gn)" ) >/dev/null 2>&1 || true
+	check "a hardlinked lock is removed" \
+		"$([ -e "$tree/store/.lock" ] && printf no || printf yes)" yes
+	check "the original record keeps its owner, mode and inode" \
+		"$(stat -f '%Su %Sg %Lp %i' "$tree/record.json")" "$before"
 	self_test_end
 }
 
@@ -230,29 +266,6 @@ for group in "$store"/groups/*; do
 	repair_record_dir "$group"
 	share_record "$group/group.json"
 done
-
-# settle_lock <path> <owner> <group>: a lock file the service takes, left by an
-# earlier run or by the other half. Every append and every rewrite takes the
-# record's own lock, `<record>.lock`, and the ones below live in a directory the
-# handler owns: a root-owned one there locks the handler out of that record until
-# root happens to take the same lock again, which is a deploy rather than a
-# request. So the layout settles them here. A regular file is handed to the
-# directory's owner; anything else, which is a name the handler could have
-# planted, is removed, because the deploy has the service stopped.
-settle_lock() {
-	[ -e "$1" ] || [ -L "$1" ] || return 0
-	if [ -L "$1" ] || [ ! -f "$1" ]; then
-		changed=1
-		rm -f "$1"
-		return 0
-	fi
-	if [ "$(stat -f '%Su %Sg %Lp' "$1")" != "$2 $3 600" ]; then
-		changed=1
-		chown "$2:$3" "$1"
-		chmod 0600 "$1"
-	fi
-	assert_mode "$1" "$2" "$3" 600
-}
 
 settle_lock "$store/drafts/.lock" "$onboard_user" "$onboard_user"
 settle_lock "$store/applications/.confirmation.lock" "$onboard_user" "$onboard_user"
