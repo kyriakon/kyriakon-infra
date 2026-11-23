@@ -6,6 +6,7 @@ use std::collections::HashSet;
 
 use crate::flow::questions::{self, Kind, Question, Rule};
 use crate::mail::keycheck;
+use crate::util;
 
 /// The reserved set, one name per line, `#` comments and blank lines skipped so
 /// the file can explain itself.
@@ -54,7 +55,7 @@ pub fn reason(
         return Some(why);
     }
     match &q.rule {
-        Rule::None => None,
+        Rule::None => free_text(q.kind, value),
         Rule::Username => username(v, reserved),
         Rule::Usernames => usernames(v, reserved),
         Rule::Address => address(v),
@@ -77,14 +78,27 @@ pub fn reason(
         // caller prefixes the question's own prompt, so this fragment does not
         // repeat it.
         Rule::SingleLine => {
-            if value.chars().any(char::is_control) {
-                Some("one line, without control characters".to_string())
+            if !value.chars().all(util::terminal_safe) {
+                Some("one line, without control or invisible characters".to_string())
             } else {
                 (value.chars().count() > SINGLE_LINE_MAX)
                     .then(|| format!("at most {SINGLE_LINE_MAX} characters"))
             }
         }
     }
+}
+
+/// A free-text answer may not carry a control or invisible formatter onto a
+/// terminal, where it would repaint the screen or reorder a name. A multiline
+/// answer, and an address list, keep their line breaks, because those are the
+/// shape they were asked for; every other character has to survive
+/// [`util::clean`] unchanged.
+fn free_text(kind: Kind, value: &str) -> Option<String> {
+    let multiline = matches!(kind, Kind::Multiline | Kind::Addresses);
+    (!value
+        .chars()
+        .all(|c| (multiline && c == '\n') || util::terminal_safe(c)))
+    .then(|| "without control or invisible characters".to_string())
 }
 
 /// The username rule: the single DNS label `scripts/add-user.sh` enforces, 1-31
@@ -401,8 +415,15 @@ mod tests {
         assert!(reason(&q, "Parish of Example", &name(), true).is_none());
         let why = reason(&q, "Parish\n=> https://evil.example/", &name(), true)
             .expect("a newline is refused");
-        assert_eq!(why, "one line, without control characters");
-        for hostile in ["Parish\rX", "Parish\u{1b}X", "Parish\tX", "Parish\u{7}X"] {
+        assert_eq!(why, "one line, without control or invisible characters");
+        for hostile in [
+            "Parish\rX",
+            "Parish\u{1b}X",
+            "Parish\tX",
+            "Parish\u{7}X",
+            "Parish\u{202e}X",
+            "Parish\u{200f}X",
+        ] {
             assert!(reason(&q, hostile, &name(), true).is_some(), "{hostile:?}");
         }
 
@@ -415,6 +436,51 @@ mod tests {
             why.contains(&format!("at most {SINGLE_LINE_MAX} characters")),
             "{why}"
         );
+    }
+
+    /// A free-text rule is not a hole in the escaping rules: an escape, a
+    /// carriage return or an invisible formatter is refused, while a multiline
+    /// answer keeps the newlines it was asked for.
+    #[test]
+    fn a_free_text_answer_refuses_an_escape_and_a_multiline_keeps_its_newlines() {
+        let text = Question {
+            id: "vat".into(),
+            prompt: "VAT number".into(),
+            kind: Kind::Text,
+            branch: Branch::Body,
+            required: false,
+            rule: Rule::None,
+        };
+        assert!(reason(&text, "GB 123 4567 89", &name(), false).is_none());
+        // A text answer is one line however it arrived, so a newline is refused
+        // with the rest of the control characters.
+        for hostile in [
+            "a\rb",
+            "a\nb",
+            "a\u{1b}[2Jb",
+            "a\u{7f}b",
+            "a\u{9b}b",
+            "a\u{202e}b",
+            "a\u{200f}b",
+            "a\u{2028}b",
+        ] {
+            assert!(
+                reason(&text, hostile, &name(), false).is_some(),
+                "{hostile:?}"
+            );
+        }
+
+        let multiline = Question {
+            kind: Kind::Multiline,
+            ..text
+        };
+        assert!(reason(&multiline, "first\nsecond", &name(), false).is_none());
+        for hostile in ["first\rsecond", "first\u{1b}second", "first\u{202e}second"] {
+            assert!(
+                reason(&multiline, hostile, &name(), false).is_some(),
+                "{hostile:?}"
+            );
+        }
     }
 
     #[test]
