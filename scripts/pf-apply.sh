@@ -113,9 +113,20 @@ remove_lo_skip() {
 # check runs as root. `flags S/SA` keeps the block to connection setup, so
 # replies ride the state the pass rule creates and httpd's own answers are never
 # blocked. Any other loopback service keeps the stock `pass` above.
+#
+# A box that already carries the block from before #920 has the root-only pass.
+# The marker test alone would call that block done and leave HTTPS broken on the
+# next load, so a block whose pass does not name _relayd is replaced in place.
+# A block that names it is left byte-identical. Returns 0 when the file changed,
+# 1 when it already carried the current block.
 append_signup_hop() {
 	if has_block_in "$1" "signup hop"; then
-		return 1
+		if pass_users_in "$1" "signup hop" | grep -qx _relayd; then
+			return 1
+		fi
+		while has_block_in "$1" "signup hop"; do
+			drop_block "$1" "signup hop"
+		done
 	fi
 	cat >>"$1" <<'EOF'
 
@@ -126,14 +137,35 @@ pass  out on lo proto tcp to 127.0.0.1 port 8080 user { root _relayd } keep stat
 EOF
 }
 
+# Remove one of our own marker pairs from a file, in place, and the blank line
+# the append puts before it. Used to replace a block an earlier version wrote
+# rather than appending a second copy behind it.
+drop_block() {
+	typeset tmp
+	tmp="$1.kyriakon-drop"
+	awk -v marker="# --- kyriakon: $2" '
+	index($0, marker) == 1 { if (blank > 0) blank--; inside = 1; next }
+	inside && /^# --- end kyriakon: / { inside = 0; next }
+	inside { next }
+	/^$/ { blank++; next }
+	{
+		while (blank > 0) { print ""; blank-- }
+		print
+	}
+	END { while (blank > 0) { print ""; blank-- } }
+	' "$1" > "$tmp"
+	mv "$tmp" "$1"
+}
+
 # The accounts the box's relayd processes run as. The relay workers that open
 # backend connections drop to _relayd, while the parent stays root, so every
-# account seen is returned, not just the first. The account record is the
-# fallback when relayd is installed but not running. Empty means the host has no
-# relayd at all (macOS), and the caller skips.
+# account seen is returned, not just the first. The process name is matched, not
+# the command line, so `less /etc/relayd.conf` is not mistaken for the daemon.
+# The account record is the fallback when relayd is installed but not running.
+# Empty means the host has no relayd at all (macOS), and the caller skips.
 relayd_users() {
 	typeset seen
-	seen=$(ps -axo user,command 2>/dev/null | awk 'NR > 1 && /[r]elayd/ { print $1 }' | sort -u)
+	seen=$(ps -axo user,comm 2>/dev/null | awk 'NR > 1 && $2 ~ /(^|\/)relayd$/ { print $1 }' | sort -u)
 	if [ -n "$seen" ]; then
 		printf '%s\n' "$seen"
 	else
@@ -141,10 +173,16 @@ relayd_users() {
 	fi
 }
 
-# The accounts a fragment's loopback pass admits, one per line, from its `user`
-# clause. Handles both `user root` and `user { root _relayd }`.
+# The accounts a pass line admits, one per line, from its `user` clause. Handles
+# both `user root` and `user { root _relayd }`. With a block name as $2, only
+# that marker block's pass is read, so a second copy or another fragment cannot
+# answer for it.
 pass_users_in() {
-	awk '/^pass .* out on lo .* user / {
+	awk -v marker="${2:+# --- kyriakon: $2}" '
+	marker != "" && index($0, marker) == 1 { inside = 1; next }
+	marker != "" && !inside { next }
+	marker != "" && /^# --- end kyriakon: / { exit }
+	/^pass .* out on lo .* user / {
 		sub(/^.* user /, "")
 		sub(/ keep state.*$/, "")
 		gsub(/[{}]/, " ")
@@ -249,7 +287,7 @@ END { if (inblk) printf "%s", buf }
 self_test() {
 	# shellcheck disable=SC1091 # resolves at runtime from this script's directory
 	. "$(dirname "$0")/lib.sh"
-	typeset tree first second env relayd_accounts account
+	typeset tree first second env relayd_accounts account hopped old
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work
@@ -326,6 +364,31 @@ self_test() {
 	if append_signup_hop "$hop"; then second=added; else second=quiet; fi
 	check "a second hop run changes nothing" "$second" quiet
 	check "and the file is byte-identical" "$(cksum "$hop")" "$before"
+
+	# A box that already carries the block an earlier version wrote has the
+	# root-only pass and the marker, so the marker test alone reported it as done
+	# and the next load kept dropping every backend connect (#920). The update
+	# must replace that block in place, not append a second one beside it.
+	old="$tree/hop-old.conf"
+	cat > "$old" <<'EOF'
+set skip on lo
+# --- kyriakon: signup hop (#758, openbsd/etc/httpd.conf) ---
+block out on lo proto tcp to 127.0.0.1 port 8080 flags S/SA
+pass  out on lo proto tcp to 127.0.0.1 port 8080 user root keep state
+# --- end kyriakon: signup hop ---
+EOF
+	if append_signup_hop "$old"; then hopped=updated; else hopped=quiet; fi
+	check "an old root-only hop block is rewritten" "$hopped" updated
+	check "the rewritten pass admits root and _relayd" \
+		"$(pass_users_in "$old" | sort | tr '\n' ' ')" "_relayd root "
+	check "and exactly one signup-hop block remains" \
+		"$(grep -c '^# --- kyriakon: signup hop' "$old")" 1
+	check "and exactly one hop pass line remains" \
+		"$(grep -c '^pass  out on lo' "$old")" 1
+	before=$(cksum "$old")
+	if append_signup_hop "$old"; then hopped=updated; else hopped=quiet; fi
+	check "a second update is quiet" "$hopped" quiet
+	check "and leaves the rewritten file byte-identical" "$(cksum "$old")" "$before"
 
 	# The greylisting scans once matched a commented-out stock rule and dropped
 	# the live block, leaving SMTP on smtpd while the output said it was already
@@ -659,12 +722,15 @@ fi
 # relayd's relay workers drop to _relayd before connecting, so the pass names
 # that account as well as root (#758, #920). Deliberately paired with the
 # skip-line removal above: alone, this block matches nothing.
-if has_block 'signup hop'; then
-	printf 'signup hop:   already in %s\n' "$pf_conf"
-else
-	append_signup_hop "$work"
+if append_signup_hop "$work"; then
 	added=$((added + 1))
-	printf 'signup hop:   to be added\n'
+	if has_block 'signup hop'; then
+		printf 'signup hop:   to be updated in place (#920)\n'
+	else
+		printf 'signup hop:   to be added\n'
+	fi
+else
+	printf 'signup hop:   already in %s\n' "$pf_conf"
 fi
 
 if [ "$added" -eq 0 ] && [ "$collapsed" -eq 0 ] && [ "$lo_removed" -eq 0 ]; then
