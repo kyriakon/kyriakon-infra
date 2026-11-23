@@ -68,30 +68,55 @@ struct kyriakon_mailbox {
 static MODULE_CONTEXT_DEFINE_INIT(kyriakon_mailbox_module,
 				  &mail_storage_module_register);
 
+static int
+kyriakon_istream_read(void *context)
+{
+	return i_stream_read(context);
+}
+
+static const unsigned char *
+kyriakon_istream_data(void *context, size_t *size_r)
+{
+	return i_stream_get_data(context, size_r);
+}
+
+static void
+kyriakon_istream_skip(void *context, size_t size)
+{
+	i_stream_skip(context, size);
+}
+
+/* i_stream_get_error() is only meaningful once a read set stream_errno. */
+static const char *
+kyriakon_istream_error(void *context)
+{
+	struct istream *input = context;
+
+	return input->stream_errno != 0 ? i_stream_get_error(input) : NULL;
+}
+
+static const struct kyriakon_pull_stream kyriakon_istream = {
+	.read = kyriakon_istream_read,
+	.data = kyriakon_istream_data,
+	.skip = kyriakon_istream_skip,
+	.error = kyriakon_istream_error,
+};
+
 /* The input can be a non-blocking client socket (IMAP APPEND): a 0 read means
  * "nothing yet", and the ioloop has to run before there can be more. -1 is
- * both EOF and a stream error; only stream_errno says which, and an error
- * must fail the save rather than complete it on a short body. -2 is "buffer
- * full": its bytes are already there to hand out. The status mapping itself
- * lives in encrypt-save.c, where the test drives it. */
+ * both EOF and a stream error; only stream_errno says which. An istream-limit
+ * reports -1 with eof=TRUE while the literal's bytes are still buffered, so
+ * the pull consumes the buffer rather than reading the result as an empty
+ * message. The loop and its status mapping live in encrypt-save.c, where the
+ * test drives them. */
 static int
 kyriakon_pull_input(void *context, const unsigned char **data_r, size_t *size_r,
 		    char *error, size_t error_size)
 {
 	struct kyriakon_save_ctx *sctx = context;
-	const char *read_error = NULL;
-	int ret;
 
-	ret = i_stream_read(sctx->input);
-	if (ret > 0 || ret == -2) {
-		*data_r = i_stream_get_data(sctx->input, size_r);
-		i_stream_skip(sctx->input, *size_r);
-		/* -2 only happens with data buffered, so report it as data. */
-		ret = *size_r > 0 ? 1 : 0;
-	} else if (ret < 0 && sctx->input->stream_errno != 0) {
-		read_error = i_stream_get_error(sctx->input);
-	}
-	return kyriakon_save_pull(ret, read_error, error, error_size);
+	return kyriakon_save_pull_stream(&kyriakon_istream, sctx->input, data_r,
+					 size_r, error, error_size);
 }
 
 static bool

@@ -11,8 +11,9 @@
 # The table is the one list. The deploy scripts read it through need_packages in
 # lib.sh, and the CI OpenBSD VM reads it here with --ci, so the VM installs the
 # tools the scripts call rather than a hand-picked subset. --ci is not "the box
-# has it": rust and dovecot stay out because the self-tests do not build or
-# start them.
+# has it": a row is in when a CI step needs the tool (rust builds the member
+# content responder); dovecot stays out because the CI VM neither builds nor
+# starts it.
 #
 # --check reads every direct need_pkg call in the scripts and fails when one is
 # not in the table. It is what keeps a new dependency from being installed only
