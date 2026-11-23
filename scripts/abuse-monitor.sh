@@ -359,10 +359,27 @@ $tally
 EOF
 }
 
-# Entries in the first list that are not in the second. Files rather than strings,
-# so a caller can hand it a state file and a fresh dump.
-new_entries() {
-	awk 'NR == FNR { old[$0] = 1; next } NF && !($0 in old) { print }' "$2" "$1"
+# trap_new <previous-total> <current-total>: how many trap entries appeared
+# since the last run, as the growth of the aggregate count. A swap (one host
+# left while another entered) reads as zero, because the monitor keeps no list
+# of hosts to compare against: that list is a per-address record, which the
+# threat model rules out (issue #889).
+trap_new() {
+	if [ "$2" -gt "$1" ]; then printf '%s' "$(( $2 - $1 ))"; else printf 0; fi
+}
+
+# deferred_senders_flagged <log> <day> <min>: print how many envelope senders
+# were deferred from <min> or more distinct addresses on <day>. The count only:
+# neither the alert nor the state file may carry a sender (issue #889).
+deferred_senders_flagged() {
+	awk -v day="$2" -v min="$3" '
+		$0 ~ "^" day && /\(GREY\)/ {
+			f = $8; gsub(/[<>]/, "", f)
+			pair = f "|" $7
+			if (!(pair in seen)) { seen[pair] = 1; n[f]++ }
+		}
+		END { c = 0; for (f in n) if (n[f] >= min) c++; print c }
+	' "$1" 2>/dev/null
 }
 
 newest_snapshot_epoch() {
@@ -555,21 +572,39 @@ state_write() {
 	mv "$tmp" "$1"
 }
 
+# scan_mtimes <dir>: print "<oldest> <count>" for the regular files under <dir>,
+# or return 1 when the scan itself fails. A find or stat that cannot run
+# is a directory that cannot be seen, not an empty one (issue #897), so the
+# caller must treat the nonzero status as a finding. FIND_CMD and STAT_CMD point
+# the scan at stubs in --self-test, the way ID_CMD and LAPSE_USER_SH do.
+scan_mtimes() {
+	typeset listing
+	if ! listing=$("${FIND_CMD:-find}" "$1" -type f -exec "${STAT_CMD:-stat}" -f '%m' {} + 2>/dev/null); then
+		return 1
+	fi
+	printf '%s\n' "$listing" | awk 'NF { n++; if (n == 1 || $1 < m) m = $1 } END { print m + 0, n + 0 }'
+}
+
 # drain_backlog <intents-dir> <max-minutes>: alert when the oldest unapplied
 # intent has waited past the drain's limit. A missing intents/ directory is a
 # finding, not a quiet pass: the check exists for a drain that stopped, and a
-# store with no intents/ is the one shape a healthy drain never has. Returning 1
-# stops the run the way an unreadable log does.
+# store with no intents/ is the one shape a healthy drain never has. A scan that
+# fails is the same class of finding, because an unreadable store is unknown
+# backlog rather than none. Returning 1 stops the run the way an unreadable log
+# does.
 drain_backlog() {
-	typeset intents="$1" max_min="$2" oldest pending age_min
+	typeset intents="$1" max_min="$2" scan oldest pending age_min
 	if [ ! -d "$intents" ]; then
 		alert control "drain store" "$intents is missing, so the drain backlog could not be read. scripts/control-store.sh creates it on a box running the control plane, so this is the drain's half not deployed or the store root moved" "run scripts/control-store.sh, or point ONBOARD_DIR at the store root drain.toml names" fail
 		return 1
 	fi
-	oldest=$(find "$intents" -type f -exec stat -f '%m' {} + 2>/dev/null \
-		| awk 'NR == 1 || $1 < m { m = $1 } END { print m }' || true)
-	[ -n "$oldest" ] || return 0
-	pending=$(find "$intents" -type f 2>/dev/null | wc -l | tr -d ' ')
+	if ! scan=$(scan_mtimes "$intents"); then
+		alert control "drain unreadable" "$intents could not be read, so the drain backlog is unknown rather than empty. A find or stat that fails is a check that cannot see what it is checking" "check the store's ownership and permissions, and that find and stat run, then run this script by hand" fail
+		return 1
+	fi
+	oldest=${scan%% *}
+	pending=${scan##* }
+	[ "$pending" -gt 0 ] || return 0
 	age_min=$(( ( $(date +%s) - oldest ) / 60 ))
 	if [ "$age_min" -gt "$max_min" ]; then
 		alert control "drain backlog" "$pending unapplied intent(s) in the store, oldest $age_min minutes (max $max_min). The drain is the service's privileged half; an intent this old is a member whose payment or approval was accepted and who still has no account" "check the drain's log and restart it" fail
@@ -618,14 +653,32 @@ self_test() {
 	check "nothing to parse prints nothing" \
 		"$(printf '%s' '' | newest_snapshot_epoch)" ""
 
-	# The trap diff: one new entry is churn and has to stay quiet, several at once
-	# is the burst the signal is for.
-	printf '%s\n' '10.0.0.1' '10.0.0.2' '10.0.0.3' > "$work/old"
-	printf '%s\n' '10.0.0.1' '10.0.0.2' '10.0.0.3' '10.0.0.9' > "$work/new1"
-	check "one new trap entry is seen" "$(new_entries "$work/new1" "$work/old" | tr '\n' ' ')" "10.0.0.9 "
-	printf '%s\n' '10.0.0.1' '10.0.0.2' '10.0.0.3' '10.0.0.9' '10.0.0.10' '10.0.0.11' > "$work/new3"
-	check "three new trap entries are seen" "$(new_entries "$work/new3" "$work/old" | grep -c .)" "3"
-	check "an unchanged list has none" "$(new_entries "$work/old" "$work/old" | grep -c .)" "0"
+	# Trap churn is the growth of an aggregate count, not a list diff: the
+	# monitor keeps no host list (issue #889), so a swap reads as zero and only
+	# the total condition can catch it.
+	check "two more trap entries than last run are seen" "$(trap_new 6 8)" "2"
+	check "a shrinking trap table has no new entries" "$(trap_new 8 6)" "0"
+	check "an unchanged trap table has none" "$(trap_new 8 8)" "0"
+
+	# The deferred-sender signal is a count of senders over the threshold, never
+	# the senders. One sender appears from six addresses and one from five, so
+	# only the first crosses DEFER_MIN 6; the output is a bare count.
+	cat > "$work/daemonlog" <<'DAEMONLOG'
+Nov 23 12:00:00 mail spamd[1]: (GREY) 203.0.113.1: <rotating@example.org> -> <member@kyriakon.net>
+Nov 23 12:01:00 mail spamd[1]: (GREY) 203.0.113.2: <rotating@example.org> -> <member@kyriakon.net>
+Nov 23 12:02:00 mail spamd[1]: (GREY) 203.0.113.3: <rotating@example.org> -> <member@kyriakon.net>
+Nov 23 12:03:00 mail spamd[1]: (GREY) 203.0.113.4: <rotating@example.org> -> <member@kyriakon.net>
+Nov 23 12:04:00 mail spamd[1]: (GREY) 203.0.113.5: <rotating@example.org> -> <member@kyriakon.net>
+Nov 23 12:05:00 mail spamd[1]: (GREY) 203.0.113.6: <rotating@example.org> -> <member@kyriakon.net>
+Nov 23 12:06:00 mail spamd[1]: (GREY) 198.51.100.1: <steady@example.net> -> <member@kyriakon.net>
+Nov 23 12:07:00 mail spamd[1]: (GREY) 198.51.100.2: <steady@example.net> -> <member@kyriakon.net>
+Nov 23 12:08:00 mail spamd[1]: (GREY) 198.51.100.3: <steady@example.net> -> <member@kyriakon.net>
+Nov 23 12:09:00 mail spamd[1]: (GREY) 198.51.100.4: <steady@example.net> -> <member@kyriakon.net>
+Nov 23 12:10:00 mail spamd[1]: (GREY) 198.51.100.5: <steady@example.net> -> <member@kyriakon.net>
+Nov 22 12:11:00 mail spamd[1]: (GREY) 192.0.2.1: <yesterday@example.org> -> <member@kyriakon.net>
+DAEMONLOG
+	check "senders over the address threshold are counted, not named" \
+		"$(deferred_senders_flagged "$work/daemonlog" "Nov 23" 6)" "1"
 
 	# The cooldown two signals get for being holdable by a stranger.
 	check "a storm signal waits six hours" "$(cooldown_for "ssh guesses")" "360"
@@ -832,15 +885,15 @@ STUB
 	state_dir "$work/loose-state"
 	check "an existing loose state directory is tightened to 0700" \
 		"$(stat -f '%Lp' "$work/loose-state")" "700"
-	printf 'old\n' | state_write "$work/fresh-state/deferred-senders"
+	printf '6\n' | state_write "$work/fresh-state/spamd-trapped"
 	check "a new state file is 0600" \
-		"$(stat -f '%Lp' "$work/fresh-state/deferred-senders")" "600"
-	chmod 0644 "$work/fresh-state/deferred-senders"
-	printf 'new\n' | state_write "$work/fresh-state/deferred-senders"
+		"$(stat -f '%Lp' "$work/fresh-state/spamd-trapped")" "600"
+	chmod 0644 "$work/fresh-state/spamd-trapped"
+	printf '8\n' | state_write "$work/fresh-state/spamd-trapped"
 	check "an existing loose state file is tightened to 0600" \
-		"$(stat -f '%Lp' "$work/fresh-state/deferred-senders")" "600"
-	check "and the run reads its state back" \
-		"$(cat "$work/fresh-state/deferred-senders")" "new"
+		"$(stat -f '%Lp' "$work/fresh-state/spamd-trapped")" "600"
+	check "and the run reads its counts-only state back" \
+		"$(cat "$work/fresh-state/spamd-trapped")" "8"
 
 	# The drain backlog reads the store the drain actually owns. An intent past
 	# the limit alerts, and never names its file; an empty backlog is silent; a
@@ -869,6 +922,36 @@ STUB
 	check "a missing intents directory is a named failure" "$drain_rc" "1"
 	check "and the failure names the directory" \
 		"$(grep -c "$work/absent-store/intents is missing" "$work/drain.out")" "1"
+
+	# A scan that cannot run is a finding, not an empty backlog (#897). The stub
+	# fails the way find does on a directory it cannot read.
+	cat > "$work/bin/find-fail" <<'STUB'
+#!/bin/sh
+exit 1
+STUB
+	chmod 0700 "$work/bin/find-fail"
+	check "an empty directory scans as zero files" \
+		"$(scan_mtimes "$work/onboard/intents")" "0 0"
+	FIND_CMD="$work/bin/find-fail"
+	if scan_mtimes "$work/onboard/intents" >/dev/null 2>&1; then
+		scan_rc=0
+	else
+		scan_rc=$?
+	fi
+	rm -f "$CURL_LOG"
+	export HEALTHCHECKS_URL="$health_url"
+	if drain_backlog "$work/onboard/intents" 240 >"$work/drain.out" 2>&1; then
+		drain_rc=0
+	else
+		drain_rc=$?
+	fi
+	unset FIND_CMD
+	unset HEALTHCHECKS_URL
+	check "a failed scan is distinguishable from an empty one" "$scan_rc" "1"
+	check "a failed drain scan is a finding, not an empty backlog" "$drain_rc" "1"
+	check "and names the directory it could not read" \
+		"$(grep -c "$work/onboard/intents could not be read" "$work/drain.out")" "1"
+	check "and marks the external check down" "$(cat "$CURL_LOG")" "$health_url/fail"
 
 	# The Healthchecks body is a third party's, and the operator's notice names
 	# only Stripe and Hetzner: an alert that names an account and an address must
@@ -1087,15 +1170,13 @@ if [ "$real_auth" -gt 0 ]; then
 	alert mail "auth failures" "$real_auth failed SMTP/IMAP login(s) since last run for $real_names, which is a real address here. The likeliest cause is a mail client or phone still sending an old password, and it stops when that is fixed; a stranger cannot use it"
 fi
 if [ "$unknown_auth" -gt "$mail_probe_max" ]; then
-	probe_sources=$(printf '%s\n' "$mail_events" | awk -F'\t' '$1 == "unknown" && $3 != "" { print $3 }' | sort | uniq -c | sort -rn | head -n 3 | awk '{ printf "%s%s (%s)", sep, $2, $1; sep = ", " }')
-	from_clause=""
-	if [ -n "$probe_sources" ]; then
-		from_clause=", busiest sources $probe_sources"
-	fi
-	alert mail "guesses" "$unknown_auth failed SMTP/IMAP logins since last run for usernames that do not exist here (max $mail_probe_max$from_clause). No mailbox can be entered and no member is affected; this is a scanner working through names, and it is worth a look only if the number keeps climbing"
+	alert mail "guesses" "$unknown_auth failed SMTP/IMAP logins since last run for usernames that do not exist here (max $mail_probe_max). No mailbox can be entered and no member is affected; this is a scanner working through names, and it is worth a look only if the number keeps climbing"
 fi
 
-# sshd, tallied by source address, reporting the worst one and the total.
+# sshd, tallied by source address, reporting the busiest source's count and the
+# total and never the address. The addresses are real, but the monitor keeps and
+# mails none of them: the threat model's aggregate-only claim is the one that
+# stands (issue #889), and nobody blocks a guessing source from this alert.
 #
 # The counting rules, including one line per attempt and the address taken from
 # before the last "port", are in source_tally above.
@@ -1116,9 +1197,9 @@ fi
 # printed beside it and why the note leaves the total as the swarm signal.
 # shellcheck disable=SC2046 # the tally is three space-separated fields by contract
 set -- $(printf '%s\n' "$new_authlog" | source_tally failures)
-ssh_ip=$1 ssh_high=${2:-0} ssh_total=${3:-0}
+ssh_high=${2:-0} ssh_total=${3:-0}
 if [ "$ssh_high" -gt "$auth_fail_max" ]; then
-	alert ssh "guesses" "$ssh_ip made $ssh_high failed ssh attempts since last run, out of $ssh_total from all addresses (max per address $auth_fail_max). Password auth is off everywhere, so none of this can succeed; it is worth a look only because one source is working through a list"
+	alert ssh "guesses" "one source made $ssh_high failed ssh attempts since last run, out of $ssh_total from all addresses (max per address $auth_fail_max). The source address is not recorded. Password auth is off everywhere, so none of this can succeed; it is worth a look only because one source is working through a list"
 fi
 
 # The applicant listener's admissions, counted beside the failures and from the
@@ -1138,9 +1219,9 @@ fi
 # separate admission threshold is invented.
 # shellcheck disable=SC2046 # the tally is three space-separated fields by contract
 set -- $(printf '%s\n' "$new_authlog" | source_tally admissions)
-onboard_ip=$1 onboard_high=${2:-0} onboard_total=${3:-0}
+onboard_high=${2:-0} onboard_total=${3:-0}
 if [ "$onboard_high" -gt "$auth_fail_max" ]; then
-	alert ssh "applicant admissions" "$onboard_ip opened $onboard_high applicant sessions since last run, out of $onboard_total from all addresses (max per address $auth_fail_max). The applicant port asks for no credential, so a source this busy is a script rather than a person; the TUI's session caps are what stop it filing, and this count is what says they are being reached"
+	alert ssh "applicant admissions" "one source opened $onboard_high applicant sessions since last run, out of $onboard_total from all addresses (max per address $auth_fail_max). The source address is not recorded. The applicant port asks for no credential, so a source this busy is a script rather than a person; the TUI's session caps are what stop it filing, and this count is what says they are being reached"
 fi
 
 # --- 3. quota approach ---------------------------------------------------
@@ -1181,22 +1262,23 @@ fi
 # and falls by one all day as hosts come and go, which is churn and not news: this
 # alerted hourly on it until 2026-10-03, always "1 new, total 6". A burst of three
 # at once, or a total that has grown past where ordinary churn sits, is the event
-# worth a mail. The new hosts are named, because a legitimate sender caught in the
-# trap is the case a person has to recognise rather than a number.
-trapped_list=$(printf '%s\n' "$spamdb_out" | awk -F'|' '/^TRAPPED\|/ { print $2 }')
-work_trapped=$(mktemp "${TMPDIR:-/tmp}/kyriakon-trapped.XXXXXX")
-printf '%s\n' "$trapped_list" > "$work_trapped"
-if [ -f "$state/spamd-trapped-list" ]; then
-	new_trapped=$(new_entries "$work_trapped" "$state/spamd-trapped-list")
-	new_count=$(printf '%s\n' "$new_trapped" | grep -c . || true)
+# worth a mail. The new count is the growth of the aggregate total, because the
+# list of trapped hosts is not stored: a per-address record is what the threat
+# model rules out, and "never a per-address identifier" is a published claim
+# (issue #889). A host that leaves as another enters therefore reads as no
+# change, which the total condition covers.
+if [ -f "$state/spamd-trapped" ]; then
+	previous_trapped=$(cat "$state/spamd-trapped" 2>/dev/null || true)
+	case "$previous_trapped" in '' | *[!0-9]*) previous_trapped=0 ;; esac
+	new_count=$(trap_new "$previous_trapped" "$trapped")
 	if [ "$new_count" -ge "$trapped_rise_min" ] || [ "$trapped" -ge "$trapped_max" ]; then
-		named=$(printf '%s\n' "$new_trapped" | head -5 | tr '\n' ' ')
-		alert spamd "blocklist" "$new_count new blacklisted host(s), total $trapped (burst at $trapped_rise_min, total at $trapped_max): $named"
+		alert spamd "blocklist" "$new_count new blacklisted host(s), total $trapped (burst at $trapped_rise_min, total at $trapped_max). The hosts are not recorded and this mail names none; spamdb on the box shows the live table"
 	fi
 fi
-rm -f "$work_trapped"
 printf '%s\n' "$trapped" > "$state/spamd-trapped"
-printf '%s\n' "$trapped_list" | state_write "$state/spamd-trapped-list"
+# The host list an older run left is deleted: it is exactly the per-address
+# record the threat model says the monitor does not keep.
+rm -f "$state/spamd-trapped-list"
 
 # --- 5. senders deferred from several addresses --------------------------
 # Greylisting promotes an address only when a retry arrives for the same tuple,
@@ -1225,20 +1307,15 @@ printf '%s\n' "$trapped_list" | state_write "$state/spamd-trapped-list"
 #   "... (GREY) <ip>: <from> -> <to>"
 # With no -v there is nothing to count, and this reports nothing.
 today=$(date '+%b %e')
-flagged=$(awk -v day="$today" -v min="$defer_min" '
-	$0 ~ "^" day && /\(GREY\)/ {
-		f = $8; gsub(/[<>]/, "", f)
-		pair = f "|" $7
-		if (!(pair in seen)) { seen[pair] = 1; n[f]++ }
-	}
-	END { for (f in n) if (n[f] >= min) print n[f], f }
-' "$daemon_log" 2>/dev/null | sort -rn || true)
-# One alert for the day's set, carrying how many addresses each sender used. The
-# state file is a snapshot of what has been reported, rewritten every run, so it
-# prunes itself and a sender stuck for days is not news on every run.
+flagged=$(deferred_senders_flagged "$daemon_log" "$today" "$defer_min")
+flagged=${flagged:-0}
+# One alert for the day's count. The state file is a snapshot of the number of
+# senders over the threshold, rewritten every run, so it prunes itself and a
+# sender stuck for days is not news on every run. The count and never the
+# senders: an envelope sender is the per-address detail (issue #889).
 reported=$(cat "$state/deferred-senders" 2>/dev/null || true)
-if [ -n "$flagged" ] && [ "$flagged" != "$reported" ]; then
-	alert spamd "deferred senders" "deferred from several addresses today: $(printf '%s' "$flagged" | tr '\n' ';'). If one is a real correspondent, add its mail ranges to /etc/mail/nospamd (docs/planning/research/spamd-greylisting.md)"
+if [ "$flagged" -gt 0 ] && [ "$flagged" != "$reported" ]; then
+	alert spamd "deferred senders" "$flagged sender(s) were deferred from $defer_min or more addresses today, so a retry never promotes them and their mail can bounce. The senders are not recorded; today's spamd -v lines on the box name them if one is a real correspondent, and its mail ranges belong in /etc/mail/nospamd (docs/planning/research/spamd-greylisting.md)"
 fi
 printf '%s\n' "$flagged" | state_write "$state/deferred-senders"
 
@@ -1459,10 +1536,13 @@ fi
 # watches.
 acme_queue_pending="$acme_queue_dir/pending"
 if [ -d "$acme_queue_pending" ]; then
-	oldest=$(find "$acme_queue_pending" -type f -exec stat -f '%m' {} + 2>/dev/null \
-		| awk 'NR == 1 || $1 < m { m = $1 } END { print m }' || true)
-	if [ -n "$oldest" ]; then
-		acme_pending=$(find "$acme_queue_pending" -type f 2>/dev/null | wc -l | tr -d ' ')
+	if ! scan=$(scan_mtimes "$acme_queue_pending"); then
+		alert acme "certificate queue unreadable" "$acme_queue_pending could not be read, so the age of the oldest request is unknown rather than there being none. A find or stat that fails is a check that cannot see what it is checking" "check the queue store's ownership and permissions, and that find and stat run, then run this script by hand" fail
+		exit 1
+	fi
+	oldest=${scan%% *}
+	acme_pending=${scan##* }
+	if [ "$acme_pending" -gt 0 ]; then
 		age_min=$(( ( $(date +%s) - oldest ) / 60 ))
 		if [ "$age_min" -gt "$acme_pending_max_min" ]; then
 			alert acme "certificate queue" "$acme_pending certificate request(s) pending, oldest $age_min minutes (max $acme_pending_max_min). The queue attempts a name on the next pass while fewer than 40 have been attempted in the last seven days and one every 202 minutes after that, so an age past this means it is not draining or the backlog is this deep, and either way a member is waiting on a certificate the page says is coming"

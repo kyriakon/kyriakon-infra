@@ -121,7 +121,10 @@ low-and-slow relay or a credential-stuffing ramp, without keeping a permanent pe
 Abuse monitoring (`scripts/abuse-monitor.sh`) reads aggregate counts: relay volume,
 authentication failures, greylist churn, plus a per-account outbound recipient count for the
 current fifteen-minute run. The count is not written to a state file. Never a per-address
-identifier. Raw addresses are discarded at rotation.
+identifier. Raw addresses are discarded at rotation. The monitor's state directory records the
+greylist total and the number of senders deferred from several addresses that day, and no list of
+hosts or senders behind either count. Its alert mail names no source address either; an operator
+who needs one reads the live `spamd` table or the day's log on the box.
 Hashing addresses to keep a longer-lived collision signal was considered and rejected, because a
 retained hash is a pseudonymous identifier rather than data minimization, and every signal it would
 serve is already a count the monitor keeps without the raw address.
