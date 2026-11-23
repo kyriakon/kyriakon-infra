@@ -29,21 +29,24 @@ Pointers, so a search starts where the thing is.
   socket server and the FastCGI wire; `crates/handler/` serves the web form and renders
   the HTML and gemtext pages; `crates/tui/` is the terminal library and binary;
   `crates/drain/` is the root-side intent loop and transition verbs; `crates/admin/` is
-  the operator console; `crates/tests/` is the acceptance suite; `crates/static/` serves
+  the operator console; `crates/fromcheck/` is the compiled OpenSMTPD From-header
+  filter; `crates/tests/` is the acceptance suite; `crates/static/` serves
   a member's published tree, opening each path component without following a link,
   because the daemons' chroot holds every member's tree at once. `templates/*.html` live
-  under `crates/handler/`. The five binaries are `kyriakon-control`,
-  `kyriakon-control-static`, `kyriakon-control-drain`, `kyriakon-control-tui` and
-  `kyriakon-admin`. The deployed state paths keep their old names (`/var/db/onboard`,
-  `/etc/onboard`, `/etc/kyriakon/onboard`), the service account is still `_onboard`,
-  and moving either is a data migration rather than a rename. A package's `src/` root
-  holds only its crate root, binary roots, and (in core) `config.rs`, `util.rs` and
-  `intent.rs`; a new module goes in its section directory, or a new directory with a
-  `mod.rs` that names its job.
+  under `crates/handler/`. The six binaries are `kyriakon-control`,
+  `kyriakon-control-static`, `kyriakon-control-drain`, `kyriakon-control-tui`,
+  `kyriakon-admin` and `kyriakon-fromcheck` (installed as
+  `/usr/local/libexec/filter-fromcheck`). The deployed state paths keep their old
+  names (`/var/db/onboard`, `/etc/onboard`, `/etc/kyriakon/onboard`), the service
+  account is still `_onboard`, and moving either is a data migration rather than a
+  rename. A package's `src/` root holds only its crate root, binary roots, and (in
+  core) `config.rs`, `util.rs` and `intent.rs`; a new module goes in its section
+  directory, or a new directory with a `mod.rs` that names its job.
 - `mailparse/`: the zero-dependency RFC 5322 and MIME parser, package
   `kyriakon-mailparse`. It sits outside the `control` workspace so each build root keeps
-  its own lockfile and the encryptor keeps no third-party dependency. The encryptor uses
-  it today; the control crates adopt it as #945, #947, #908 and #919 land.
+  its own lockfile and the encryptor keeps no third-party dependency. The encryptor, the
+  control core and the fromcheck filter use it; the remaining control consumers adopt it
+  as #908 and #919 land.
 - `kyriakon-encrypt/`: the CLI the save path runs to encrypt each message; `src/lib.rs`
   builds the PGP/MIME wrapper.
 - `dovecot-plugin/`: the C plugin that forks the encryptor for each save and turns its
@@ -52,10 +55,10 @@ Pointers, so a search starts where the thing is.
   surface. `scripts/publish-mail-key.sh` writes one, `scripts/rekey-mail-key.sh`
   rewrites one without the AEAD advert.
 - `scripts/`: every deploy and operator script, each with a `--self-test`. `lib.sh`
-  sources the three modules under `scripts/lib/`: atomic writes and directory locks,
-  TLS and ACME paths, and the identity predicates. `install-set.tsv` is the one table
-  naming what each destination gets, and `install-packages.sh` installs from
-  `openbsd/packages.tsv`.
+  sources the five modules under `scripts/lib/`: atomic writes and directory locks,
+  TLS and ACME paths, the identity predicates, the box manifest, and the fixed paths.
+  `install-set.tsv` is the one table naming what each destination gets, and
+  `install-packages.sh` installs from `openbsd/packages.tsv`.
 - `openbsd/`: what the box runs: `etc/` (smtpd, httpd, relayd, gmid, unbound, nsd,
   spamd, sshd, `login.conf.d/`, `rc.d/`, `kyriakon.env`, and the control plane's four
   configs (`catalogue.toml`, `drain.toml`, `onboard.toml`, `static.toml`) under
@@ -69,7 +72,7 @@ Pointers, so a search starts where the thing is.
   research, prototypes), `agents/` (issue tracker, triage labels, domain docs).
 - `.github/workflows/`: `checks.yml` (the seven CI jobs: control, encrypt plugin,
   shared mail parser, shell scripts, script self-tests on the OpenBSD 8.0 VM, terraform,
-  and the dependency advisories), `fuzz.yml` (the six libFuzzer targets, weekly), and
+  and the dependency advisories), `fuzz.yml` (the seven libFuzzer targets, weekly), and
   `auto-merge-key.yml` (a green key publication merges itself, as the machine account).
 - `.githooks/`: commit shape, pre-commit, pre-push.
 - Root: `reserved-usernames.txt` (the held-back names), `CONTEXT.md` (repo vocabulary),
@@ -108,8 +111,9 @@ repo's own root. Two terms most likely to matter while working in this repo:
   lockfile needs adding there in the same change.
 - Fuzz targets: `kyriakon-encrypt/fuzz/`, `control/fuzz/` and `mailparse/fuzz/` hold one
   per parser: the encryptor's message and envelope, the shared mail parser's headers,
-  addresses and MIME walk, the FastCGI reader and form decoder, and the member path
-  resolver, which asserts that a served file is always one inside the member's own root.
+  addresses and MIME walk, the FastCGI reader and form decoder, the From-header filter,
+  and the member path resolver, which asserts that a served file is always one inside
+  the member's own root.
   Run one with `cargo +nightly fuzz run <target>` from the matching directory. Fuzzing is
   not in the merge gate; a crash found by the weekly `fuzz` job becomes a test in the
   crate it came from. See `docs/runbook.md` "Fuzz the parsers".
