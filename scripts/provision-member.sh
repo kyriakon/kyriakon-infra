@@ -136,6 +136,18 @@ assert_shape() {
 	fi
 }
 
+# refuse_symlink <path>...: a planted link would make install or chown act on
+# its target, and the tree below a member's home belongs to the member. Refuse
+# it before any privileged call, and never touch the target.
+refuse_symlink() {
+	typeset path
+	for path in "$@"; do
+		[ -L "$path" ] || continue
+		printf '%s is a symlink; refusing to install through it\n' "$path" >&2
+		exit 1
+	done
+}
+
 # ensure_dir <path> <mode> <owner> <group>: the directory, in that shape.
 # Returns 0 when it created or corrected it and 1 when it was already right, so
 # a run can report what it did rather than claiming work it did not do. install
@@ -144,13 +156,9 @@ assert_shape() {
 ensure_dir() {
 	typeset path mode want
 	path="$1"
-	# install -d follows a final symlink, and the tree it descends is the
-	# member's own: a planted link would make root chown and chmod the target
-	# before the shape check below ran. Refuse it first, and never touch it.
-	[ -L "$path" ] && {
-		printf '%s is a symlink; refusing to install through it\n' "$path" >&2
-		exit 1
-	}
+	# install -d follows a final symlink, so refuse one before the chown and
+	# chmod below would follow it.
+	refuse_symlink "$path"
 	mode="$2"
 	# The names, not the ids: every call site names an owner and a group, and
 	# %Su/%Sg are what print those. %u/%g would print 0:0 beside "root:wheel".
@@ -180,10 +188,7 @@ ensure_bare_repo() {
 	group=$3
 	# Same reason as ensure_dir: install and chown must never follow a link the
 	# member planted in their own home.
-	[ -L "$path" ] && {
-		printf '%s is a symlink; refusing to install through it\n' "$path" >&2
-		exit 1
-	}
+	refuse_symlink "$path"
 	if [ -e "$path" ]; then
 		if [ ! -d "$path" ] ||
 			[ "$("$git_bin" -c safe.directory="$path" --git-dir="$path" \
@@ -494,6 +499,13 @@ self_test() {
 	( ensure_bare_repo "$repo" "$(id -un)" "$(id -gn)" ) >/dev/null 2>&1 || rc=$?
 	check "a second run leaves it alone" "$rc" 1
 	check "and does not replace it" "$(stat -f '%i' "$repo")" "$repo_inode"
+	# A mode that drifted is corrected by the same body, so a later run does not
+	# leave a repository the git session cannot read.
+	chmod 0755 "$repo"
+	rc=0
+	( ensure_bare_repo "$repo" "$(id -un)" "$(id -gn)" ) >/dev/null 2>&1 || rc=$?
+	check "a drifted repository mode is corrected" "$rc" 0
+	check "and the mode is 700 again" "$(stat -f '%Lp' "$repo")" 700
 	# A plain directory at the name is refused rather than adopted, because a
 	# push into it would land in a working tree nothing serves.
 	mkdir "$tree/repos/plain.git"
@@ -503,6 +515,19 @@ self_test() {
 	check "an existing non-bare directory is refused" "$rc" 1
 	check "and the refusal says why" \
 		"$(grep -c 'is not a bare git repository' "$tree/plain.err")" 1
+	# A link planted at the repository name is refused before install or chown
+	# can follow it, and its target keeps the mode it had.
+	mkdir "$tree/repos/planted-target"
+	chmod 0755 "$tree/repos/planted-target"
+	ln -s "$tree/repos/planted-target" "$tree/repos/planted.git"
+	rc=0
+	( ensure_bare_repo "$tree/repos/planted.git" "$(id -un)" "$(id -gn)" ) \
+		>/dev/null 2>"$tree/repo-link.err" || rc=$?
+	check "a symlinked repository is refused" "$rc" 1
+	check "and its target keeps its mode" \
+		"$(stat -f '%Lp' "$tree/repos/planted-target")" 755
+	check "and the refusal names the link" \
+		"$(grep -c 'is a symlink' "$tree/repo-link.err")" 1
 
 	self_test_end
 }
@@ -845,11 +870,7 @@ if [ "$have_key" = yes ]; then
 	if ensure_dir "$home/.ssh" 0750 root "$group"; then changed=yes; fi
 	# The home is member-owned, so ~/.ssh can be replaced between ensure_dir and
 	# the key install. Refuse that here rather than follow it as root (#934).
-	if [ -L "$home/.ssh" ] || [ -L "$authorized_keys" ]; then
-		printf '%s or %s is a symlink; refusing to install a key through it\n' \
-			"$home/.ssh" "$authorized_keys" >&2
-		exit 1
-	fi
+	refuse_symlink "$home/.ssh" "$authorized_keys"
 	if ensure_dir "$managed_keys_dir" 0755 root wheel; then changed=yes; fi
 
 	# The key is installed whole rather than appended: the source file is the
