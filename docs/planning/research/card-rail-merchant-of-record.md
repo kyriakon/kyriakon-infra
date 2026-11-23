@@ -112,9 +112,9 @@ read 2026-11-20), so a UK or Union card is 6.5 per cent plus USD 0.50.
 
 The Paddle row applies 5 per cent to the full £20. If Paddle computes its discount on
 the tax-exclusive price, the Union figure falls to 5 per cent of £16.67 plus £0.39, or
-£1.22, and the mixed annual figures fall by £0.034 a member, which is £3.40 at 100 and
-£17 at 500. The pricing page does not settle which base applies, so the higher figure is
-used and the difference is marked unverified.
+£1.22, and the mixed annual figures fall by £0.0333 a member, which is £3.33 at 100
+and £16.65 at 500. The pricing page does not settle which base applies, so the higher
+figure is used and the difference is marked unverified.
 
 ### 2.2 Annual provider fees
 
