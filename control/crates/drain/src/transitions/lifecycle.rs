@@ -25,6 +25,7 @@ use kyriakon_control_core::intent::{
     MailKeyIntent, OutsideAddressIntent, PasswordIntent, ServingIntent, TestMailIntent,
     UploadKeyIntent, WindowExtendIntent,
 };
+use kyriakon_control_core::mail::bounce;
 use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::payments::ledger::Ledger;
 use kyriakon_control_core::payments::rails::rail_instructions;
@@ -973,12 +974,12 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
             if !due(journal, &id, now) {
                 continue;
             }
-            // The clock is stopped when the bounce ingest found a permanent
-            // failure at every address a lifecycle notice went to: no channel
-            // reached the member, so the delete transition must not run. The
-            // sweep reads the latched state rather than the notice history,
-            // because a later notice that is also not delivered must not
-            // restart the clock. Only `notice resend` clears it, and that
+            // The clock is stopped only when the operator ran `notice stop`
+            // after the delivery reports said no lifecycle notice reached any
+            // address: no channel reached the member, so the delete transition
+            // must not run. The sweep reads the latched state rather than the
+            // notice history, because a later notice that is also not delivered
+            // must not restart the clock. `notice resend` clears it, and that
             // extends the grace.
             if account.notice_stopped.is_some() {
                 continue;
@@ -1094,10 +1095,11 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
                 continue;
             }
             // A body's lifecycle notices are recorded against its site owner,
-            // so a hard bounce that reached no address latches that account.
-            // The group's deletion waits on the same latch: the person the
-            // body's mail names was not reached. A read error is a failure to
-            // retry; an absent owner is a body with no addressee.
+            // so the reports that say no address was reached are the operator's
+            // evidence for `notice stop` on that account. The group's deletion
+            // waits on the same latch: the person the body's mail names was not
+            // reached. A read error is a failure to retry; an absent owner is a
+            // body with no addressee.
             let owner = match store.account(&group.site_owner).await {
                 Ok(owner) => owner,
                 Err(e) => {
@@ -1419,6 +1421,60 @@ async fn suspension_final_notice(
     )
     .await
     .map_err(Error::from)
+}
+
+/// `kyriakon-admin notice stop`: hold the account's grace clock after the
+/// delivery reports say the lifecycle notices reached nobody. The reports are
+/// unauthenticated inbound mail, so this decision is the operator's: the command
+/// refuses unless a permanent failure is recorded for every address a lifecycle
+/// notice went to, then latches the stop the sweep reads. `notice resend`
+/// clears it.
+pub async fn stop_notice(store: &Store, username: &str) -> Result<store::NoticeStop, Error> {
+    if let Some(why) = validate::username_shape(username) {
+        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+    }
+    if store.account(username).await?.is_none() {
+        return Err(Error::Failed(format!("no account for {username}")));
+    }
+    if !bounce::every_address_failed(store, username).await? {
+        return Err(Error::Failed(format!(
+            "the lifecycle notices to {username} have not all hard-bounced, so there is no \
+             delivery report to hold it on"
+        )));
+    }
+    let Some(failed) = bounce::last_failure(store, username).await? else {
+        return Err(Error::Failed(format!(
+            "the lifecycle notices to {username} have not all hard-bounced, so there is no \
+             delivery report to hold it on"
+        )));
+    };
+    let stop = store::NoticeStop {
+        address: failed.to.clone(),
+        status: failed
+            .delivery
+            .as_ref()
+            .map(|delivery| delivery.status.clone())
+            .unwrap_or_default(),
+        // The report's own time, which is what `show` prints; a hold is dated to
+        // the bounce, not to the day the operator read it.
+        at: failed
+            .delivery
+            .as_ref()
+            .map(|delivery| delivery.at.clone())
+            .unwrap_or_else(util::filed_at),
+    };
+    let latched = stop.clone();
+    // Under the account's own lock, like every other account write from a
+    // separate process.
+    store
+        .update_account(username, move |current| {
+            if let Some(account) = current {
+                account.notice_stopped = Some(latched);
+            }
+            Ok::<(), Error>(())
+        })
+        .await?;
+    Ok(stop)
 }
 
 /// `kyriakon-admin notice resend`: the runbook's step for a lifecycle notice

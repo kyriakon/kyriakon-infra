@@ -4611,11 +4611,11 @@ fn last_notice(fix: &Fix, username: &str) -> (String, String) {
     )
 }
 
-/// A hard bounce at the only address an account holds stops the grace clock:
-/// the expired grace does not delete it, the notice line records the failure,
-/// and `notice resend` clears the stop and restarts the forty days. Without the
-/// resend the same record and date would be deleted, which the last assertion
-/// drives.
+/// A hard bounce at the only address an account holds is recorded, and the
+/// operator's `notice stop` holds the grace clock: the expired grace does not
+/// delete it, the notice line records the failure, and `notice resend` clears
+/// the stop and restarts the forty days. Without the resend the same record and
+/// date would be deleted, which the last assertion drives.
 #[test]
 fn a_hard_bounced_notice_stops_the_grace_and_the_resend_restarts_it() {
     let fix = Fix::new("bounce-stop");
@@ -4625,6 +4625,11 @@ fn a_hard_bounced_notice_stops_the_grace_and_the_resend_restarts_it() {
     assert!(out.status.success(), "{}", body(&out));
     let (to, id) = last_notice(&fix, "secretary");
     fix.bounce("dsn-1", "5.1.1", &to, &id);
+    // The pass that records the report comes first; the hold is the operator's
+    // decision on that evidence.
+    assert!(fix.drain().status.success());
+    let out = fix.ctl(&["notice", "stop", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
 
     // The clock has run out. With a reachable address this pass deletes.
     let mut account = fix.account("secretary");
@@ -4755,6 +4760,109 @@ fn a_hard_bounced_notice_stops_the_grace_and_the_resend_restarts_it() {
     );
 }
 
+/// A delivery report is unauthenticated inbound mail: a member can quote their
+/// own notice's Message-ID and forge one. The report is recorded and the
+/// operator is told, but it does not hold the account; the expired grace still
+/// deletes it.
+#[test]
+fn a_forged_delivery_report_does_not_stop_the_grace() {
+    let fix = Fix::new("bounce-forged");
+    approved_paid(&fix, "secretary", "cash");
+    let reason = "Published material is outside the acceptable use policy.";
+    let out = fix.ctl(&["suspend", "secretary", "--reason", reason]);
+    assert!(out.status.success(), "{}", body(&out));
+    let (to, id) = last_notice(&fix, "secretary");
+    fix.bounce("dsn-forged", "5.1.1", &to, &id);
+
+    // The final notice's week, then the end of the grace.
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(6));
+    fix.write_account("secretary", &account);
+    assert!(fix.drain().status.success());
+    let account = fix.account("secretary");
+    assert!(
+        account.get("notice_stopped").is_none(),
+        "a forged report held the account: {account}"
+    );
+    assert!(
+        fix.read("accounts/secretary/notices.jsonl")
+            .contains("\"delivery\":{\"status\":\"5.1.1\""),
+        "the report was not recorded as evidence"
+    );
+    assert!(
+        fix.journal()
+            .contains("a delivery report says no lifecycle notice reached secretary"),
+        "the operator was not told: {}",
+        fix.journal()
+    );
+
+    let mut account = fix.account("secretary");
+    account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
+    fix.write_account("secretary", &account);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        !fix.dir.join("store/accounts/secretary").exists(),
+        "a forged report stopped the deletion: {}",
+        fix.journal()
+    );
+}
+
+/// A permanent report on a notice that is not a lifecycle notice is recorded but
+/// does not raise the deletion alert: a bounced receipt is not "no channel
+/// reached the member".
+#[test]
+fn a_bounced_receipt_does_not_raise_the_deletion_alert() {
+    let fix = Fix::new("bounce-receipt");
+    approved_paid(&fix, "secretary", "cash");
+    let to = "secretary@kyriakon.net";
+    let id = "0123456789abcdefghjkmnpqrs";
+    let path = fix.dir.join("store/accounts/secretary/notices.jsonl");
+    let mut notices = std::fs::read_to_string(&path).unwrap_or_default();
+    notices.push_str(&format!(
+        "{{\"version\":1,\"id\":\"{id}\",\"at\":\"2026-10-01T09:00:00Z\",\
+         \"type\":\"prepaid.receipt\",\"subject\":\"Receipt for your payment.\",\
+         \"to\":\"{to}\"}}\n"
+    ));
+    std::fs::write(&path, notices).unwrap();
+    fix.bounce("dsn-receipt", "5.1.1", to, id);
+
+    assert!(fix.drain().status.success());
+    assert!(
+        fix.read("accounts/secretary/notices.jsonl")
+            .contains("\"delivery\":{\"status\":\"5.1.1\""),
+        "the report was not recorded"
+    );
+    assert!(
+        !fix.journal().contains("notice-secretary"),
+        "a bounced receipt raised the deletion alert: {}",
+        fix.journal()
+    );
+}
+
+/// `notice stop` is the operator's decision, and it refuses when the reports do
+/// not show a permanent failure at every address a lifecycle notice went to.
+#[test]
+fn notice_stop_refuses_without_a_permanent_failure_at_every_address() {
+    let fix = Fix::new("bounce-stop-refuses");
+    approved_paid(&fix, "secretary", "cash");
+    let reason = "Published material is outside the acceptable use policy.";
+    let out = fix.ctl(&["suspend", "secretary", "--reason", reason]);
+    assert!(out.status.success(), "{}", body(&out));
+
+    let out = fix.ctl(&["notice", "stop", "secretary"]);
+    assert!(!out.status.success(), "the stop was latched with no report");
+    assert!(
+        body(&out).contains("have not all hard-bounced"),
+        "{}",
+        body(&out)
+    );
+    assert!(
+        fix.account("secretary").get("notice_stopped").is_none(),
+        "a refused stop latched anyway"
+    );
+}
+
 /// A soft bounce and ordinary mail to the bounce address move nothing: the
 /// sender's queue is still trying, and a message that is not a permanent-failure
 /// DSN is not a report. The expired grace deletes the account as it would with
@@ -4816,6 +4924,9 @@ fn a_resend_that_cannot_leave_keeps_the_stop() {
     assert!(out.status.success(), "{}", body(&out));
     let (to, id) = last_notice(&fix, "secretary");
     fix.bounce("dsn-fail", "5.1.1", &to, &id);
+    assert!(fix.drain().status.success());
+    let out = fix.ctl(&["notice", "stop", "secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
     let mut account = fix.account("secretary");
     account["grace_until"] = json!(kyriakon_control_core::util::date_after_days(-1));
     fix.write_account("secretary", &account);
@@ -4889,6 +5000,9 @@ fn a_hard_bounced_group_notice_stops_the_group_deletion() {
     let to = notice["to"].as_str().unwrap().to_string();
     let id = notice["id"].as_str().unwrap().to_string();
     fix.bounce("group-dsn", "5.1.1", &to, &id);
+    assert!(fix.drain().status.success());
+    let out = fix.ctl(&["notice", "stop", "parish-secretary"]);
+    assert!(out.status.success(), "{}", body(&out));
 
     // The grace has run out. The bounce leaves the body in place.
     let mut group: Value =

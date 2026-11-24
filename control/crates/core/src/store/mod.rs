@@ -2189,18 +2189,18 @@ pub struct Account {
     /// deletion sweeps measure from one date rather than from the lapse notice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grace_until: Option<String>,
-    /// Set when a permanent delivery failure leaves no address the lifecycle
-    /// notices reached. While it is present the deletion sweep refuses to run,
-    /// so a later notice that is also not delivered cannot restart the clock.
-    /// `kyriakon-admin notice resend` clears it and restarts the grace; a
-    /// payment or a resume clears it because that clock is gone.
+    /// Set by `kyriakon-admin notice stop` when the delivery reports say no
+    /// lifecycle notice reached any address. While it is present the deletion
+    /// sweep refuses to run. `kyriakon-admin notice resend` clears it and
+    /// restarts the grace; a payment or a resume clears it because that clock is
+    /// gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice_stopped: Option<NoticeStop>,
 }
 
-/// The stop a hard bounce sets on an account's grace clock: the failed
-/// recipient, the status the receiving host gave, and when it was read. The
-/// notice line keeps the whole history; this is the one fact the sweep needs.
+/// The hold an operator sets on an account's grace clock: the failed recipient,
+/// the status the receiving host gave, and when it was read. The notice line
+/// keeps the whole history; this is the one fact the sweep needs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NoticeStop {
     pub address: String,

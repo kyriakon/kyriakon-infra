@@ -12,10 +12,12 @@
 //!
 //! The record it writes is on the notice line itself, because that line is
 //! already the audit of what was sent and where. `every_address_failed` then
-//! answers the deletion sweep's question: did a lifecycle notice to every
-//! address this account has reach nobody? The drain latches that answer on the
-//! account, because the platform gets no successful-delivery report and a later
-//! unmarked attempt is not evidence that the address works.
+//! answers the operator's question: did a lifecycle notice to every address this
+//! account has reach nobody? A report is unauthenticated inbound mail — anyone
+//! can quote a notice's Message-ID — so the drain records it and alerts, and
+//! only `kyriakon-admin notice stop` holds the account. The platform gets no
+//! successful-delivery report, and a later unmarked attempt is not evidence that
+//! the address works.
 
 use std::collections::BTreeMap;
 
@@ -184,16 +186,30 @@ async fn mark(store: &Store, username: &str, bounce: &Bounce) -> Result<bool, Er
     Ok(true)
 }
 
+/// The most recent lifecycle notice with a permanent failure, if any. It is the
+/// same predicate `every_address_failed` uses, so `notice stop` names the line
+/// the sweep's answer came from instead of re-deriving it.
+pub async fn last_failure(store: &Store, username: &str) -> Result<Option<Notice>, Error> {
+    let notices: Vec<Notice> = store
+        .log(&format!("accounts/{username}/notices.jsonl"))
+        .jsonl()
+        .await?;
+    Ok(notices.into_iter().rev().find(|notice| {
+        LIFECYCLE.contains(&notice.notice_type.as_str())
+            && notice.delivery.as_ref().is_some_and(Delivery::permanent)
+    }))
+}
+
 /// Whether **every** address a lifecycle notice went to has reported a
-/// permanent failure: no channel reached the member, so the grace clock stops
-/// rather than running out into a deletion nobody was told about. The types are
-/// [`LIFECYCLE`] in `notice`, shared with every send site.
+/// permanent failure: no channel demonstrably reached the member, so this is
+/// the evidence `kyriakon-admin notice stop` requires before it holds the grace
+/// clock. The types are [`LIFECYCLE`] in `notice`, shared with every send site.
 ///
 /// Any failure at the address counts, not only the latest notice's. The
 /// platform gets no successful-delivery report, so a later notice with no
 /// report is not evidence that an address that already hard-bounced works; the
-/// operator's resend is what says a channel does, and it clears the latched stop
-/// on the account.
+/// operator reads this answer before `notice stop`, and `notice resend` clears
+/// the hold once a channel works.
 ///
 /// An account with no lifecycle notice at all reads `false`: the notice has not
 /// gone out yet, and the sweep's own final-notice branch is what sends it.
