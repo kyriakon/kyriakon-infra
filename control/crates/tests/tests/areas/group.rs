@@ -272,6 +272,7 @@ fn two_labelled_keys_for_a_body_are_both_filed() {
             ("whose", "body"),
             ("body_domain", "parish.example"),
             ("body_account_names", "secretary\nhall"),
+            ("address_outside", ""),
         ],
     );
     let message = format!("secretary@parish.example\n{GOOD_KEY}\nhall@parish.example\n{GOOD_KEY}");
@@ -288,12 +289,18 @@ fn two_labelled_keys_for_a_body_are_both_filed() {
     assert_eq!(keys[1]["mailbox"], "hall");
 }
 
-/// A live token files its key even when the message has no usable From. The
-/// reply address is only needed on the paths that answer.
+/// A live token files its key even when the draft recorded no reply address.
 #[test]
 fn a_key_with_no_reply_address_is_still_filed() {
     let fix = Fix::new("mail-no-from");
-    fix.write_draft(TOKEN, &[("username", "secretary"), ("whose", "person")]);
+    fix.write_draft(
+        TOKEN,
+        &[
+            ("username", "secretary"),
+            ("whose", "person"),
+            ("address_outside", ""),
+        ],
+    );
     fix.mail("one", "", TOKEN, GOOD_KEY);
 
     let out = fix.drain();

@@ -103,6 +103,21 @@ required = true
 validation = "usernames"
 
 [[question]]
+id = "address_outside"
+prompt = "An address outside this platform"
+type = "text"
+branch = "all"
+required = false
+validation = "address"
+
+[[question]]
+id = "address_ack"
+prompt = "I understand that we can only reach me inside this account."
+type = "yesno"
+branch = "all"
+required = false
+
+[[question]]
 id = "body_mail_key"
 prompt = "A public key for each mailbox"
 type = "key"
@@ -123,21 +138,6 @@ id = "body_dns_contact"
 prompt = "Who should we talk to about DNS?"
 type = "text"
 branch = "body"
-required = false
-
-[[question]]
-id = "address_outside"
-prompt = "An address outside this platform"
-type = "text"
-branch = "all"
-required = false
-validation = "address"
-
-[[question]]
-id = "address_ack"
-prompt = "I understand that we can only reach me inside this account."
-type = "yesno"
-branch = "all"
 required = false
 
 [[question]]

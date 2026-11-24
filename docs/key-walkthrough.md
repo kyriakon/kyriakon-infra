@@ -59,6 +59,6 @@ There is no interactive shell on the account. The sftp session is confined to yo
 
 ## Where the key goes
 
-Paste the mail public key when the application asks for it. If your client refuses the paste because the address line is too long, mail the key to apply@kyriakon.net with your application's token as the subject, and name the mailbox in the message.
+Paste the mail public key when the application asks for it. The contact-address page comes first; once that page is answered, a key mailed to apply@kyriakon.net with your application's token as the subject is filed, with the mailbox named in the message.
 
 Paste the upload public key on the upload key page. It is optional in the form and not optional in practice: without it you get mail and nothing else.

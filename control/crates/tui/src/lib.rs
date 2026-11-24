@@ -2150,12 +2150,11 @@ mod tests {
         .into_iter()
         .map(str::to_string)
         .collect();
+        lines.extend(["", ""].into_iter().map(str::to_string));
         lines.extend(key_lines());
         lines.extend(key_lines());
         lines.extend(
             [
-                "",
-                "",
                 "",
                 "",
                 "no_charge",
