@@ -424,12 +424,18 @@ fn the_capsule_adds_the_blessing_only_on_the_monastic_path() {
 async fn a_capsule_body_with_mismatched_address_and_name_lists_is_reasked() {
     let (app, dir) = handler("capsule-body-mismatch").await;
     let mut record = kyriakon_control_core::store::draft::Draft::new(TOKEN.to_string());
-    record
-        .answers
-        .insert("whose".to_string(), "body".to_string());
-    record
-        .answers
-        .insert("body_addresses".to_string(), "a: own\nb: own".to_string());
+    for (id, value) in [
+        ("username", "theophilus"),
+        ("whose", "body"),
+        ("body_name", "The Parish of Example"),
+        ("body_kind", "parish"),
+        ("vat", ""),
+        ("body_domain", "example.invalid"),
+        ("body_records", "yes"),
+        ("body_addresses", "a: own\nb: own"),
+    ] {
+        record.answers.insert(id.into(), value.into());
+    }
     record.cursor = 8;
     kyriakon_control_core::store::draft::save(&app.store, &mut record)
         .await
@@ -447,20 +453,21 @@ async fn a_capsule_body_with_mismatched_address_and_name_lists_is_reasked() {
 async fn a_capsule_body_key_page_names_one_mailbox_and_the_mail_route() {
     let (app, dir) = handler("capsule-key-pages").await;
     let mut record = kyriakon_control_core::store::draft::Draft::new(TOKEN.to_string());
-    record
-        .answers
-        .insert("whose".to_string(), "body".to_string());
-    record
-        .answers
-        .insert("body_domain".to_string(), "parish.example".to_string());
-    record.answers.insert(
-        "body_addresses".to_string(),
-        "secretary: own\nhall: alias secretary".to_string(),
-    );
-    record.answers.insert(
-        "body_account_names".to_string(),
-        "secretary\nhall".to_string(),
-    );
+    for (id, value) in [
+        ("username", "theophilus"),
+        ("whose", "body"),
+        ("body_name", "The Parish of Example"),
+        ("body_kind", "parish"),
+        ("vat", ""),
+        ("body_domain", "parish.example"),
+        ("body_records", "yes"),
+        ("body_addresses", "secretary: own\nhall: alias secretary"),
+        ("body_account_names", "secretary\nhall"),
+        ("address_outside", ""),
+        ("address_ack", "yes"),
+    ] {
+        record.answers.insert(id.into(), value.into());
+    }
     let path = flow_path(&app.questions, &record.answers);
     let first = path
         .iter()
@@ -508,12 +515,14 @@ async fn a_capsule_body_key_page_names_one_mailbox_and_the_mail_route() {
 async fn a_capsule_person_key_page_names_their_address() {
     let (app, _dir) = handler("capsule-person-key").await;
     let mut record = kyriakon_control_core::store::draft::Draft::new(TOKEN.to_string());
-    record
-        .answers
-        .insert("whose".to_string(), "person".to_string());
-    record
-        .answers
-        .insert("username".to_string(), "secretary".to_string());
+    for (id, value) in [
+        ("username", "secretary"),
+        ("whose", "person"),
+        ("address_outside", ""),
+        ("address_ack", "yes"),
+    ] {
+        record.answers.insert(id.into(), value.into());
+    }
     let path = flow_path(&app.questions, &record.answers);
     let index = path
         .iter()
@@ -538,12 +547,21 @@ async fn a_capsule_person_key_page_names_their_address() {
 async fn a_capsule_upload_key_page_names_the_walkthrough() {
     let (app, _dir) = handler("capsule-upload-key").await;
     let mut record = kyriakon_control_core::store::draft::Draft::new(TOKEN.to_string());
+    for (id, value) in [
+        ("username", "secretary"),
+        ("whose", "person"),
+        ("address_outside", ""),
+        ("address_ack", "yes"),
+    ] {
+        record.answers.insert(id.into(), value.into());
+    }
     record
-        .answers
-        .insert("whose".to_string(), "person".to_string());
-    record
-        .answers
-        .insert("username".to_string(), "secretary".to_string());
+        .mail_keys
+        .push(kyriakon_control_core::mail::keycheck::mail_key(
+            "secretary".to_string(),
+            "secretary@kyriakon.net",
+            GOOD_KEY,
+        ));
     let path = flow_path(&app.questions, &record.answers);
     let index = path
         .iter()
@@ -563,16 +581,21 @@ async fn a_capsule_upload_key_page_names_the_walkthrough() {
 async fn a_mailed_key_answers_the_capsule_key_page() {
     let (app, dir) = handler("capsule-key-mailed").await;
     let mut record = kyriakon_control_core::store::draft::Draft::new(TOKEN.to_string());
-    record
-        .answers
-        .insert("whose".to_string(), "body".to_string());
-    record
-        .answers
-        .insert("body_domain".to_string(), "parish.example".to_string());
-    record.answers.insert(
-        "body_account_names".to_string(),
-        "secretary\nhall".to_string(),
-    );
+    for (id, value) in [
+        ("username", "theophilus"),
+        ("whose", "body"),
+        ("body_name", "The Parish of Example"),
+        ("body_kind", "parish"),
+        ("vat", ""),
+        ("body_domain", "parish.example"),
+        ("body_records", "yes"),
+        ("body_addresses", "secretary: own\nhall: alias secretary"),
+        ("body_account_names", "secretary\nhall"),
+        ("address_outside", ""),
+        ("address_ack", "yes"),
+    ] {
+        record.answers.insert(id.into(), value.into());
+    }
     record
         .mail_keys
         .push(kyriakon_control_core::mail::keycheck::mail_key(
@@ -600,6 +623,91 @@ async fn a_mailed_key_answers_the_capsule_key_page() {
         "{redirect}"
     );
     assert_eq!(read_draft(&dir, TOKEN).cursor, first + 1);
+}
+
+/// A draft written when the address pages came after the key pages is moved
+/// onto this order: the address pages it never saw come before the key pages it
+/// answered, and those answered pages are not asked again.
+#[tokio::test]
+async fn a_draft_from_before_the_address_pages_moved_is_migrated_onto_this_order() {
+    use kyriakon_control_core::store::draft::Draft;
+
+    let (app, dir) = handler("capsule-cursor-moved").await;
+    let mut record = Draft::new(TOKEN.to_string());
+    for (id, value) in [
+        ("username", "theophilus"),
+        ("whose", "body"),
+        ("body_name", "The Parish of Example"),
+        ("body_kind", "parish"),
+        ("vat", ""),
+        ("body_domain", "example.invalid"),
+        ("body_records", "yes"),
+        ("body_addresses", "secretary: own\nhall: alias secretary"),
+        ("body_account_names", "secretary\nhall"),
+        ("body_upload_key", ""),
+        ("body_dns_contact", ""),
+    ] {
+        record.answers.insert(id.into(), value.into());
+    }
+    for name in ["secretary", "hall"] {
+        record
+            .mail_keys
+            .push(kyriakon_control_core::mail::keycheck::mail_key(
+                name.into(),
+                &format!("{name}@example.invalid"),
+                GOOD_KEY,
+            ));
+    }
+    // The old order: key pages 9 and 10, the body upload key 11, the DNS
+    // contact 12, the address pages 13 and 14.
+    record.cursor = 13;
+    kyriakon_control_core::store::draft::save(&app.store, &mut record)
+        .await
+        .unwrap();
+
+    // The page number the old order gave this draft now names the body upload
+    // key; the applicant is sent to the address page they never saw.
+    let (code, redirect) = ask(&app, &gmid_get(&format!("apply/{TOKEN}/14"), "")).await;
+    assert_eq!(code, 30, "{redirect}");
+    assert!(
+        redirect.contains(&format!("/apply/{TOKEN}/10")),
+        "{redirect}"
+    );
+    let (code, page) = ask(&app, &gmid_get(&format!("apply/{TOKEN}/10"), "")).await;
+    assert_eq!(code, 10, "{page}");
+    assert!(page.contains("An address outside this platform"), "{page}");
+
+    ask(
+        &app,
+        &gmid_get(&format!("apply/{TOKEN}/10"), "postbox@example.invalid"),
+    )
+    .await;
+    let (code, page) = ask(&app, &gmid_get(&format!("apply/{TOKEN}/11"), "")).await;
+    assert_eq!(code, 10, "{page}");
+    assert!(
+        page.contains("I understand that we can only reach me inside this account."),
+        "{page}"
+    );
+    ask(&app, &gmid_get(&format!("apply/{TOKEN}/11"), "yes")).await;
+
+    // The key pages and the body upload and DNS pages were answered under the
+    // old order, so they are skipped rather than re-asked.
+    let (code, redirect) = ask(&app, &gmid_get(&format!("apply/{TOKEN}/12"), "")).await;
+    assert_eq!(code, 30, "{redirect}");
+    assert!(
+        redirect.contains(&format!("/apply/{TOKEN}/16")),
+        "{redirect}"
+    );
+    let (code, page) = ask(&app, &gmid_get(&format!("apply/{TOKEN}/16"), "")).await;
+    assert_eq!(code, 10, "{page}");
+    assert!(page.contains("How you will pay"), "{page}");
+
+    let migrated = read_draft(&dir, TOKEN);
+    assert_eq!(migrated.cursor, 15);
+    assert_eq!(
+        migrated.answers["address_outside"],
+        "postbox@example.invalid"
+    );
 }
 
 /// A mailed key reaches the application the way the spec describes: the body's
@@ -683,6 +791,13 @@ async fn a_complete_capsule_draft_files_the_application() {
         .collect();
     let mut record = kyriakon_control_core::store::draft::Draft::new(TOKEN.to_string());
     record.answers = answers;
+    record
+        .mail_keys
+        .push(kyriakon_control_core::mail::keycheck::mail_key(
+            "secretary".to_string(),
+            "secretary@example.invalid",
+            GOOD_KEY,
+        ));
     record.cursor = flow_path(&app.questions, &record.answers).len();
     kyriakon_control_core::store::draft::save(&app.store, &mut record)
         .await
@@ -711,6 +826,13 @@ async fn a_failed_intent_write_leaves_no_application_record() {
         .collect();
     let mut record = kyriakon_control_core::store::draft::Draft::new(TOKEN.to_string());
     record.answers = answers;
+    record
+        .mail_keys
+        .push(kyriakon_control_core::mail::keycheck::mail_key(
+            "secretary".to_string(),
+            "secretary@example.invalid",
+            GOOD_KEY,
+        ));
     record.cursor = flow_path(&app.questions, &record.answers).len();
     kyriakon_control_core::store::draft::save(&app.store, &mut record)
         .await
