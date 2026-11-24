@@ -956,7 +956,7 @@ self_test() {
 	# reads. It used to carry a statement at awk top level after a bare rule,
 	# which awk rejects, so it exited 2 and printed nothing; a caller read that
 	# as "no row" and either installed nothing or reported the table as empty.
-	printf 'lib.sh\t/root/bin\t-\t\tmail\t-\tactive\nopenbsd/restore-template/install.conf\t/home/www/kyriakon.net/www\t-\t\tmail\tinstall.conf\tactive\nother.conf\t/home/www/kyriakon.net/www\t-\t\tcontrol\tother.conf\tactive\n' \
+	printf 'lib.sh\t/root/bin\t-\t\tmail\t-\tactive\nopenbsd/restore-template/install.conf\t/home/www/kyriakon.net/www\t-\t\tmail\tinstall.conf\tactive\nother.conf\t/home/www/kyriakon.net/www\t-\t\tcontrol\tother.conf\tactive\ngone.sh\t/root/bin\t-\t\tmail\t-\tretired\n' \
 		>"$tree/route-table.tsv"
 	check "the route query returns the mail row" \
 		"$(manifest_targets_route "$tree/route-table.tsv" /home/www/kyriakon.net/www mail)" \
@@ -981,6 +981,28 @@ self_test() {
 	PATH=$old_path
 	check "a query that cannot run is an error" \
 		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	# Every other query, on the same fixture. A syntax error or a broken filter
+	# in one of them is invisible to the deploys until the row it should return
+	# is live, which is how a route query that always exited 2 merged.
+	check "every active row is listed" \
+		"$(manifest_rows "$tree/route-table.tsv" | wc -l | tr -d ' ')" 3
+	check "a script's row is present" \
+		"$(manifest_has "$tree/route-table.tsv" lib.sh && printf yes || printf no)" yes
+	check "an absent script has no row" \
+		"$(manifest_has "$tree/route-table.tsv" absent.sh && printf yes || printf no)" no
+	check "a row's route is printed" \
+		"$(manifest_routes "$tree/route-table.tsv" lib.sh)" mail
+	check "a destination's active names are printed" \
+		"$(manifest_active_names "$tree/route-table.tsv" /root/bin)" lib.sh
+	check "targets keep the installed name" \
+		"$(manifest_targets "$tree/route-table.tsv" /home/www/kyriakon.net/www |
+			grep -c 'install\.conf')" 1
+	check "a renamed row installs under its new name" \
+		"$(manifest_installed_name "$tree/route-table.tsv" lib.sh /root/bin)" lib.sh
+	check "a retired row's route is printed" \
+		"$(manifest_retired_routes "$tree/route-table.tsv" gone.sh)" mail
+	check "a retired row's name is reported" \
+		"$(manifest_retired_names "$tree/route-table.tsv" /root/bin)" gone.sh
 
 	self_test_end
 }
