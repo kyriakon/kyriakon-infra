@@ -101,14 +101,17 @@ start_service() {
 
 # dkim_domains_add <file> <domain>: put <domain> in the DKIM filter's domain
 # list, and print only when it was not already there, so a redeploy that changes
-# nothing says nothing. The line is written by table_set, the same locked shape
-# the virtual table below uses, which also compares the key literally rather than
-# as a substring: parish.example and sub.parish.example are different domains and
-# both belong in the list.
+# nothing says nothing. The line is written by the mail-table command, the same
+# locked shape the virtual table below uses, which also compares keys literally
+# rather than as substrings: parish.example and sub.parish.example are different
+# domains and both belong in the list.
 dkim_domains_add() {
-	table_set "$1" "$2" "$2"
-	# shellcheck disable=SC2154 # table_set_how is set by table_set in lib.sh
-	[ "$table_set_how" = added ] || return 0
+	typeset how
+	# A fresh or replacement box has no list; this deploy is the only thing that
+	# creates it, and the writer refuses a table that is not there.
+	[ -e "$1" ] || install -m 0644 /dev/null "$1" || return 1
+	how=$(mail_table add "$1" "$2") || return 1
+	[ "$how" = added ] || return 0
 	printf 'dkim domain %s added\n' "$2"
 }
 
@@ -119,14 +122,14 @@ dkim_domains_add() {
 # set_virtual <table> <name> <entry>
 #
 # Replace the line whose localpart is exactly <name> with <entry>, or append it
-# when there is none, and print which happened. The write is lib.sh's table_set,
-# which is also what the signup and removal scripts use: this file is the whole
-# answer for local delivery, so an interrupted write that left a fragment would
-# make addresses under it unreachable.
+# when there is none, and print which happened. The write is the mail-table
+# command, which is also what the signup and removal scripts use: this file is
+# the whole answer for local delivery, so an interrupted write that left a
+# fragment would make addresses under it unreachable.
 set_virtual() {
-	typeset table="$1" name="$2" entry="$3"
-	table_set "$table" "$name" "$entry"
-	printf 'virtual %s %s\n' "$name" "$table_set_how"
+	typeset table="$1" how
+	how=$(mail_table set "$table" "$3") || return 1
+	printf 'virtual %s %s\n' "$2" "$how"
 }
 
 # require_mail_domains <table> <platform-domain>: the deploy's refusal. Prints
@@ -159,51 +162,8 @@ merge_spamd_allowed() {
 		# line this appends, and the next hygiene run would call that drift.
 		domain=$(printf '%s' "$domain" | sed -e 's/#.*//' -e 's/[[:space:]]//g')
 		[ -n "$domain" ] || continue
-		table_set "$dst" "@$domain" "@$domain" || return 1
+		mail_table add "$dst" "@$domain" >/dev/null || return 1
 	done <"$domains"
-}
-
-# mail_from_entries <passwd-file> <virtuals-file>: the mail-from table, mapped
-# from account to the addresses that account may submit as. Every account whose
-# home is under /home gets a line starting with its own identity,
-# <user>@<platform-domain>, and every full-address virtuals entry whose target is
-# one of those accounts is appended to that account's list, so a group mailbox
-# that publishes secretary@parish.example can send as it. A bare localpart is not
-# an identity and is left out, as is an address aimed at a service account, and
-# an address already in the account's list is not repeated. smtpd's `senders`
-# option reads this as a mapping, so one account's line never carries another
-# account's address.
-mail_from_entries() {
-	awk -F: -v d="$platform_domain" '
-		FILENAME == ARGV[1] {
-			if ($6 ~ /^\/home\//) {
-				account[++n] = $1
-				own[$1] = $1 "@" d
-				seen[$1 "@" d] = 1
-			}
-			next
-		}
-		{
-			addr = $1
-			if (addr !~ /@/) next
-			target = $2
-			sub(/^[ \t]+/, "", target)
-			sub(/[ \t]+$/, "", target)
-			sub(/\+.*$/, "", target)
-			if ((target in own) && !(addr in seen)) {
-				seen[addr] = 1
-				extra[target] = (extra[target] == "") ? addr : extra[target] "," addr
-			}
-		}
-		END {
-			for (i = 1; i <= n; i++) {
-				acct = account[i]
-				line = own[acct]
-				if (extra[acct] != "") line = line "," extra[acct]
-				print acct ": " line
-			}
-		}
-	' "$1" "$2"
 }
 
 # install_smtpd_conf lives in lib.sh: reload-smtpd.sh and provision-member.sh
@@ -392,6 +352,8 @@ self_test() {
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work
+	KYRIAKON_DRAIN=$(self_test_mail_table "$tree")
+	export KYRIAKON_DRAIN
 
 	# --- the virtual table ---
 	# As a previous run and the drain leave it: two platform entries, and one the
@@ -419,23 +381,23 @@ self_test() {
 	after=$(stat -f %i "$tree/virtuals")
 	check "an entry with no line of its own is appended" \
 		"$(grep -c '^dmarc: oliver$' "$tree/virtuals")" 1
-	# The append writes the live table under the helper's lock rather than
-	# replacing it, so the inode stays and a concurrent append cannot be lost.
-	check "and the table is appended to, not replaced" \
-		"$([ "$before" = "$after" ] && printf yes || printf no)" yes
+	# Every write goes through a sibling candidate and a rename, so a reader
+	# never sees half a line and the inode changes even for an append.
+	check "and the table is replaced atomically, not appended in place" \
+		"$([ "$before" != "$after" ] && printf yes || printf no)" yes
 
-	# A write that cannot be made leaves the table exactly as it was. The table is
-	# a directory here, which the append refuses as root as well as otherwise.
+	# A write that cannot be made leaves the table exactly as it was.
 	cp "$tree/virtuals" "$tree/expected"
-	mkdir "$tree/adirectory"
+	: >"$tree/virtuals.fail"
 	set +e
-	( set -e; set_virtual "$tree/adirectory" hello "hello: x" ) >/dev/null 2>&1
+	( set -e; set_virtual "$tree/virtuals" hello "hello: x" ) >/dev/null 2>&1
 	code=$?
 	set -e
+	rm -f "$tree/virtuals.fail"
 	check "a write that fails leaves the table as it was" \
 		"$(cmp -s "$tree/virtuals" "$tree/expected" && printf same || printf changed)" same
-	check "and does not leave the lock behind" \
-		"$([ -d "$tree/adirectory.lock" ] && printf held || printf free)" free
+	check "and leaves no candidate beside it" \
+		"$(find "$tree" -maxdepth 1 -name 'virtuals.[0-9]*' | wc -l | tr -d ' ')" 0
 	check "and says that it failed" "$([ "$code" -ne 0 ] && printf yes || printf no)" yes
 
 	# --- mail_domains ---
@@ -503,39 +465,21 @@ self_test() {
 	check "and nothing carrying the comment or the spaces is appended" \
 		"$(grep -c -e '@parish.example ' -e '@parish.example#' "$tree/spamd.alloweddomains")" 0
 
-	# --- the mail-from table ---
-	# The submission check is only as good as this table: smtpd's `senders`
-	# option looks the authenticated account up and refuses any other address, so
-	# the line must be per-account. An account's own identity heads its list, and
-	# a full-address virtuals line that delivers into it is appended, which is how
-	# a group mailbox sends as the address it publishes. A bare alias and an
-	# address aimed at a service account are not account identities.
-	printf '%s\n' 'oliver:x:1000:1000::/home/oliver:/bin/ksh' \
-		'alice:x:1001:1001::/home/alice:/bin/ksh' \
-		'_onboard:x:800:800::/var/db/onboard:/sbin/nologin' > "$tree/passwd"
-	printf '%s\n' 'oliver@kyriakon.net: oliver' \
-		'secretary@parish.example: alice' \
-		'admin@kyriakon.net: alice+Admin' \
-		'hello: alice' \
-		'apply@kyriakon.net: _onboard' > "$tree/virtuals_mail_from"
-	mail_from_entries "$tree/passwd" "$tree/virtuals_mail_from" > "$tree/mail_from"
-	check "each account under /home gets its own line" \
-		"$(grep -c -e '^oliver: ' -e '^alice: ' "$tree/mail_from")" 2
-	check "and the platform identity alone is on it" \
-		"$(grep -c '^oliver: oliver@kyriakon.net$' "$tree/mail_from")" 1
-	check "and the addresses that deliver into it are on that line" \
-		"$(grep -c '^alice: alice@kyriakon.net,secretary@parish.example,admin@kyriakon.net$' "$tree/mail_from")" 1
-	check "a delivery detail resolves to the account" \
-		"$(grep -c 'admin@kyriakon.net' "$tree/mail_from")" 1
-	check "but a bare alias and a service account's address are not" \
-		"$(grep -c -e 'hello' -e 'apply@' -e '_onboard' "$tree/mail_from")" 0
-	check "and no account's line carries another account's address" \
-		"$(awk -F': ' '$1 == "alice" && $2 ~ /oliver@/ { found = 1 } END { exit !found }' "$tree/mail_from" \
-			&& printf yes || printf no)" no
-	check "an identity virtuals already carries is not repeated" \
-		"$(grep -c 'alice@kyriakon.net' "$tree/mail_from")" 1
-	check "and there is one line per account" \
-		"$(wc -l < "$tree/mail_from" | tr -d ' ')" 2
+	# A fresh box has no dkim_domains. The deploy is the only thing that creates
+	# it, so the seed must create the file before the writer will touch it.
+	mkdir -p "$tree/fresh"
+	out=$(dkim_domains_add "$tree/fresh/dkim_domains" kyriakon.net)
+	check "a missing dkim table is seeded" \
+		"$(cat "$tree/fresh/dkim_domains")" kyriakon.net
+	check "and the seed reports the addition" "$out" 'dkim domain kyriakon.net added'
+	out=$(dkim_domains_add "$tree/fresh/dkim_domains" kyriakon.net)
+	check "a second seed says nothing" "$out" ''
+	check "and adds no duplicate line" \
+		"$(grep -c '^kyriakon.net$' "$tree/fresh/dkim_domains")" 1
+
+	# The mail-from generation lives in the mail-table command now, under its
+	# lock; the mapping's shape is asserted in `core::mail::table`'s own test,
+	# because a shell fixture cannot exercise the kernel-lock window.
 
 	# --- the MTA configuration ---
 	# Against the file that gets installed rather than a fixture: the substitution
@@ -1612,13 +1556,6 @@ hello: oliver"
 # by line rather than split on whitespace: splitting would tear the "name: value"
 # pair apart and write an entry with an empty value, which stops delivering mail
 # to that address.
-# One trap for every candidate in this section: a second `trap ... EXIT` would
-# replace this one rather than add to it, and the earlier writes' candidates
-# would be left behind. mail_from_tmp is set below; `:-` covers this trap running
-# first. The virtual writes create their own candidate inside table_set, under
-# the lock.
-mail_from_tmp=''
-trap 'rm -f "${mail_from_tmp:-}"' EXIT
 while IFS= read -r entry; do
 	set_virtual "$virtuals_table" "${entry%%:*}" "$entry"
 done <<EOF
@@ -1652,7 +1589,7 @@ while IFS= read -r acct; do
 	if awk -F: -v k="$acct@$platform_domain" '$1 == k { found = 1 } END { exit !found }' "$virtuals_table"; then
 		continue
 	fi
-	table_set "$virtuals_table" "$acct@$platform_domain" "$account_line"
+	mail_table set "$virtuals_table" "$account_line" >/dev/null || exit 1
 	awk -F: -v k="$acct@$platform_domain" '$1 == k { found = 1 } END { exit !found }' "$virtuals_table" \
 		|| { printf 'virtual entry did not land in %s: %s\n' "$virtuals_table" "$account_line" >&2; exit 1; }
 	printf 'virtual %s added\n' "$acct@$platform_domain"
@@ -1673,16 +1610,11 @@ EOF
 # everything the box holds at that moment; provision-member.sh and the drain's
 # group transition add an address to the owning account's line as they make it,
 # so a member provisioned after this deploy submits without waiting for the next
-# one. The read-modify-replace runs under the same table lock those writers take:
-# an append landing between the virtuals read and the rename would otherwise be
+# one. The replacement runs under the same kernel lock those writers take: an
+# append landing between the virtuals read and the rename would otherwise be
 # dropped.
 mail_from_table=/etc/mail/mail_from
-mail_from_tmp=$(mktemp "$mail_from_table.XXXXXX")
-table_lock "$mail_from_table" || exit 1
-mail_from_entries /etc/passwd "$virtuals_table" > "$mail_from_tmp"
-chmod 0644 "$mail_from_tmp"
-mv "$mail_from_tmp" "$mail_from_table"
-table_unlock "$mail_from_table"
+mail_table regenerate "$mail_from_table" /etc/passwd "$virtuals_table" "$platform_domain" || exit 1
 printf 'mail_from: %s entries\n' "$(grep -c . "$mail_from_table" || true)"
 
 # The table's /usr/local/libexec rows, installed before the configuration that

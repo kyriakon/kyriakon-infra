@@ -279,7 +279,7 @@ mail_from_ensure() {
 			"$mail_from_table" "$address" >&2
 		return 0
 	fi
-	table_map_add "$mail_from_table" "$account" "$address" || rc=$?
+	mail_table map-add "$mail_from_table" "$account" "$address" || rc=$?
 	case $rc in
 	0)
 		printf 'mail-from %s added for %s\n' "$address" "$account"
@@ -318,7 +318,7 @@ ensure_mail_address() {
 			printf 'note: %s maps to %s, so mail for this member goes there\n' "$key" "$current" >&2
 		fi
 	else
-		table_set "$virtuals" "$key" "$key: $user"
+		mail_table set "$virtuals" "$key: $user" >/dev/null
 		awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals" \
 			|| { printf 'could not add %s to %s\n' "$key" "$virtuals" >&2; exit 1; }
 		printf 'virtual %s added\n' "$key"
@@ -368,6 +368,8 @@ self_test() {
 	# mktemp can hand back a symlinked component (macOS /var). Resolve the tree
 	# once here so the push fixture and the repository it names agree.
 	tree=$(cd "$tree" && pwd -P)
+	KYRIAKON_DRAIN=$(self_test_mail_table "$tree")
+	export KYRIAKON_DRAIN
 	# smtpd -n validates the live tree, maildir and filter, which this fixture
 	# does not have. The deploy self-test proves the parser check with a stub.
 	export SMTPD_CONF_CHECK=no

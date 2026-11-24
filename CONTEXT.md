@@ -47,12 +47,14 @@ whole new one, never a truncated file. `scripts/lib/atomic-fs.sh` holds the one
 _Avoid_: staged write (the helper's old name), temp-file copy
 
 **Lock directory**:
-The shell-side exclusion on this box: `mkdir` a directory, write the owner's pid
-inside, and remove it when done. OpenBSD has no `flock(1)` or `lockf(1)`, so
-`scripts/lib/atomic-fs.sh`'s `lock_dir` is the one scheme. A stale lock is
-reaped by renaming it to a unique sibling and comparing the pid it held, so two
-reapers cannot delete each other's fresh lock.
-_Avoid_: file lock, flock
+The shell-side exclusion `scripts/lib/atomic-fs.sh`'s `lock_dir` provides for the
+login checker's attempt gate: `mkdir` a directory, write the owner's pid, remove
+it when done, and reap a stale one by renaming it to a unique sibling and
+comparing the pid. The mail tables do not use it: their one writer is
+`kyriakon-control-drain mail-table`, which takes a kernel `flock(2)` on
+`<table>.lock`.
+_Avoid_: flock(1) (OpenBSD has neither it nor lockf(1); the kernel lock is the
+Rust writer's `flock(2)`)
 
 **Member account**:
 An OS account that passes `require_member`: uid above 0, a Maildir in its home,

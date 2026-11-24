@@ -24,6 +24,8 @@ mod group;
 mod intent;
 #[path = "areas/lifecycle.rs"]
 mod lifecycle;
+#[path = "areas/mailtable.rs"]
+mod mailtable;
 #[path = "areas/monero.rs"]
 mod monero;
 #[path = "areas/prepaid.rs"]

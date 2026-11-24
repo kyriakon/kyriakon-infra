@@ -386,6 +386,14 @@ expect_count() {
 	}
 }
 
+# legacy_lock_dir_problem <table>: a pre-flock writer left `<table>.lock` as a
+# directory, which the mail-table command cannot open as a flock file. One line,
+# or nothing.
+legacy_lock_dir_problem() {
+	[ -d "$1.lock" ] || return 0
+	printf '%s.lock is a directory from the pre-flock writer; remove it\n' "$1"
+}
+
 self_test() {
 	typeset dir out want
 	dir=$(mktemp -d "${TMPDIR:-/tmp}/check-hygiene-test.XXXXXX") || exit 1
@@ -475,24 +483,24 @@ self_test() {
 		exit 1
 	}
 
-	# A lock whose owner is gone is a finding; one held by this live shell is not.
+	# The lock the mail-table command uses is a kernel flock on a file, so there
+	# is no owner to inspect here. The hygiene run reports a leftover directory
+	# from the old writer instead.
 	mkdir "$dir/mail_domains.lock"
-	printf '999999\n' > "$dir/mail_domains.lock/pid"
-	out=$(table_lock_stale "$dir/mail_domains")
+	out=$(legacy_lock_dir_problem "$dir/mail_domains")
 	case "$out" in
-	*'pid 999999 is gone'*) ;;
-	*)
-		printf 'FAIL: a lock whose owner is gone is stale; got [%s]\n' "$out" >&2
-		exit 1
-		;;
+	*'pre-flock writer; remove it'*) ;;
+	*) printf 'FAIL: a legacy lock directory is a finding; got [%s]\n' "$out" >&2
+	   exit 1 ;;
 	esac
-	printf '%s\n' "$$" > "$dir/mail_domains.lock/pid"
-	out=$(table_lock_stale "$dir/mail_domains")
+	rm -rf "$dir/mail_domains.lock"
+	: >"$dir/mail_domains.lock"
+	out=$(legacy_lock_dir_problem "$dir/mail_domains")
 	[ -z "$out" ] || {
-		printf 'FAIL: a lock held by a live pid is not stale; got [%s]\n' "$out" >&2
+		printf 'FAIL: the flock file is not a legacy directory; got [%s]\n' "$out" >&2
 		exit 1
 	}
-	rm -rf "$dir/mail_domains.lock"
+	rm -f "$dir/mail_domains.lock"
 
 	# The remedy is per tool, from the absent list. The caller used to print one
 	# line using `$tool`, which after its loop is jq whatever is missing.
@@ -1167,16 +1175,17 @@ if [ "$mail_domains_ok" = yes ]; then
 	printf 'mail domains: every domain smtpd accepts is in the greylist pass-through list\n'
 fi
 
-# A writer killed while holding a table lock leaves <table>.lock, and every later
-# writer waits five seconds and then refuses. Report a stale one here rather than
-# letting the next signup be the thing that discovers it.
-for mail_table in "$mail_domains_table" "$KYRIAKON_VIRTUALS" "$KYRIAKON_MAIL_FROM" "$KYRIAKON_DKIM_DOMAINS"; do
-	lock_problem=$(table_lock_stale "$mail_table")
-	if [ -n "$lock_problem" ]; then
-		printf 'mail domains: %s.lock is stale: %s; remove it if no writer is running\n' \
-			"$mail_table" "$lock_problem"
+# A pre-flock writer left <table>.lock as a directory with a pid file. The
+# mail-table command takes a kernel flock on a file at that path, so a leftover
+# directory wedges every table write until it is removed. Report it; do not
+# remove it here, because an operator may be mid-upgrade.
+for mail_table in "$mail_domains_table" "$KYRIAKON_VIRTUALS" "$KYRIAKON_MAIL_FROM" \
+	"$KYRIAKON_DKIM_DOMAINS" "$spamd_allowed"; do
+	lock_problem=$(legacy_lock_dir_problem "$mail_table")
+	[ -z "$lock_problem" ] || {
+		printf 'mail domains: %s\n' "$lock_problem"
 		status=1
-	fi
+	}
 done
 
 # --- 8. the address every alert is mailed to ------------------------------

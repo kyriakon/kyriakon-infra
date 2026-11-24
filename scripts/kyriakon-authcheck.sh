@@ -191,18 +191,18 @@ login_gate() {
 	gate_file=$(attempts_file "$1")
 	# A record that cannot be locked is a record that cannot be trusted to bound
 	# anything, so the answer is the refusal a spent pair gets.
-	table_lock "$gate_file" "$attempt_lock_tries" "$attempt_lock_interval" || return 1
+	gate_lock "$gate_file" "$attempt_lock_tries" "$attempt_lock_interval" || return 1
 	prune_attempts "$gate_file" >/dev/null
 	gate_count=$(attempts_count "$gate_file" "$2")
 	if [ "$gate_count" -ge "$attempt_limit" ]; then
-		table_unlock "$gate_file"
+		gate_unlock "$gate_file"
 		return 1
 	fi
 	if ! printf '%s %s\n' "$2" "$(date +%s)" >>"$gate_file"; then
-		table_unlock "$gate_file"
+		gate_unlock "$gate_file"
 		return 1
 	fi
-	table_unlock "$gate_file"
+	gate_unlock "$gate_file"
 	return 0
 }
 
@@ -213,7 +213,7 @@ clear_failures() {
 	typeset clear_file clear_kept clear_tmp
 	clear_file=$(attempts_file "$1")
 	[ -f "$clear_file" ] || return 0
-	table_lock "$clear_file" "$attempt_lock_tries" "$attempt_lock_interval" || return 0
+	gate_lock "$clear_file" "$attempt_lock_tries" "$attempt_lock_interval" || return 0
 	clear_kept=$(awk -v source="$2" '$1 != source' "$clear_file") || clear_kept=
 	if [ -z "$clear_kept" ]; then
 		rm -f "$clear_file"
@@ -225,7 +225,7 @@ clear_failures() {
 			rm -f "$clear_tmp"
 		fi
 	fi
-	table_unlock "$clear_file"
+	gate_unlock "$clear_file"
 }
 
 # authenticate <username>: the one doveadm subcommand. A function so the
