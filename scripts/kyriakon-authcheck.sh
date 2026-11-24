@@ -292,6 +292,13 @@ self_test() {
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	work=$self_test_work
+	# The concurrent cases below need every login to take the record lock.
+	# Under the VM's emulation a queue of six to ten logins rewriting a
+	# thousand-line record can outlast the shipped five seconds, and a login
+	# that gives up is refused without recording, which the burst assertion
+	# then reads as a lost write. Wait longer here; the product value is
+	# untouched.
+	attempt_lock_tries=600
 	check "a member shape passes" \
 		"$(valid_localpart 'theophilus-1' && printf yes || printf no)" yes
 	check "an uppercase letter is refused" \

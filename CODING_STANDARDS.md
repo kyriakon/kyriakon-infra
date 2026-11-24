@@ -14,6 +14,8 @@ A front-end flow test covers every answer kind in `questions.toml` and at least 
 
 A check that cannot see what it is checking is a finding, not a pass. A health check that reads a missing file, a mail that was not sent, a stale table: each must say so rather than exit 0.
 
+A stub standing in for a process or a socket does the fork or connect the real one does. A fake encryptor that never forks cannot show an inherited `SIGCHLD` disposition, and the suite stays green while every save fails.
+
 ## The drain's transitions
 
 Every transition that settles an intent removes its own file and journals its outcome. A pass that fails leaves the intent in place for the backoff, and a failure journal line is the reason to retry, never a settlement.
