@@ -31,7 +31,9 @@ pub struct Draft {
     pub mail_keys: Vec<KeyRecord>,
     /// The next page to ask, as an index into the applicant's own path. Zero is
     /// the first question; a value equal to the path's length means every page
-    /// has been answered.
+    /// has been answered. The capsule recomputes it from the answers on every
+    /// request, so a release that reorders the questions cannot move the page
+    /// under a stored index.
     pub cursor: usize,
     pub created_at: String,
     pub updated_at: String,

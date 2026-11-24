@@ -72,6 +72,27 @@ pub fn flow_path<'a>(list: &'a [Question], answers: &BTreeMap<String, String>) -
     out
 }
 
+/// Whether one page has been answered: a key page by the key its mailbox has
+/// filed, every other page by its id in the answers.
+fn answered(page: &Page, record: &draft::Draft) -> bool {
+    match &page.mailbox {
+        Some(mailbox) => record.mail_keys.iter().any(|k| k.mailbox == mailbox.name),
+        None => record.answers.contains_key(&page.q.id),
+    }
+}
+
+/// The index of the next page to ask, from the answers. A stored cursor is an
+/// index into the path, so a release that reorders the questions moves the page
+/// under it and can re-ask an answered page or leave one unanswered behind the
+/// cursor; the answers do not move. Every answered page is skipped.
+pub fn next_page(path: &[Page], record: &draft::Draft) -> usize {
+    let mut index = 0;
+    while index < path.len() && answered(&path[index], record) {
+        index += 1;
+    }
+    index
+}
+
 /// Why one page's answer cannot advance the flow, or `None`. The rules are the
 /// web form's, `validate::reason` included, so the capsule refuses what the form
 /// refuses; a key's per-mailbox checks and an address list's shape are added
@@ -268,5 +289,54 @@ mod tests {
             .iter()
             .any(|why| why.contains("AEAD")));
         assert!(!mail_key_errors(&q, EXPIRED_SUBKEY, &form).is_empty());
+    }
+
+    /// A draft written when the address pages came after the key pages: its
+    /// cursor is an index into that order, and the answers are what settle the
+    /// page to ask under this one.
+    #[test]
+    fn a_cursor_from_before_the_address_pages_moved_is_read_from_the_answers() {
+        use crate::mail::keycheck;
+
+        let list = questions::shipped().unwrap();
+        let mut record = draft::Draft::new("abcdefghjkmnpqrstvwxyz0123".into());
+        for (id, value) in [
+            ("username", "parish"),
+            ("whose", "body"),
+            ("body_name", "The Parish of Example"),
+            ("body_kind", "parish"),
+            ("vat", ""),
+            ("body_domain", "example.invalid"),
+            ("body_records", "yes"),
+            ("body_addresses", "secretary: own\nhall: alias secretary"),
+            ("body_account_names", "secretary\nhall"),
+            ("body_upload_key", ""),
+            ("body_dns_contact", ""),
+        ] {
+            record.answers.insert(id.into(), value.into());
+        }
+        for name in ["secretary", "hall"] {
+            record
+                .mail_keys
+                .push(keycheck::mail_key(name.into(), name, CLEAN));
+        }
+        let path = flow_path(&list, &record.answers);
+        assert_eq!(path[9].q.id, "address_outside");
+        assert_eq!(path[15].q.id, "rail");
+
+        // In the old order index 13 was the first address page, and index 14
+        // the acknowledgement; the cursor does not decide either.
+        record.cursor = 13;
+        assert_eq!(next_page(&path, &record), 9);
+        record
+            .answers
+            .insert("address_outside".into(), "postbox@example.invalid".into());
+        assert_eq!(next_page(&path, &record), 10);
+
+        // With both address pages answered, the pages this draft answered under
+        // the old order are skipped: the key pages (11, 12), the body's upload
+        // key (13) and its DNS contact (14), leaving the rail (15).
+        record.answers.insert("address_ack".into(), "yes".into());
+        assert_eq!(next_page(&path, &record), 15);
     }
 }

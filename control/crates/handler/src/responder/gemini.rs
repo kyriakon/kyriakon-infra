@@ -8,7 +8,7 @@ use super::reply::{respond, too_many, unavailable, Which};
 use super::route::Call;
 use super::status::{card_link, live_application};
 use kyriakon_control_core::flow::applicant::{
-    body_cross_checks, flow_answers, flow_path, flow_problem, Page,
+    body_cross_checks, flow_answers, flow_path, flow_problem, next_page, Page,
 };
 
 use time::OffsetDateTime;
@@ -190,23 +190,20 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
         .store
         .update_draft(token, |record| {
             let path = flow_path(&app.questions, &record.answers);
-            if record.cursor >= path.len() {
-                return Ok((Step::File, false));
+            // The page is the first one the answers have not settled: a draft
+            // written before this release's question order carries an index
+            // into the old path, and a key the mail route filed answers its
+            // page without the cursor moving.
+            let index = next_page(&path, record);
+            let moved = index != record.cursor;
+            record.cursor = index;
+            if index >= path.len() {
+                return Ok((Step::File, moved));
             }
-            if page != record.cursor + 1 {
-                return Ok((Step::Redirect(record.cursor + 1), false));
-            }
-            // A key mailed to apply@ is filed against this draft by the drain.
-            // When the flow reaches that page, it is already answered: advance
-            // past every such page rather than asking for a key already sent.
-            if capsule_skip_mailed(&path, record) {
-                if record.cursor >= path.len() {
-                    return Ok((Step::File, true));
-                }
-                return Ok((Step::Redirect(record.cursor + 1), true));
+            if page != index + 1 {
+                return Ok((Step::Redirect(index + 1), moved));
             }
 
-            let index = record.cursor;
             let page = &path[index];
             let q = page.q;
             if incoming.query.is_empty() {
@@ -289,22 +286,6 @@ enum Step {
     File,
     Redirect(usize),
     Ask(String),
-}
-
-/// Advance the cursor past key pages whose mailbox already holds a key, which
-/// is how a key mailed to apply@ answers the page for the applicant.
-pub(super) fn capsule_skip_mailed(path: &[Page], record: &mut draft::Draft) -> bool {
-    let mut moved = false;
-    while let Some(page) = path.get(record.cursor) {
-        match &page.mailbox {
-            Some(mailbox) if record.mail_keys.iter().any(|k| k.mailbox == mailbox.name) => {
-                record.cursor += 1;
-                moved = true;
-            }
-            _ => break,
-        }
-    }
-    moved
 }
 
 /// The query as the draft stores it. gmid leaves the query percent-encoded, and
