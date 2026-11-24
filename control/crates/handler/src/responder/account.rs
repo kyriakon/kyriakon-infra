@@ -218,7 +218,7 @@ pub(super) async fn closure_refund(app: &App, account: &Account) -> Option<Strin
 pub(super) async fn account_action(app: &App, call: &Call<'_>) -> Reply {
     match call.rest {
         "password" => account_password(app, call).await,
-        "upload-key" => account_upload_key(app, call.request).await,
+        "upload-key" => account_upload_key(app, call).await,
         "address" => account_address(app, call.request).await,
         "serving" => account_serving(app, call.request).await,
         "renewal" => account_renewal(app, call.request).await,
@@ -408,8 +408,11 @@ pub(super) async fn account_password(app: &App, call: &Call<'_>) -> Reply {
 
 /// The upload key form: add one key or remove the one on the account. One key
 /// serves sftp and git, so adding replaces rather than accumulates, and the
-/// page shows the fingerprint and the day it was added.
-pub(super) async fn account_upload_key(app: &App, request: &Request) -> Reply {
+/// page shows the fingerprint and the day it was added. The mail password is
+/// re-entered: the key outlives the session, so a borrowed browser must not be
+/// able to attach one that keeps working after logout.
+pub(super) async fn account_upload_key(app: &App, call: &Call<'_>) -> Reply {
+    let request = call.request;
     let (cookie, account) = match session_account(app, request).await {
         Ok(Some(found)) => found,
         Ok(None) => return refused("Sign in to the account whose upload key you want to change."),
@@ -419,6 +422,25 @@ pub(super) async fn account_upload_key(app: &App, request: &Request) -> Reply {
         return refused("Sign in to the account whose upload key you want to change.");
     };
     let form = fields(&String::from_utf8_lossy(&request.body));
+    let password = form.get("password").map(String::as_str).unwrap_or("");
+    // The same key the login uses, so the throttle's record is one pair's.
+    let source = call.incoming.key.to_string();
+    if password.is_empty()
+        || !app
+            .auth
+            .authenticate(
+                &account.username,
+                password,
+                std::path::Path::new(&app.cfg.proof_dir),
+                &source,
+            )
+            .await
+            .is_some()
+    {
+        return refused(
+            "That password did not match. Enter your mail password again to change the upload key.",
+        );
+    }
     match form.get("action").map(String::as_str) {
         Some("add") => {
             let material = form.get("key").map(String::as_str).unwrap_or("").trim();

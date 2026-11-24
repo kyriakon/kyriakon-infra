@@ -339,6 +339,11 @@ fn an_upload_key_is_added_and_removed_for_both_sessions() {
         account["upload_keys"][0]["added_at"].is_string(),
         "the page shows the day the key was added: {account}"
     );
+    assert!(
+        fix.sent().contains("was added"),
+        "the member is told the key changed: {}",
+        fix.sent()
+    );
 
     // A key that is not on the account is refused and nothing is removed.
     fix.file_page_action(
@@ -352,6 +357,10 @@ fn an_upload_key_is_added_and_removed_for_both_sessions() {
         "the key is still there"
     );
     assert!(fix.journal().contains("\"outcome\":\"refused\""));
+    assert!(
+        !fix.sent().contains("was removed"),
+        "a refused removal announced a change"
+    );
 
     fix.file_page_action(
         "upload-key",
@@ -370,6 +379,53 @@ fn an_upload_key_is_added_and_removed_for_both_sessions() {
             .is_none_or(Value::is_null),
         "the page no longer lists a key"
     );
+    assert!(
+        fix.sent().contains("was removed"),
+        "the member is told the key was removed: {}",
+        fix.sent()
+    );
+}
+
+/// A removal whose notice cannot leave stays unapplied: the retry still finds
+/// the key recorded, sends the one notice, and only then clears it. Sending
+/// after the record update would silently lose the warning.
+#[test]
+fn an_upload_key_removal_waits_for_its_notice() {
+    let fix = Fix::new("upload-key-notice-retry");
+    fix.page_account("alice", json!({}));
+    logging_script(&fix, "provision-member.sh");
+    logging_script(&fix, "cron-apply.sh");
+    logging_script(&fix, "remove-upload-key.sh");
+    let fingerprint =
+        kyriakon_control_core::mail::keycheck::openssh_fingerprint(UPLOAD_KEY).unwrap();
+    fix.file_page_action(
+        "upload-key",
+        "alice",
+        json!({"action": "add", "material": UPLOAD_KEY}),
+    );
+    assert!(fix.drain().status.success());
+
+    fix.file_page_action(
+        "upload-key",
+        "alice",
+        json!({"action": "remove", "fingerprint": fingerprint}),
+    );
+    fix.enqueuer_fails();
+    // The pass reports the failure and keeps the intent for a later retry, so
+    // it exits 0; what matters is that the record still names the key.
+    assert!(fix.drain().status.success());
+    assert_eq!(
+        fix.account("alice")["upload_keys"][0]["fingerprint"],
+        json!(fingerprint),
+        "the record cleared before the notice left"
+    );
+    assert!(
+        !fix.read("accounts/alice/notices.jsonl")
+            .contains("was removed"),
+        "a notice that never left was recorded"
+    );
+    assert_eq!(fix.intents().len(), 1, "the intent was not kept for retry");
+    fix.enqueuer_works();
 }
 
 /// A lapsed or suspended account is not sending, so its upload session is not

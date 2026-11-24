@@ -860,8 +860,13 @@ async fn the_password_form_requires_the_current_password_and_files_one_intent() 
 #[tokio::test]
 async fn the_upload_key_forms_add_and_remove_the_one_key() {
     const UPLOAD: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample secretary@example";
-    let (app, dir) = handler("account-upload-key").await;
+    const PASS: &str = "password=right%20horse%20battery";
+    let (mut app, dir) = handler("account-upload-key").await;
     file_account(&dir);
+    app.auth = session::Authenticator {
+        program: checker("account-upload-key", "right horse battery"),
+        args: Vec::new(),
+    };
     let fingerprint = keycheck::openssh_fingerprint(UPLOAD).unwrap();
     amend_account(&dir, "alice", |value| {
         value["upload_keys"] = serde_json::json!([
@@ -874,7 +879,7 @@ async fn the_upload_key_forms_add_and_remove_the_one_key() {
         &app,
         &httpd_post_with(
             "/account/upload-key",
-            "action=add&key=not+a+key",
+            "action=add&key=not+a+key&password=right%20horse%20battery",
             Some(&cookie),
         ),
     )
@@ -884,7 +889,7 @@ async fn the_upload_key_forms_add_and_remove_the_one_key() {
         &app,
         &httpd_post_with(
             "/account/upload-key",
-            "action=remove&fingerprint=SHA256%3Anot-on-the-account",
+            &format!("action=remove&fingerprint=SHA256%3Anot-on-the-account&{PASS}"),
             Some(&cookie),
         ),
     )
@@ -894,17 +899,17 @@ async fn the_upload_key_forms_add_and_remove_the_one_key() {
 
     // A form whose action is missing or is not one this route carries out is a
     // refusal, not a method the route does not have.
-    for body in ["action=rename", ""] {
+    for body in [format!("action=rename&{PASS}"), PASS.to_string()] {
         let (code, _) = ask(
             &app,
-            &httpd_post_with("/account/upload-key", body, Some(&cookie)),
+            &httpd_post_with("/account/upload-key", &body, Some(&cookie)),
         )
         .await;
         assert_eq!(code, 403, "{body:?}");
     }
     assert_eq!(filed(&dir), 0);
 
-    let body = format!("action=add&key={}", UPLOAD.replace(' ', "%20"));
+    let body = format!("action=add&key={}&{PASS}", UPLOAD.replace(' ', "%20"));
     let (code, page) = ask(
         &app,
         &httpd_post_with("/account/upload-key", &body, Some(&cookie)),
@@ -924,7 +929,7 @@ async fn the_upload_key_forms_add_and_remove_the_one_key() {
         &app,
         &httpd_post_with(
             "/account/upload-key",
-            &format!("action=remove&fingerprint={encoded}"),
+            &format!("action=remove&fingerprint={encoded}&{PASS}"),
             Some(&cookie),
         ),
     )
@@ -934,6 +939,36 @@ async fn the_upload_key_forms_add_and_remove_the_one_key() {
     assert_eq!(intent["kind"], "upload-key");
     assert_eq!(intent["action"], "remove");
     assert_eq!(intent["fingerprint"], fingerprint);
+}
+
+/// The upload key is persistent SSH access, so the session alone is not enough:
+/// the current mail password is re-entered, as on the closure and password
+/// forms. Without it nothing is filed.
+#[tokio::test]
+async fn an_upload_key_change_without_the_mail_password_files_nothing() {
+    const UPLOAD: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample secretary@example";
+    let (mut app, dir) = handler("account-upload-key-password").await;
+    file_account(&dir);
+    app.auth = session::Authenticator {
+        program: checker("account-upload-key-password", "right horse battery"),
+        args: Vec::new(),
+    };
+    let cookie = signed_in(&app, "alice").await;
+    let key = UPLOAD.replace(' ', "%20");
+    for body in [
+        format!("action=add&key={key}"),
+        format!("action=add&key={key}&password="),
+        format!("action=add&key={key}&password=wrong%20horse%20battery"),
+    ] {
+        let (code, page) = ask(
+            &app,
+            &httpd_post_with("/account/upload-key", &body, Some(&cookie)),
+        )
+        .await;
+        assert_eq!(code, 403, "{body}: {page}");
+        assert!(page.contains("password did not match"), "{page}");
+    }
+    assert_eq!(filed(&dir), 0, "a change without the password was filed");
 }
 
 /// The contact address form files a set or a clear, and refuses anything that

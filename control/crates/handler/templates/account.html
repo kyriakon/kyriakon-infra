@@ -171,6 +171,7 @@
         <form method="post" action="/account/upload-key">
           <input type="hidden" name="action" value="remove">
           <input type="hidden" name="fingerprint" value="{{ key.fingerprint }}">
+          <label>Mail password <input type="password" name="password" autocomplete="current-password" required></label>
           <button class="btn" type="submit">Remove this key</button>
         </form>
       </td>
@@ -189,8 +190,9 @@
   <input type="hidden" name="action" value="add">
   <label for="upload-key">{% if upload_keys.is_empty() %}Add an upload key{% else %}Replace the upload key{% endif %}</label>
   <textarea id="upload-key" name="key" rows="3" cols="70" required placeholder="ssh-ed25519 AAAA... you@example"></textarea>
+  <label>Mail password <input type="password" name="password" autocomplete="current-password" required></label>
   <button class="btn" type="submit">Save the upload key</button>
-  <p class="hint">One bare OpenSSH public key line, as <code>ssh-keygen</code> writes it. It gives sftp into your <code>www/</code> and <code>gemini/</code> directories and git into your repositories, and nothing else.</p>
+  <p class="hint">One bare OpenSSH public key line, as <code>ssh-keygen</code> writes it. It gives sftp into your <code>www/</code> and <code>gemini/</code> directories and git into your repositories, and nothing else. The mail password is asked again because a key keeps working after you sign out, and a borrowed browser must not be able to add one.</p>
 </form>
 
 {% if has_hosting || site_served || capsule_served %}

@@ -111,7 +111,7 @@ The page is what proposal section 5.9.1 bounds, with each part against the docum
 | --- | --- |
 | Log in | the mail password, verified through `doveadm auth test` by a `doas` rule, so passwords have one source of truth and the service holds no hash |
 | Change the mail password | the password re-entered regardless of how fresh the session is, filed as an intent; the drain sets the hash as root, since `doveadm auth test` only ever verifies |
-| Add and remove upload keys | `docs/planning/specs/per-member-hosting.md`; one key serves sftp and git, and the page shows its fingerprints and dates |
+| Add and remove upload keys | `docs/planning/specs/per-member-hosting.md`; one key serves sftp and git, and the page shows its fingerprints and dates. The mail password is re-entered for both, as for a password change, because the key outlives the session; the drain tells every address the account holds when it changes |
 | Add and change the address outside the platform | the account's contact and recovery address, with the bounce rule from [#153](https://github.com/kyriakon/kyriakon-infra/issues/153) |
 | See the space used | the filesystem quota, read by the drain: soft 5 GB, hard 5.5 GB across mail, site and repositories together |
 | See the payment window and what a lapse stops | `docs/planning/specs/prepaid-rails.md`: the block at the top while the window runs, naming the rail, the days left and the close date, the amount, the token in full and the rail's own instructions; `Lapsed` once it closes with nothing recorded, repeating the close date, stating what still works and what has stopped in the lapse notice's own words, and showing the token again; then the paid-until date once it is set |
@@ -146,7 +146,7 @@ The prototype is worth reading for the copy and is not to be copied blindly. It 
 | Lapse and its grace | the lapse notice, the grace notice, and a final notice seven days before deletion |
 | Suspension | the reason, and how to answer it |
 | A refund | the credit notice with the settlement date |
-| Rotation and export | the rotation's confirmations at every address, and the notice that an export is ready |
+| Rotation and export | the rotation's confirmations at every address, the notice that an export is ready, and an upload-key change to every address the account holds |
 
 ## Out of scope
 
