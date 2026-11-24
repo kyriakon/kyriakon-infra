@@ -104,11 +104,12 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
 }
 
 /// Act on one message. `Ok` means it has been dealt with and may be deleted,
-/// whether that was files, refuse or ignore. A live token files the key even
-/// when From is empty, unless the draft recorded an address outside the
-/// platform: then the mail must come from that address, and a message with no
-/// usable From is refused with nothing to reply to. A message with no token, or
-/// one whose token names no live draft, has no address to answer: it is dropped.
+/// whether that was files, refuse or ignore. A live token files the key once the
+/// draft's address page has been answered; the token is the capability, so the
+/// From header and the envelope sender are not read. Before that page the key is
+/// dropped, because filing it would let the capsule skip the key page the
+/// applicant never saw. A message with no token, or one whose token names no live
+/// draft, has no address to answer: it is dropped.
 async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
     let message = Message::parse(raw);
     let blocks = pgp::labelled_blocks(&message.body);
@@ -123,32 +124,28 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
     // lose one of the two.
     let mailed = match store
         .update_draft::<Mailed, kyriakon_control_core::store::Error>(&token, move |draft| {
+            // The token in the Subject is the capability: smtpd authenticates
+            // neither the envelope sender nor the From header, so a mailed key
+            // is not tied to the sender. Wait for the address page, though: a
+            // key mailed before it would be filed unseen and the capsule would
+            // skip the key page, so the applicant would never see or replace it.
+            if !draft.answers.contains_key("address_outside") {
+                return Ok((
+                    Mailed {
+                        recorded: None,
+                        outcome: MailedOutcome::AwaitAddress,
+                    },
+                    false,
+                ));
+            }
             // The only address a reply may go to: the one this live draft
-            // recorded. smtpd authenticates neither an inbound envelope sender
-            // nor the From header, so a stranger can write any address there and
-            // a reply to it would make the address a backscatter source.
+            // recorded. A stranger's From is never a reply target, which keeps
+            // the address from being a backscatter source.
             let recorded = draft
                 .answers
                 .get("address_outside")
                 .filter(|address| !address.is_empty())
                 .cloned();
-            // A draft that recorded an address outside the platform takes a
-            // mailed key only from that address. Anyone who learns the token
-            // could otherwise replace the key.
-            if let Some(outside) = recorded.as_deref() {
-                let same = message
-                    .reply_address()
-                    .is_some_and(|from| from.eq_ignore_ascii_case(outside));
-                if !same {
-                    return Ok((
-                        Mailed {
-                            recorded,
-                            outcome: MailedOutcome::Mismatch,
-                        },
-                        false,
-                    ));
-                }
-            }
             let keys = match assign(&blocks, draft) {
                 Ok(keys) => keys,
                 Err(missing) => {
@@ -239,15 +236,9 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
         Err(e) => return Err(Error::from(e)),
     };
     match mailed.outcome {
-        MailedOutcome::Mismatch => {
-            reply_or_drop(
-                cfg,
-                store,
-                mailed.recorded.as_deref(),
-                &sender_mismatch_body(),
-            )
-            .await
-        }
+        // No address page yet: there is no recorded address to answer, and the
+        // capsule still asks for the key.
+        MailedOutcome::AwaitAddress => Ok(()),
         MailedOutcome::Missing(body) => {
             reply_or_drop(cfg, store, mailed.recorded.as_deref(), &body).await
         }
@@ -274,7 +265,7 @@ struct Mailed {
 }
 
 enum MailedOutcome {
-    Mismatch,
+    AwaitAddress,
     Missing(String),
     Bad(String),
     Filed(Vec<String>),
@@ -297,7 +288,6 @@ async fn reply_or_drop(
 
 /// One message: the headers it needs, and the decoded body.
 pub struct Message {
-    pub from: String,
     pub subject: String,
     pub body: String,
 }
@@ -312,47 +302,9 @@ impl Message {
             None => (raw.as_str(), ""),
         };
         Message {
-            from: header(headers, "from").unwrap_or_default(),
             subject: header(headers, "subject").unwrap_or_default(),
             body: decode_body(headers, body),
         }
-    }
-
-    /// The address a reply may go to, or `None` when the From header holds
-    /// nothing that parses. Never reply to something that is not an address:
-    /// the alternative is a bounce loop.
-    pub fn reply_address(&self) -> Option<String> {
-        if let (Some(open), Some(close)) = (self.from.find('<'), self.from.find('>')) {
-            if open < close {
-                let inner = self.from[open + 1..close].trim();
-                if is_address(inner) {
-                    return Some(inner.to_string());
-                }
-            }
-        }
-        self.from
-            .split(|c: char| {
-                c.is_whitespace() || matches!(c, '<' | '>' | ',' | ';' | ':' | '"' | '(' | ')')
-            })
-            .find(|token| is_address(token))
-            .map(str::to_string)
-    }
-}
-
-fn is_address(value: &str) -> bool {
-    let mut parts = value.split('@');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(local), Some(domain), None) => {
-            !local.is_empty()
-                && !domain.is_empty()
-                && !domain.starts_with('.')
-                && !domain.ends_with('.')
-                && domain.contains('.')
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_graphic() && !b"<>\"(),;:".contains(&b))
-        }
-        _ => false,
     }
 }
 
@@ -488,17 +440,6 @@ async fn reply(cfg: &DrainConfig, store: &Store, sender: &str, body: &str) -> Re
     notice::enqueue(cfg, sender, REPLY_SUBJECT, body)
         .await
         .map_err(Error::from)
-}
-
-/// The refusal for a key mailed from another address, sent to the address the
-/// draft recorded. It never names the sender: the sender is whoever holds the
-/// token, not necessarily the applicant.
-fn sender_mismatch_body() -> String {
-    format!(
-        "The key was not filed: the message did not come from the address this \
-         application recorded. Mail it from that address, or start again here:\n\n\
-         gemini://{HOST}/apply\n"
-    )
 }
 
 fn missing_body(missing: &[String]) -> String {
@@ -847,10 +788,6 @@ mAYEAAAAABK4BgQAAAAAEg==\n-----END PGP PUBLIC KEY BLOCK-----\n";
             "From: Applicant <applicant@example.invalid>\nSubject: 0123456789abcdefghjkmnpqrs\n\n{KEY}"
         );
         let message = Message::parse(&raw);
-        assert_eq!(
-            message.reply_address().as_deref(),
-            Some("applicant@example.invalid")
-        );
         assert_eq!(
             token_in_subject(&message.subject).as_deref(),
             Some("0123456789abcdefghjkmnpqrs")

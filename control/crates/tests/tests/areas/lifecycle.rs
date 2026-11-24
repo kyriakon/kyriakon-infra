@@ -3701,11 +3701,20 @@ fn a_decline_that_could_not_be_sent_goes_on_the_next_pass() {
 
 /// A key mailed to apply@ is filed against the draft its subject names, with
 /// the fingerprint and verdict the handler would have recorded, and the spool
-/// is empty afterwards.
+/// is empty afterwards. The address page has been answered, so the mail route
+/// accepts the token as the capability; an empty answer records no reply
+/// address.
 #[test]
 fn a_mailed_key_is_filed_against_the_draft_and_the_spool_empties() {
     let fix = Fix::new("mail-key");
-    fix.write_draft(TOKEN, &[("username", "secretary"), ("whose", "person")]);
+    fix.write_draft(
+        TOKEN,
+        &[
+            ("username", "secretary"),
+            ("whose", "person"),
+            ("address_outside", ""),
+        ],
+    );
     fix.mail("one", "applicant@example.invalid", TOKEN, GOOD_KEY);
 
     let out = fix.drain();
@@ -3725,12 +3734,39 @@ fn a_mailed_key_is_filed_against_the_draft_and_the_spool_empties() {
     );
 }
 
-/// A draft that recorded an address outside the platform takes its mailed key
-/// only from that address: another sender cannot replace the key the approval
-/// will encrypt future mail to.
+/// A key mailed before the address page has no answer to work from, and filing
+/// it would let the capsule skip the key page the applicant never saw. The
+/// spool is drained and the draft keeps no key; the capsule still asks.
 #[test]
-fn a_mailed_key_from_another_address_does_not_replace_the_drafts_key() {
-    let fix = Fix::new("mail-key-wrong-sender");
+fn a_mailed_key_before_the_address_page_is_not_filed() {
+    let fix = Fix::new("mail-key-before-address");
+    fix.write_draft(TOKEN, &[("username", "secretary"), ("whose", "person")]);
+    fix.mail("one", "applicant@example.invalid", TOKEN, GOOD_KEY);
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.names("mail/new").is_empty(), "the spool is drained");
+    let draft: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    assert!(
+        draft["mail_keys"]
+            .as_array()
+            .is_none_or(|keys| keys.is_empty()),
+        "a key was filed before the address page: {draft}"
+    );
+    assert!(
+        fix.sent().is_empty(),
+        "there is no address to answer: {}",
+        fix.sent()
+    );
+}
+
+/// The token in the Subject is the capability: `smtpd` authenticates neither
+/// the envelope sender nor the From header, so a From comparison would be a
+/// pretence. Any sender holding the token files the key once the address page
+/// is answered; a second key is still refused by the one-key rule, and the
+/// refusal goes to the recorded address rather than the sender.
+#[test]
+fn a_mailed_key_is_authorised_by_the_token_not_the_sender() {
+    let fix = Fix::new("mail-key-token");
     fix.write_draft(
         TOKEN,
         &[
@@ -3739,12 +3775,17 @@ fn a_mailed_key_from_another_address_does_not_replace_the_drafts_key() {
             ("address_outside", "applicant@example.invalid"),
         ],
     );
-    fix.mail("one", "applicant@example.invalid", TOKEN, GOOD_KEY);
+    fix.mail("one", "attacker@example.invalid", TOKEN, GOOD_KEY);
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
-    let before: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
-    let key = before["mail_keys"][0].clone();
+    let filed: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
+    let key = filed["mail_keys"][0].clone();
     assert_eq!(key["mailbox"], "secretary");
+    assert!(
+        fix.sent().is_empty(),
+        "the token holder is not answered: {}",
+        fix.sent()
+    );
 
     const OTHER_KEY: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\
                              mAYEAAAAABK4BgQAAAAAEQ==\n\
@@ -3753,14 +3794,10 @@ fn a_mailed_key_from_another_address_does_not_replace_the_drafts_key() {
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
     let after: Value = serde_json::from_str(&fix.read(&format!("drafts/{TOKEN}.json"))).unwrap();
-    assert_eq!(
-        after["mail_keys"],
-        json!([key]),
-        "the key was replaced by another sender"
-    );
+    assert_eq!(after["mail_keys"], json!([key]), "the key was replaced");
     assert!(
-        fix.sent().contains("did not come from the address"),
-        "{}",
+        fix.sent().contains("already filed"),
+        "the refusal is not the one-key rule: {}",
         fix.sent()
     );
     assert!(
@@ -3771,13 +3808,19 @@ fn a_mailed_key_from_another_address_does_not_replace_the_drafts_key() {
 }
 
 /// A draft holds one key per mailbox: a second mailed key is refused rather than
-/// replacing the first. smtpd authenticates neither the From header nor an
-/// inbound envelope sender, and the draft recorded no address to answer, so the
-/// refusal is the control and the forged sender gets no mail back.
+/// replacing the first. The address answer is empty, so there is no address to
+/// answer and the forged sender gets no mail back.
 #[test]
 fn a_second_mailed_key_does_not_replace_the_first() {
     let fix = Fix::new("mail-key-second");
-    fix.write_draft(TOKEN, &[("username", "secretary"), ("whose", "person")]);
+    fix.write_draft(
+        TOKEN,
+        &[
+            ("username", "secretary"),
+            ("whose", "person"),
+            ("address_outside", ""),
+        ],
+    );
     fix.mail("one", "applicant@example.invalid", TOKEN, GOOD_KEY);
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
@@ -3806,7 +3849,14 @@ fn a_second_mailed_key_does_not_replace_the_first() {
 #[test]
 fn a_mailed_key_does_not_replace_a_key_the_form_filed() {
     let fix = Fix::new("mail-key-form-first");
-    fix.write_draft(TOKEN, &[("username", "secretary"), ("whose", "person")]);
+    fix.write_draft(
+        TOKEN,
+        &[
+            ("username", "secretary"),
+            ("whose", "person"),
+            ("address_outside", ""),
+        ],
+    );
     fix.mail("one", "applicant@example.invalid", TOKEN, GOOD_KEY);
     let out = fix.drain();
     assert!(out.status.success(), "{}", body(&out));
@@ -3888,8 +3938,8 @@ fn a_colliding_block_does_not_discard_the_others() {
     );
 }
 
-/// The address the draft recorded still files its key, including when the From
-/// header carries a display name.
+/// A mailed key files whatever the From header carries, display name or not:
+/// the token authorises it, not the sender.
 #[test]
 fn a_mailed_key_from_the_recorded_address_is_filed() {
     let fix = Fix::new("mail-key-right-sender");
