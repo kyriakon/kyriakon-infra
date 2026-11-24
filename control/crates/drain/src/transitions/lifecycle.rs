@@ -2489,6 +2489,42 @@ pub async fn upload_key(
             )))
         }
     }
+    // Announce the change on every address the account holds, before the record
+    // update makes a removal unretriable: a retry after a failed enqueue finds
+    // the key still recorded and sends again. The intent's id is part of the
+    // notice type, so a later change warns again while a retry of this one stays
+    // deduplicated; the subject carries the action and the fingerprint.
+    let changed = if intent.action == "add" {
+        "added"
+    } else {
+        "removed"
+    };
+    let fingerprint = account
+        .upload_keys
+        .first()
+        .map(|key| key.fingerprint.as_str())
+        .unwrap_or(intent.fingerprint.as_str());
+    let subject =
+        format!("The upload key on your kyriakon.net account was {changed} ({fingerprint})");
+    let body = format!(
+        "The upload key on the kyriakon.net account {} was {changed} from the account \
+         page.\n\n\
+         Its fingerprint is {fingerprint}.\n\n\
+         If you did not make this change, write to admin@kyriakon.net now. A key gives \
+         sftp and git access to your published tree and repositories, and one added by \
+         someone else keeps working after you sign out.\n",
+        account.username
+    );
+    rotation_notices(
+        cfg,
+        store,
+        &account,
+        notice::UPLOAD_KEY_CHANGED,
+        &intent.id,
+        &subject,
+        &body,
+    )
+    .await?;
     let upload_keys = account.upload_keys.clone();
     let site_served = account.site_served;
     let capsule_served = account.capsule_served;

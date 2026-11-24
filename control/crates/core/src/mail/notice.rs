@@ -73,6 +73,10 @@ pub const LIFECYCLE: [&str; 8] = [
     GROUP_FINAL,
 ];
 
+/// An upload key was added or removed from the account page. It is not a
+/// lifecycle notice; the bounce parser never acts on it.
+pub const UPLOAD_KEY_CHANGED: &str = "upload-key.changed";
+
 /// Enqueue one message through the enqueuer the config names. The message gets a
 /// fresh Message-ID; nothing records it, because this path is for a reply or an
 /// operator alert rather than a notice a DSN can be matched against.

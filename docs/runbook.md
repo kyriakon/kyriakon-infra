@@ -326,7 +326,7 @@ The drain removes the domain's lines from the mail tables, its generated vhosts,
 
 ### Hand a site to a replacement owner
 
-A site owner leaving the group hands the role to the replacement the removal intent names. The drain builds the replacement's tree, runs the three lanes at it, writes the replacement into `group.json`, and mails them once if they hold no key. It copies no key. The replacement adds their own upload key from the account page, and that runs the three lanes again. Until then the site serves what is already in the tree and nothing can be uploaded.
+A site owner leaving the group hands the role to the replacement the removal intent names. The drain builds the replacement's tree, runs the three lanes at it, writes the replacement into `group.json`, and mails them once if they hold no key. It copies no key. The replacement adds their own upload key from the account page, re-entering the mail password, and that runs the three lanes again. Until then the site serves what is already in the tree and nothing can be uploaded.
 
 Past handovers copied the departing owner's key into the replacement's key file, so compare the two when a site changes hands:
 
