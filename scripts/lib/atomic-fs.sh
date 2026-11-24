@@ -312,9 +312,7 @@ lock_dir_stale() {
 		;;
 	esac
 	if kill -0 "$pid" 2>/dev/null; then
-		# A live owner is holding it, however long the write is taking. This is
-		# the rule the Rust drain's TableLock follows, so the two exclude each
-		# other rather than one reaping the other's lock.
+		# A live owner is holding it, however long the write is taking.
 		return 0
 	fi
 	lock_stale_reason="the owner pid $pid is gone"
@@ -340,19 +338,13 @@ unlock_dir() {
 }
 
 
-# table_lock <table> [tries] [interval]: the mail tables' lock, with the pid
-# file the drain's Rust writer also uses. Returns 0, 1 (live holder) or 2.
-table_lock() {
+# gate_lock <path> [tries] [interval]: the mkdir lock for the login checker's
+# attempt gate. It is not the mail tables' lock: those are written by the drain's
+# mail-table command under a kernel flock. Returns 0, 1 (live holder) or 2.
+gate_lock() {
 	lock_dir "$1.lock" "${2:-5}" "${3:-1}" 30
 }
 
-# table_lock_stale <table>: why <table>.lock is not being held by a live writer,
-# one line, or nothing when it is absent or looks live. check-hygiene.sh reads it.
-table_lock_stale() {
-	lock_dir_stale "$1.lock" 30
-	[ -z "$lock_stale_reason" ] || printf '%s\n' "$lock_stale_reason"
-}
-
-table_unlock() {
+gate_unlock() {
 	unlock_dir "$1.lock"
 }

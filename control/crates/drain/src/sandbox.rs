@@ -36,18 +36,17 @@ use kyriakon_control_core::sandbox;
 /// * `wpath`: writing the rate cache, the mail tables, store records, proofs and
 ///   the export bundle.
 /// * `cpath`: creating, renaming and removing those files, the `<table>.lock`
-///   directories and the store's intent/record removals.
+///   files and the store's intent/record removals.
 /// * `fattr`: `set_permissions` on the rate cache, the table temp file, the
 ///   keyring `.asc` and every directory `ensure_dir_owned` repairs.
 /// * `chown`: changing the owner, which `fattr` alone refuses with `EPERM`:
 ///   `export::write_tree` hands each bundle file to the member's uid, and
 ///   `Store::ensure_dir_owned` hands `accounts/<name>/` to the store's owner.
-/// * `flock`: `Store::try_lock`'s `.drain.lock` and the ledger's
-///   `payments.jsonl.lock`.
+/// * `flock`: `Store::try_lock`'s `.drain.lock`, the ledger's
+///   `payments.jsonl.lock` and the mail table's `<table>.lock`.
 /// * `proc`: fork for every `Command`, and `wait4` on the child.
 /// * `exec`: `execve` of the configured scripts, `sendmail`, `gpg`, `dig`,
-///   `repquota`, `curl` and `/bin/kill`, the last for the stale-lock liveness
-///   check.
+///   `repquota` and `curl`.
 ///
 /// Not present, because nothing in a pass asks for it: `inet` and `dns` (the
 /// network calls are the `curl` and `dig` children, which start unpledged),
@@ -88,12 +87,6 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     unveil(&cfg.repquota, "x")?;
     // The HTTPS client the rate cache is fetched with.
     unveil(&cfg.rates_fetch, "x")?;
-    // The liveness check `groups::stale_table_lock` runs on a `<table>.lock`
-    // owner's pid. The path is a literal in that function rather than a config
-    // value because `/bin/kill` is base-system, and without this entry the check
-    // reads a failed spawn as "the owner is alive", so a stale lock is never
-    // reaped and every table write fails forever.
-    unveil("/bin/kill", "x")?;
     // The box keyring: `boxrun::write_public_key` writes an approved member's
     // `.asc`, and the export reads it back.
     unveil(&cfg.keyring_dir, "rwc")?;
@@ -111,10 +104,9 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     // as argv to `stripe-api.sh` and `publish-mail-key.sh`, which read them
     // after `execve` has dropped this process's unveils.
     unveil(&cfg.stripe_webhook_secret, "r")?;
-    // The five mail tables. Each is rewritten through a sibling
-    // `<name>.onboard.<pid>` and guarded by a `<name>.lock` directory whose
-    // `pid` file is read back on a stale lock, so the containing directory
-    // needs read, write and create. The files themselves are covered by it.
+    // The five mail tables. Each is replaced through a sibling candidate and a
+    // `<name>.lock` kernel-flock file, so the containing directory needs read,
+    // write and create. The files themselves are covered by it.
     for table in [
         &cfg.mail_domains,
         &cfg.virtuals,
@@ -230,7 +222,7 @@ fn probe_pass_paths(cfg: &DrainConfig) -> Result<(), Error> {
     // operation, so it is refused by an `x`-only rule, and probing them would
     // fail every pass. `unveil` itself already fails on a target that does not
     // exist; a target whose entry is missing fails at `execve` with `ENOENT`,
-    // which the fixture catches for `/bin/kill` through the stale lock.
+    // which the fixture catches for a configured script.
     Ok(())
 }
 

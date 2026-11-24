@@ -236,7 +236,10 @@ configuration and the member's certificate material. The proposal's section 5.9.
 The order matters: remove `/etc/httpd.d/<name>.conf`, `/etc/gmid.d/<name>.kyriakon.net.conf`
 and `/etc/acme-client.d/<name>.kyriakon.net.conf`, regenerate the three indexes and reload
 the daemons, and only then remove the public tree and the account, so a daemon is never
-serving a config that names a file which has already gone. The certificate material for the
+serving a config that names a file which has already gone. Before the account goes, the
+mail tables are made durable and smtpd reloaded, so a table write that fails leaves an
+account a retry can still find rather than mail routed at a mailbox that has gone
+([#885](https://github.com/kyriakon/kyriakon-infra/issues/885)). The certificate material for the
 member's name is removed with it. What deletion does to the member's data, the export and
 the backup window is [#241](https://github.com/kyriakon/kyriakon-infra/issues/241)'s.
 

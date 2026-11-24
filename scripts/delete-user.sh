@@ -214,6 +214,43 @@ remove_member() {
 		fi
 	done
 
+	# The mail tables go before the account and its home (#885): a table write
+	# that fails after `userdel -r` leaves mail routed at a mailbox that no
+	# longer exists. The reload follows the writes, so smtpd has stopped routing
+	# to the address before the account it named is gone. The notes about kept
+	# aliases stay below, after the account, where they are only printed.
+	mail_changed=no
+	if [ "$show" = no ] && [ -f "$virtuals" ]; then
+		drop_rc=0
+		remove_own_addresses || drop_rc=$?
+		if [ "$drop_rc" -gt 1 ]; then
+			printf 'the address lines for %s@ were not removed from %s; fix the table, then rerun\n' \
+				"$user" "$virtuals" >&2
+			return 1
+		fi
+		if [ "$drop_rc" -eq 0 ]; then
+			printf 'removed the address lines for %s@ from %s\n' "$user" "$virtuals"
+			mail_changed=yes
+		fi
+	fi
+	if [ "$show" = no ] && [ -f "$mail_from" ]; then
+		drop_rc=0
+		remove_own_senders || drop_rc=$?
+		if [ "$drop_rc" -gt 1 ]; then
+			printf 'the sender line for %s was not removed from %s; fix the table, then rerun\n' \
+				"$user" "$mail_from" >&2
+			return 1
+		fi
+		if [ "$drop_rc" -eq 0 ]; then
+			printf 'removed the sender line for %s from %s\n' "$user" "$mail_from"
+			mail_changed=yes
+		fi
+	fi
+	if [ "$mail_changed" = yes ]; then
+		restart_smtpd
+		printf 'restarted smtpd, which reads the tables at start\n'
+	fi
+
 	# 5 and 6. The account, its home and the Maildir inside it, and the allowance
 	# record that belongs to it. Both are guarded on the account still being
 	# there, which is what makes a second run print nothing and call nothing:
@@ -269,33 +306,11 @@ remove_member() {
 		fi
 	fi
 
-	# 7. The member's own line in the mail virtual table, which provisioning
-	# wrote and nothing else removes. A lookup that finds nothing there has
-	# nothing to expand to, so the address starts bouncing at RCPT time, which is
-	# the point: a deleted member is not a catch-all.
-	#
-	# The senders mapping beside it holds the same identity on this account's
-	# line, and is what the listeners check: a line left there still lets the
-	# account submit this deleted address as its envelope sender. Both tables go
-	# under one restart, because smtpd reads either at start.
-	mail_changed=no
+	# The notes on entries the removal kept. The member's own lines went before
+	# the account; these say what is left and why, and are what --show prints.
 	if [ -f "$virtuals" ]; then
-		if [ "$show" = yes ]; then
-			if [ -n "$(own_virtual_keys)" ]; then
-				printf 'would remove the address lines for %s@\n' "$user"
-			fi
-		else
-			drop_rc=0
-			remove_own_addresses || drop_rc=$?
-			if [ "$drop_rc" -gt 1 ]; then
-				printf 'the address lines for %s@ were not removed from %s; fix the table, then rerun\n' \
-					"$user" "$virtuals" >&2
-				return 1
-			fi
-			if [ "$drop_rc" -eq 0 ]; then
-				printf 'removed the address lines for %s@ from %s\n' "$user" "$virtuals"
-				mail_changed=yes
-			fi
+		if [ "$show" = yes ] && [ -n "$(own_virtual_keys)" ]; then
+			printf 'would remove the address lines for %s@\n' "$user"
 		fi
 		# An address that points at this member without being theirs is a body's
 		# alias or the platform's own. Removing it silently would break someone
@@ -329,28 +344,10 @@ remove_member() {
 				"$user" "$unparsed" >&2
 		fi
 	fi
-	if [ -f "$mail_from" ]; then
-		if [ "$show" = yes ]; then
-			if awk -v u="$user" -F: '$1 == u' "$mail_from" | grep -q .; then
-				printf 'would remove the sender line for %s\n' "$user"
-			fi
-		else
-			drop_rc=0
-			remove_own_senders || drop_rc=$?
-			if [ "$drop_rc" -gt 1 ]; then
-				printf 'the sender line for %s was not removed from %s; fix the table, then rerun\n' \
-					"$user" "$mail_from" >&2
-				return 1
-			fi
-			if [ "$drop_rc" -eq 0 ]; then
-				printf 'removed the sender line for %s from %s\n' "$user" "$mail_from"
-				mail_changed=yes
-			fi
+	if [ "$show" = yes ] && [ -f "$mail_from" ]; then
+		if awk -v u="$user" -F: '$1 == u' "$mail_from" | grep -q .; then
+			printf 'would remove the sender line for %s\n' "$user"
 		fi
-	fi
-	if [ "$mail_changed" = yes ]; then
-		restart_smtpd
-		printf 'restarted smtpd, which reads the tables at start\n'
 	fi
 
 	# The control plane's record of the account, last. The note below says the
@@ -407,12 +404,13 @@ own_virtual_keys() {
 remove_own_addresses() {
 	typeset key status=1 rc
 	keys=$(own_virtual_keys) || return 2
-	# Each table_drop keeps the table it replaced; with more than one key only
-	# the last copy survives, so this is not a one-step undo.
+	# Each drop is a separate write under the kernel lock, and the table atomically
+	# replaced; a failure part-way leaves the earlier keys gone, which a rerun
+	# finishes.
 	# shellcheck disable=SC2086 # one address per word; an address carries no whitespace
 	for key in $keys; do
 		rc=0
-		table_drop "$virtuals" exact "$key" >/dev/null || rc=$?
+		mail_table drop "$virtuals" exact "$key" >/dev/null || rc=$?
 		case $rc in
 		2) return 2 ;;
 		0) status=0 ;;
@@ -427,7 +425,7 @@ remove_own_addresses() {
 # the line, as its virtuals line does, and the note above names it.
 # Returns 0 when the file changed, 1 when it did not, and 2 when the write failed.
 remove_own_senders() {
-	table_drop "$mail_from" exact "$user"
+	mail_table drop "$mail_from" exact "$user"
 }
 
 # --- the self-test ----------------------------------------------------------
@@ -459,6 +457,9 @@ self_test() {
 
 	mkdir -p "$httpd_d" "$gmid_d" "$acme_d" "$ssl_private" "$www_root" \
 		"$(dirname "$virtuals")" "$authorized_keys_dir"
+
+	KYRIAKON_DRAIN=$(self_test_mail_table "$tree")
+	export KYRIAKON_DRAIN
 
 	# The predicate and the steps, recorded rather than run.
 	# require_member reads uid and home; the fixture accounts answer from the
@@ -526,6 +527,35 @@ self_test() {
 		"$(grep -c 'not a member account (missing account)' "$tree/root.err")" 1
 	user=alice
 
+	# A table write that fails aborts before the account or its home is touched:
+	# the account is what a retry can still find, and a deleted one with a live
+	# virtuals line bounces at RCPT time (#885).
+	: >"$case_dir/calls"
+	: >"$virtuals.fail"
+	code=0
+	remove_member >"$tree/fail.out" 2>"$tree/fail.err" || code=$?
+	check "a table failure aborts the removal" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and no account removal ran" "$(grep -c 'userdel' "$case_dir/calls" || true)" 0
+	check "and the home is untouched" \
+		"$([ -d "$HOME_ROOT/$user" ] && printf present || printf gone)" present
+	check "and the address still points at it" \
+		"$(awk '/^alice@kyriakon.net/' "$virtuals" | wc -l | tr -d ' ')" 1
+	rm -f "$virtuals.fail"
+
+	# The sender table's failure aborts before the account in the same way; the
+	# virtuals lines may already be gone, which a rerun finishes.
+	: >"$mail_from.fail"
+	code=0
+	remove_member >"$tree/fail-sender.out" 2>"$tree/fail-sender.err" || code=$?
+	check "a sender-table failure aborts the removal" \
+		"$([ "$code" -ne 0 ] && printf yes || printf no)" yes
+	check "and no account removal ran for it" \
+		"$(grep -c 'userdel' "$case_dir/calls" || true)" 0
+	check "and the home is untouched" \
+		"$([ -d "$HOME_ROOT/$user" ] && printf present || printf gone)" present
+	rm -f "$mail_from.fail"
+
 	remove_member >"$tree/first.out" 2>"$tree/first.err"
 	check "the vhost went" "$([ -e "$httpd_d/$user.kyriakon.net.conf" ] && echo present || echo gone)" gone
 	check "the capsule block went" "$([ -e "$gmid_d/$user.kyriakon.net.conf" ] && echo present || echo gone)" gone
@@ -553,10 +583,12 @@ self_test() {
 	check "and the address that delivered into them went with its line" \
 		"$(grep -c 'secretary@parish.example' "$mail_from" || true)" 0
 	check "the order starts with the indexes" "$(awk 'NR == 1' "$case_dir/calls")" 'cron-apply --web'
-	check "and the account goes last of the tools" "$(awk 'NR == 3' "$case_dir/calls")" 'userdel -r alice'
+	check "the tables are reloaded before the account goes" \
+		"$(awk 'NR == 2' "$case_dir/calls")" 'rcctl restart smtpd'
+	check "and the account goes after them" "$(awk 'NR == 4' "$case_dir/calls")" 'userdel -r alice'
 	check "smtpd restarted once, after both mail tables" \
 		"$(grep -c 'rcctl restart smtpd' "$case_dir/calls")" 1
-	check "the member's group goes after the account" "$(awk 'NR == 4' "$case_dir/calls")" 'groupdel alice'
+	check "the member's group goes after the account" "$(awk 'NR == 5' "$case_dir/calls")" 'groupdel alice'
 	check "the finger page is regenerated last" \
 		"$(tail -1 "$case_dir/calls")" 'gen-finger-page'
 	# The store's record goes too: the drain reads it to decide whether a name is

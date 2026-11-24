@@ -10,6 +10,12 @@
 //! Usage:
 //!
 //!   kyriakon-control-drain [--config PATH]
+//!   kyriakon-control-drain mail-table <verb> <table> ...
+//!
+//! `mail-table` is the one writer of the five `/etc/mail` tables. The shell
+//! scripts run it rather than carrying their own writer; the verbs are
+//! `add`, `set`, `drop`, `map-add` and `regenerate` (rebuild `mail_from` from
+//! passwd and the virtual table, under the lock).
 //!
 //! The config defaults to `/etc/kyriakon/onboard/drain.toml`.
 
@@ -17,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use kyriakon_control_core::config::DrainConfig;
+use kyriakon_control_core::mail::table::{DropMode, Table};
 use kyriakon_control_core::store::Store;
 use kyriakon_control_drain::transitions::Error;
 
@@ -35,6 +42,7 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "mail-table" => return mail_table(args.collect()),
             other => {
                 Error::Failed(format!(
                     "unknown argument {other:?}; usage: kyriakon-control-drain [--config PATH]"
@@ -50,6 +58,109 @@ async fn main() -> ExitCode {
             e.report("the drain");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Exit codes the scripts act on: 0 changed, 1 unchanged, 2 failed. `add`,
+/// `set` and `regenerate` return 0 on success whether or not they changed the
+/// file; `drop` and `map-add` use 1 for "nothing to do".
+fn mail_table(args: Vec<String>) -> ExitCode {
+    match run_mail_table(&args) {
+        Ok(code) => ExitCode::from(code),
+        Err(e) => {
+            e.report("the mail table");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run_mail_table(args: &[String]) -> Result<u8, Error> {
+    let usage = "usage: kyriakon-control-drain mail-table \
+                 <add|set|drop|map-add|regenerate> <table> ...";
+    let (verb, rest) = args
+        .split_first()
+        .ok_or_else(|| Error::Failed(usage.to_string()))?;
+    let (path, rest) = rest
+        .split_first()
+        .ok_or_else(|| Error::Failed(usage.to_string()))?;
+    let table = Table::at(path).map_err(Error::from)?;
+    let changed = |change: kyriakon_control_core::mail::table::Change| {
+        if change.changed {
+            0
+        } else {
+            1
+        }
+    };
+    match verb.as_str() {
+        "add" => {
+            let (name, rest) = rest
+                .split_first()
+                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            let value = rest.first().map(String::as_str);
+            let change = table.ensure(name, value).map_err(Error::from)?;
+            println!("{}", if change.added { "added" } else { "present" });
+            Ok(0)
+        }
+        "set" => {
+            let line = rest
+                .first()
+                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            let change = table.set(line).map_err(Error::from)?;
+            println!(
+                "{}",
+                if change.added {
+                    "added"
+                } else if change.changed {
+                    "set"
+                } else {
+                    "unchanged"
+                }
+            );
+            Ok(0)
+        }
+        "drop" => {
+            let (how, rest) = rest
+                .split_first()
+                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            let text = rest
+                .first()
+                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            let how = DropMode::parse(how).map_err(Error::from)?;
+            Ok(changed(table.drop(how, text).map_err(Error::from)?))
+        }
+        "map-add" => {
+            let (key, rest) = rest
+                .split_first()
+                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            let value = rest
+                .first()
+                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            Ok(changed(table.map_add(key, value).map_err(Error::from)?))
+        }
+        "regenerate" => {
+            let (passwd, rest) = rest
+                .split_first()
+                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            let (virtuals, rest) = rest
+                .split_first()
+                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            let domain = rest
+                .first()
+                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            let change = table
+                .regenerate_senders(Path::new(passwd), Path::new(virtuals), domain)
+                .map_err(Error::from)?;
+            println!(
+                "{}",
+                if change.changed {
+                    "replaced"
+                } else {
+                    "unchanged"
+                }
+            );
+            Ok(0)
+        }
+        _ => Err(Error::Failed(usage.to_string())),
     }
 }
 

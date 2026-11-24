@@ -144,12 +144,12 @@ remove_path() {
 
 # drop_table <table> <exact|prefix|suffix> <text> <message>
 #
-# One table_drop call and its report, with 2 (failure) kept apart from 1 (no
-# match): a failed write must stop the removal, not read as nothing to do.
+# One mail-table drop call and its report, with 2 (failure) kept apart from 1
+# (no match): a failed write must stop the removal, not read as nothing to do.
 # Sets tables_changed when the table changed, and returns 1 on a failed write.
 drop_table() {
 	typeset table="$1" mode="$2" text="$3" message="$4" rc=0
-	table_drop "$table" "$mode" "$text" || rc=$?
+	mail_table drop "$table" "$mode" "$text" || rc=$?
 	case $rc in
 	0)
 		printf '%s\n' "$message"
@@ -230,6 +230,8 @@ self_test() {
 	self_test_begin
 	# shellcheck disable=SC2154 # set by self_test_begin in lib.sh
 	tree=$self_test_work
+	KYRIAKON_DRAIN=$(self_test_mail_table "$tree")
+	export KYRIAKON_DRAIN
 
 	mail_domains="$tree/etc/mail/mail_domains"
 	virtuals="$tree/etc/mail/virtuals"
@@ -361,8 +363,6 @@ self_test() {
 	check "the other body's files stayed" \
 		"$([ -e "$httpd_d/$other.conf" ] && [ -e "$ssl_private/$other.key" ] \
 			&& [ -e "$acme_queue_dir/pending/$other" ] && echo present || echo gone)" present
-	check "a copy of the old table was kept" \
-		"$(find "$(dirname "$mail_domains")" -name 'mail_domains.*.bak' | wc -l | tr -d ' ')" 1
 	check "smtpd was restarted once" "$(grep -c '^reload-smtpd$' "$calls")" 1
 	check "and spamd, whose allow list lost the line" \
 		"$(grep -c '^reload-spamd$' "$calls")" 1

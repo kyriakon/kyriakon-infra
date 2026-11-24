@@ -23,6 +23,7 @@ use kyriakon_control_core::flow::questions;
 use kyriakon_control_core::flow::validate;
 use kyriakon_control_core::intent::ADDRESS_ACTIONS;
 use kyriakon_control_core::mail::notice;
+use kyriakon_control_core::mail::table::Table;
 use kyriakon_control_core::payments::ledger::{Ledger, LedgerLine};
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::{
@@ -35,7 +36,6 @@ use serde_json::json;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
-use std::os::unix::fs::PermissionsExt;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -687,99 +687,6 @@ async fn write_group_account(
         .await
 }
 
-/// The lock every writer of a mail table holds: a `<table>.lock` directory with
-/// the owner's pid inside. The shell scripts take the same directory in lib.sh's
-/// table_lock, with the same pid file and the same stale rule, so a drain append
-/// and an operator deploy or delete exclude each other. Releasing is the Drop
-/// impl, so an early return cannot leave it behind.
-struct TableLock {
-    dir: std::path::PathBuf,
-}
-
-impl TableLock {
-    fn acquire(path: &str) -> Result<TableLock, Error> {
-        let dir = std::path::PathBuf::from(format!("{path}.lock"));
-        let mut reaped = false;
-        for attempt in 0..5 {
-            match std::fs::create_dir(&dir) {
-                Ok(()) => {
-                    if let Err(e) =
-                        std::fs::write(dir.join("pid"), format!("{}\n", std::process::id()))
-                    {
-                        let _ = std::fs::remove_dir_all(&dir);
-                        return Err(Error::Failed(format!(
-                            "cannot write the owner pid into {}: {e}",
-                            dir.display()
-                        )));
-                    }
-                    return Ok(TableLock { dir });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if !reaped {
-                        if let Some(reason) = stale_table_lock(&dir) {
-                            Error::Failed(reason)
-                                .report(&format!("reaping stale lock {}", dir.display()));
-                            let _ = std::fs::remove_dir_all(&dir);
-                            reaped = true;
-                            continue;
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(Error::Failed(format!("cannot lock {path}: {e}")));
-                }
-            }
-            if attempt < 4 {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-        }
-        Err(Error::Failed(format!(
-            "could not lock {path}: {} exists and did not clear; remove it if no writer is running",
-            dir.display()
-        )))
-    }
-}
-
-impl Drop for TableLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Why `<table>.lock` is not being held by a live writer, or `None` when it
-/// looks live. The pid file is the first answer; a lock old enough that no
-/// legitimate write could still hold it is the second, which also covers a
-/// writer killed between mkdir and the pid write.
-fn stale_table_lock(dir: &std::path::Path) -> Option<String> {
-    if let Ok(text) = std::fs::read_to_string(dir.join("pid")) {
-        let pid = text.trim();
-        if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) {
-            let alive = std::process::Command::new("/bin/kill")
-                .arg("-0")
-                .arg(pid)
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(true);
-            if !alive {
-                return Some(format!("pid {pid} is gone"));
-            }
-            // A live owner is holding it, however long the write is taking.
-            return None;
-        }
-    }
-    let held = std::fs::metadata(dir)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok());
-    if let Some(held) = held {
-        if held.as_secs() > 30 {
-            return Some(format!("it has been held for {} seconds", held.as_secs()));
-        }
-    }
-    None
-}
-
 /// The group's domain in the three tables that name it: smtpd's domain table,
 /// the DKIM filter's list and spamd's greylist pass-through list. The last is
 /// not a mail route: a destination domain absent from it is not greylisted, it
@@ -792,200 +699,46 @@ fn ensure_group_domain(cfg: &DrainConfig, domain: &str) -> Result<(), Error> {
     ensure_table_line(&cfg.spamd_alloweddomains, &format!("@{domain}"), None)
 }
 
-/// Ensure one line is in a virtual table: a bare value when `value` is `None`
-/// (a `mail_domains` line), and `name: value` otherwise (a `virtuals` entry). A
-/// key already present with the same value is left alone; one present with a
-/// different value is a refusal, because overruling it would silently redirect
-/// somebody's mail. Written through a temporary in the same directory, so smtpd
-/// never reads half a table.
+/// Ensure one line is in a table: a bare value when `value` is `None`
+/// (a `mail_domains` line), and `name: value` otherwise (a `virtuals` entry).
+/// The module owns the lock and the atomic rename.
 fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), Error> {
-    let _lock = TableLock::acquire(path)?;
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        Error::context(
-            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
-            e,
-        )
-    })?;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        match value {
-            None if line == name => return Ok(()),
-            None => {}
-            Some(want) => {
-                let (key, have) = line.split_once(':').unwrap_or((line, ""));
-                if key.trim() == name {
-                    if have.trim() == want {
-                        return Ok(());
-                    }
-                    return Err(Error::Failed(format!(
-                        "{path} already maps {name} to {}, not {want}",
-                        have.trim()
-                    )));
-                }
-            }
-        }
-    }
-    let line = match value {
-        Some(v) => format!("{name}: {v}"),
-        None => name.to_string(),
-    };
-    // Append rather than rewrite. A rewrite reads the whole table and renames a
-    // copy over it, so a line another writer appended between the read and the
-    // rename is lost; one approval runs subprocesses and a network call, so two
-    // passes overlap. The lock above is what excludes a shell writer, and the
-    // append itself cannot lose a line. The newline guard is the same one
-    // deploy-mail.sh uses: a hand edit may have left the last line unterminated.
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| Error::context(format!("cannot open {path}"), e))?;
-    let mut entry = String::new();
-    if !text.is_empty() && !text.ends_with('\n') {
-        entry.push('\n');
-    }
-    entry.push_str(&line);
-    entry.push('\n');
-    std::io::Write::write_all(&mut file, entry.as_bytes())
-        .map_err(|e| Error::context(format!("cannot append to {path}"), e))
+    Table::at(path)?.ensure(name, value).map_err(Error::from)?;
+    Ok(())
 }
 
 /// The value a virtual table maps `name` to, or `None` when the key is absent.
 fn table_value(path: &str, name: &str) -> Result<Option<String>, Error> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        Error::context(
-            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
-            e,
-        )
-    })?;
-    for line in text.lines() {
-        if let Some((key, value)) = line.split_once(':') {
-            if key.trim() == name {
-                return Ok(Some(value.trim().to_string()));
-            }
-        }
-    }
-    Ok(None)
+    Table::at(path)?.lookup(name).map_err(Error::from)
 }
 
 /// How many addresses the body's domain has: every `<localpart>@<domain>` line,
 /// mailboxes and aliases alike, which is the ten-address cap's count.
 fn address_count(path: &str, domain: &str) -> Result<usize, Error> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        Error::context(
-            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
-            e,
-        )
-    })?;
-    let suffix = format!("@{domain}");
-    Ok(text
-        .lines()
-        .filter(|line| {
-            line.split_once(':')
-                .map(|(key, _)| key.trim().ends_with(&suffix))
-                .unwrap_or(false)
-        })
-        .count())
+    Table::at(path)?
+        .count_suffix(&format!("@{domain}"))
+        .map_err(Error::from)
 }
 
-/// Rewrite a table through a temporary beside it, then rename it into place.
-/// The `TableLock` argument is the proof that the caller holds the table's lock
-/// for the read that produced `text` as well as this write: an unlocked rewrite
-/// would drop a line another writer appended between the two.
-fn write_table(path: &str, text: &str, _lock: &TableLock) -> Result<(), Error> {
-    let candidate = format!("{path}.onboard.{}", std::process::id());
-    std::fs::write(&candidate, text)
-        .map_err(|e| Error::context(format!("cannot write {candidate}"), e))?;
-    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644))
-        .map_err(|e| Error::context(format!("cannot set the mode on {candidate}"), e))?;
-    std::fs::rename(&candidate, path)
-        .map_err(|e| Error::context(format!("cannot replace {path}"), e))
-}
-
-/// Repoint an existing virtual entry, keeping every other line. A value that is
-/// already right is left alone, so an upgrade intent applied twice changes
-/// nothing. `ensure_table_line` refuses a different value on purpose (it must
-/// not overrule a line somebody else made), so this is the explicit repoint.
-///
+/// Repoint an existing virtual entry. A value that is already right is left
+/// alone, so an upgrade intent applied twice changes nothing. `ensure_table_line`
+/// refuses a different value on purpose (it must not overrule a line somebody
+/// else made), so this is the explicit repoint.
 fn repoint_table_line(path: &str, name: &str, want: &str) -> Result<(), Error> {
-    let lock = TableLock::acquire(path)?;
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        Error::context(
-            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
-            e,
-        )
-    })?;
-    let mut out = String::new();
-    let mut found = false;
-    for line in text.lines() {
-        if let Some((key, have)) = line.split_once(':') {
-            if key.trim() == name {
-                if have.trim() == want {
-                    return Ok(());
-                }
-                out.push_str(&format!("{name}: {want}\n"));
-                found = true;
-                continue;
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !found {
-        out.push_str(&format!("{name}: {want}\n"));
-    }
-    write_table(path, &out, &lock)
+    Table::at(path)?
+        .set(&format!("{name}: {want}"))
+        .map_err(Error::from)?;
+    Ok(())
 }
 
 /// Drop every line for `domain` that points at `mailbox`. That is the mailbox's
 /// own address and any alias into it, so no entry is left delivering nowhere.
 /// Returns whether the table changed.
 pub(super) fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, Error> {
-    let lock = TableLock::acquire(path)?;
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        Error::context(
-            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
-            e,
-        )
-    })?;
-    let suffix = format!("@{domain}");
-    let mut out = String::new();
-    let mut changed = false;
-    for line in text.lines() {
-        let remove = line
-            .split_once(':')
-            .map(|(key, value)| key.trim().ends_with(&suffix) && value.trim() == mailbox)
-            .unwrap_or(false);
-        if remove {
-            changed = true;
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if changed {
-        write_table(path, &out, &lock)?;
-    }
-    Ok(changed)
-}
-
-/// The addresses in a sender mapping line's value: comma-separated, trimmed,
-/// with empty entries dropped.
-fn sender_values(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// One sender mapping line in the shape deploy-mail.sh writes.
-fn sender_line(account: &str, values: &[String]) -> String {
-    format!("{account}: {}\n", values.join(","))
+    Ok(Table::at(path)?
+        .drop_delivering(&format!("@{domain}"), mailbox)
+        .map_err(Error::from)?
+        .changed)
 }
 
 /// Add `address` to `account`'s list in the sender mapping, creating the line
@@ -993,36 +746,9 @@ fn sender_line(account: &str, values: &[String]) -> String {
 /// retry changes nothing. The mapping is what the listeners' `senders` option
 /// checks, so an address here is one this account may submit as.
 fn ensure_sender(path: &str, account: &str, address: &str) -> Result<(), Error> {
-    let lock = TableLock::acquire(path)?;
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        Error::context(
-            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
-            e,
-        )
-    })?;
-    let mut out = String::new();
-    let mut found = false;
-    for line in text.lines() {
-        if let Some((key, value)) = line.split_once(':') {
-            if key.trim() == account {
-                found = true;
-                let mut values = sender_values(value);
-                if !values.iter().any(|v| v == address) {
-                    values.push(address.to_string());
-                }
-                out.push_str(&sender_line(account, &values));
-                continue;
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !found {
-        out.push_str(&sender_line(account, &[address.to_string()]));
-    }
-    if out != text {
-        write_table(path, &out, &lock)?;
-    }
+    Table::at(path)?
+        .map_add(account, address)
+        .map_err(Error::from)?;
     Ok(())
 }
 
@@ -1032,49 +758,10 @@ fn ensure_sender(path: &str, account: &str, address: &str) -> Result<(), Error> 
 /// `keep` has no line yet on a first upgrade, so one is appended. Returns
 /// whether the table changed.
 fn repoint_sender(path: &str, address: &str, keep: &str) -> Result<bool, Error> {
-    let lock = TableLock::acquire(path)?;
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        Error::context(
-            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
-            e,
-        )
-    })?;
-    let mut out = String::new();
-    let mut changed = false;
-    let mut found = false;
-    for line in text.lines() {
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim();
-            let mut values = sender_values(value);
-            if key == keep {
-                found = true;
-                if !values.iter().any(|v| v == address) {
-                    values.push(address.to_string());
-                    changed = true;
-                    out.push_str(&sender_line(key, &values));
-                    continue;
-                }
-            } else if values.iter().any(|v| v == address) {
-                values.retain(|v| v != address);
-                changed = true;
-                if values.is_empty() {
-                    continue;
-                }
-                out.push_str(&sender_line(key, &values));
-                continue;
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !found {
-        out.push_str(&sender_line(keep, &[address.to_string()]));
-        changed = true;
-    }
-    if changed {
-        write_table(path, &out, &lock)?;
-    }
-    Ok(changed)
+    Ok(Table::at(path)?
+        .map_move(address, keep)
+        .map_err(Error::from)?
+        .changed)
 }
 
 /// Drop every address on `domain` from `mailbox`'s sender line, dropping the
@@ -1085,41 +772,10 @@ pub(super) fn remove_senders_for_domain(
     domain: &str,
     mailbox: &str,
 ) -> Result<bool, Error> {
-    let lock = TableLock::acquire(path)?;
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        Error::context(
-            format!("cannot read {path}; run scripts/deploy-mail.sh first"),
-            e,
-        )
-    })?;
-    let suffix = format!("@{domain}");
-    let mut out = String::new();
-    let mut changed = false;
-    for line in text.lines() {
-        if let Some((key, value)) = line.split_once(':') {
-            if key.trim() == mailbox {
-                let values = sender_values(value);
-                let kept: Vec<String> = values
-                    .iter()
-                    .filter(|v| !v.ends_with(&suffix))
-                    .cloned()
-                    .collect();
-                if kept.len() != values.len() {
-                    changed = true;
-                }
-                if !kept.is_empty() {
-                    out.push_str(&sender_line(mailbox, &kept));
-                }
-                continue;
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if changed {
-        write_table(path, &out, &lock)?;
-    }
-    Ok(changed)
+    Ok(Table::at(path)?
+        .drop_sender_suffix(mailbox, &format!("@{domain}"))
+        .map_err(Error::from)?
+        .changed)
 }
 
 /// A username's hold, while it still has time to run. The date is the record's;
@@ -2177,65 +1833,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The lock the shell takes is `<table>.lock` with the owner's pid inside, so
-    /// this asserts the Rust side uses that path and file, and that dropping the
-    /// guard releases it. That shared shape is what lets a drain append and a
-    /// deploy's table_set exclude each other.
-    #[test]
-    fn the_mail_table_lock_is_a_pid_directory_beside_the_table() {
-        let dir = std::env::temp_dir().join(format!("onboard-table-lock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let table = dir.join("virtuals");
-        std::fs::write(&table, "hello: oliver\n").unwrap();
-        let path = table.to_str().unwrap();
-
-        let lock = TableLock::acquire(path).unwrap();
-        let lock_dir = dir.join("virtuals.lock");
-        assert!(
-            lock_dir.is_dir(),
-            "the lock is a directory beside the table"
-        );
-        assert_eq!(
-            std::fs::read_to_string(lock_dir.join("pid"))
-                .unwrap()
-                .trim(),
-            std::process::id().to_string(),
-            "the owner pid is inside, which is what the shell reads"
-        );
-        drop(lock);
-        assert!(!lock_dir.exists(), "releasing removes the directory");
-        drop(TableLock::acquire(path).unwrap());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A lock whose owner is gone is reaped rather than left to wedge every
-    /// later writer, which is the shell's rule too.
-    #[test]
-    fn a_stale_mail_table_lock_is_reaped() {
-        let dir = std::env::temp_dir().join(format!("onboard-table-reap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let table = dir.join("mail_domains");
-        std::fs::write(&table, "kyriakon.net\n").unwrap();
-        let lock_dir = dir.join("mail_domains.lock");
-        std::fs::create_dir(&lock_dir).unwrap();
-        std::fs::write(lock_dir.join("pid"), "999999\n").unwrap();
-
-        let lock = TableLock::acquire(table.to_str().unwrap()).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(lock_dir.join("pid"))
-                .unwrap()
-                .trim(),
-            std::process::id().to_string()
-        );
-        drop(lock);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     /// Three writers at once, the case the lock exists for: every appended line
-    /// is in the table afterwards, with no candidate left beside it. The retry is
-    /// in whole seconds, so the count is kept under the five-second wait.
+    /// is in the table afterwards, with no candidate left beside it.
     #[test]
     fn concurrent_table_appends_all_land() {
         let dir = std::env::temp_dir().join(format!("onboard-table-race-{}", std::process::id()));
@@ -2257,7 +1856,12 @@ mod tests {
         }
         let text = std::fs::read_to_string(&table).unwrap();
         assert_eq!(text.lines().count(), 4, "{text}");
-        assert!(!dir.join("virtuals.lock").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".onboard."))
+            .collect();
+        assert!(leftovers.is_empty(), "a candidate was left behind");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

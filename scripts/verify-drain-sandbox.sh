@@ -21,7 +21,7 @@
 #   bin/{sendmail,curl,dig,repquota,gpg}  stubs that record or answer
 #   key, stripe-secret, passwd, reserved
 #   etc/mail/{mail_domains,virtuals,mail_from,dkim_domains,spamd.alloweddomains}
-#   etc/mail/mail_domains.lock/pid   a stale lock whose owner is dead
+#   etc/mail/mail_domains.lock      the empty flock file the writer creates
 #   logins/, keyring/, mail/new/, bounce/new/, home/www/, store/rates/
 #
 # The tree is made outside the process's temp directory: restrict unveils /tmp
@@ -31,8 +31,8 @@
 #
 # Two applications are approved through the console, with the same key the
 # drain verifies: one person's, and one body's. The body's approval takes the
-# group path, so the pass writes mail_domains, and that write is what reaps the
-# dead owner's lock through `groups::stale_table_lock`'s `/bin/kill -0`.
+# group path, so the pass writes mail_domains, and that write is what opens the
+# kernel lock beside the table.
 #
 # What the pass proves when it exits 0 and the assertions hold: the approval key
 # and the config were read, the store lock was taken, an intent was parsed, one
@@ -141,17 +141,6 @@ make_fixture() {
 	printf 'root: root@kyriakon.net\n' > "$tree/etc/mail/mail_from"
 	printf 'kyriakon.net\n' > "$tree/etc/mail/dkim_domains"
 	printf '@kyriakon.net\n' > "$tree/etc/mail/spamd.alloweddomains"
-
-	# A stale lock with a dead owner on the first table the group approval
-	# writes. Reaping it runs `groups::stale_table_lock`'s `/bin/kill -0` under
-	# the veil; without that unveil entry the probe reads a failed spawn as "the
-	# owner is alive", keeps the lock, and the group's write fails.
-	sleep 1 &
-	typeset dead_pid=$!
-	kill "$dead_pid" 2>/dev/null || true
-	wait "$dead_pid" 2>/dev/null || true
-	mkdir "$tree/etc/mail/mail_domains.lock"
-	printf '%s\n' "$dead_pid" > "$tree/etc/mail/mail_domains.lock/pid"
 
 	# A malformed intent: the drain mails the operator once and leaves it.
 	printf '{"kind":"close"}\n' > "$tree/store/intents/01AAAAAAAAAAAAAAAAAAAAAAAA.json"
@@ -322,7 +311,6 @@ assert_fixture() {
 	[ -f "$tree/key" ] || ok=no
 	[ -d "$tree/store/rates" ] || ok=no
 	[ "$(cat "$tree/etc/mail/mail_domains")" = kyriakon.net ] || ok=no
-	[ -s "$tree/etc/mail/mail_domains.lock/pid" ] || ok=no
 	[ "$ok" = yes ]
 }
 
@@ -385,9 +373,8 @@ full_run() {
 	[ -f "$tree/keyring/alice.asc" ] ||
 		fail "the approval did not write the member's key into the keyring"
 	# The body's approval took the group path and wrote the mail tables on the
-	# way. Its first table write is also the only proof the `/bin/kill -0`
-	# reaper ran under the veil: a failed spawn leaves the dead owner looking
-	# alive, the lock in place and the approval failed.
+	# way. That write also proves the kernel lock beside the table opens under
+	# the veil: a refused open aborts the approval.
 	[ -f "$tree/store/groups/parish.example/group.json" ] ||
 		fail "the body approval wrote no group record"
 	[ -f "$tree/store/accounts/parish-secretary/account.json" ] ||
@@ -396,8 +383,8 @@ full_run() {
 		fail "the body approval did not write the mailbox key into the keyring"
 	grep -qx 'parish.example' "$tree/etc/mail/mail_domains" ||
 		fail "the body approval did not add its domain to mail_domains"
-	[ ! -d "$tree/etc/mail/mail_domains.lock" ] ||
-		fail "the stale mail_domains.lock was not reaped"
+	[ -f "$tree/etc/mail/mail_domains.lock" ] ||
+		fail "the table writer left no kernel lock file"
 	for script in add-user.sh provision-member.sh publish-mail-key.sh; do
 		grep -q "$script" "$tree/log/scripts" ||
 			fail "the approval did not run $script"
