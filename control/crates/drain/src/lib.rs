@@ -117,10 +117,11 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
     // active, or lapses the account and starts the grace. One sweep, so a
     // member who paid on the last day is not lapsed by a later pass.
     transitions::lifecycle::window_sweep(cfg, store, &journal).await?;
-    // The delivery-status reports are read before the grace sweep, so a bounce
-    // that arrived since the last pass stops the clock on this one rather than
-    // after a deletion. A report that could not be settled skips the sweep: a
-    // failure is a reason to retry, and a deletion is not a settlement.
+    // The delivery-status reports are read before the grace sweep, so a report
+    // is recorded and the operator alerted before a deletion the same pass. A
+    // report that could not be settled skips the sweep: a failure is a reason to
+    // retry, and a deletion is not a settlement. The report does not stop the
+    // clock itself; only the operator's `notice stop` does.
     let bounces_settled = crate::mailbox::bounces(cfg, store, &journal).await?;
     // The card rail's arriving events are settled before the grace sweep: a
     // payment that arrived before this pass on the grace date restores the

@@ -16,8 +16,10 @@
 //! has no key block, and is dropped rather than answered.
 //!
 //! The `bounce@kyriakon.net` spool is read here too. A delivery-status report
-//! for a notice is a machine message with no key, and the drain latches a stop
-//! on the account when the report leaves no channel that reached the member.
+//! for a notice is a machine message with no key. The drain records it on the
+//! notice line and alerts the operator; it does not stop the grace clock,
+//! because the report is unauthenticated inbound mail and only the operator can
+//! judge it.
 
 use std::collections::BTreeMap;
 
@@ -33,7 +35,7 @@ use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::mail::pgp;
 use kyriakon_control_core::store::draft::Draft;
 use kyriakon_control_core::store::journal::Journal;
-use kyriakon_control_core::store::{NoticeStop, Store};
+use kyriakon_control_core::store::Store;
 
 /// One reply per address per day. Only a live draft's recorded address is ever
 /// answered, and a day is long enough that a second mail from the same
@@ -717,18 +719,69 @@ pub async fn bounces(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Res
             match bounce::record(store, &report).await {
                 Ok(usernames) => {
                     for username in &usernames {
-                        if let Err(e) = stop_clock(cfg, store, journal, username, &report).await {
-                            crate::transitions::report_failure(
-                                cfg,
-                                store,
-                                journal,
-                                name.as_ref(),
-                                "mail",
-                                &e,
-                            )
-                            .await;
-                            file_settled = false;
-                            break;
+                        // A report on a receipt or a renewal is recorded, but it
+                        // is not the lifecycle condition: only a permanent
+                        // failure at every address a lifecycle notice went to is
+                        // worth an operator's decision. The report is still
+                        // evidence, not a decision: smtpd authenticates neither
+                        // its sender nor its headers, so anyone can quote a
+                        // notice's Message-ID.
+                        match bounce::every_address_failed(store, username).await {
+                            Ok(true) => match bounce::last_failure(store, username).await {
+                                Ok(Some(failed)) => {
+                                    // The failed notice's own id makes this a new
+                                    // event for a recurrence; the journal dedups
+                                    // the identical text, so a second lifecycle
+                                    // notice bouncing must not be silent.
+                                    let status = failed
+                                        .delivery
+                                        .as_ref()
+                                        .map(|delivery| delivery.status.clone())
+                                        .unwrap_or_default();
+                                    crate::transitions::report_failure(
+                                        cfg,
+                                        store,
+                                        journal,
+                                        &format!("notice-{username}"),
+                                        "notice",
+                                        &Error::Failed(format!(
+                                            "a delivery report says no lifecycle notice reached \
+                                             {username}: notice {} to {} reported {}. The sweep \
+                                             continues; run `kyriakon-admin notice stop \
+                                             {username}` to hold the account if the address is \
+                                             dead.",
+                                            failed.id, failed.to, status
+                                        )),
+                                    )
+                                    .await;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    crate::transitions::report_failure(
+                                        cfg,
+                                        store,
+                                        journal,
+                                        name.as_ref(),
+                                        "mail",
+                                        &Error::from(e),
+                                    )
+                                    .await;
+                                    file_settled = false;
+                                }
+                            },
+                            Ok(false) => {}
+                            Err(e) => {
+                                crate::transitions::report_failure(
+                                    cfg,
+                                    store,
+                                    journal,
+                                    name.as_ref(),
+                                    "mail",
+                                    &Error::from(e),
+                                )
+                                .await;
+                                file_settled = false;
+                            }
                         }
                     }
                 }
@@ -747,8 +800,8 @@ pub async fn bounces(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Res
             }
         }
         if !file_settled {
-            // The notice lines may be marked already, which is idempotent to
-            // repeat; the latch is what must be written before the sweep runs.
+            // Marking the notice lines again is idempotent; what must land is
+            // the record and the operator alert, so the spool file stays.
             settled = false;
             continue;
         }
@@ -778,58 +831,6 @@ async fn read_bounded(path: &std::path::Path) -> std::io::Result<String> {
         .read_to_end(&mut bytes)
         .await?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// Latch the stop on the account when the recorded failure leaves no address
-/// the lifecycle notices reached. The sweep reads the latch rather than the
-/// notice history, so a later notice that is also not delivered cannot restart
-/// the clock; `kyriakon-admin notice resend` clears it and restarts the grace.
-///
-/// The notice line is the history and the latch is the state the sweep acts on.
-/// A write failure leaves the spool file in place, so the next pass marks the
-/// same notice and tries again. The operator is told once per distinct failure,
-/// through the same journal-deduped alert as every other drain failure.
-async fn stop_clock(
-    cfg: &DrainConfig,
-    store: &Store,
-    journal: &Journal,
-    username: &str,
-    report: &bounce::Bounce,
-) -> Result<(), Error> {
-    if !bounce::every_address_failed(store, username).await? {
-        return Ok(());
-    }
-    let stop = NoticeStop {
-        address: report.recipient.clone(),
-        status: report.status.clone(),
-        at: kyriakon_control_core::util::filed_at(),
-    };
-    // The latch is set under the account's own lock: the console's own account
-    // writes are a separate process, and a read-modify-write without the lock
-    // could drop one of the two.
-    store
-        .update_account(username, move |current| {
-            if let Some(account) = current {
-                account.notice_stopped = Some(stop);
-            }
-            Ok::<(), Error>(())
-        })
-        .await?;
-    crate::transitions::report_failure(
-        cfg,
-        store,
-        journal,
-        &format!("notice-{username}"),
-        "notice",
-        &Error::Failed(format!(
-            "no lifecycle notice reached {username}: {} reported {}. The grace clock is \
-             stopped, so no deletion runs. Run `kyriakon-admin notice resend {username}` \
-             over a channel that works.",
-            report.recipient, report.status
-        )),
-    )
-    .await;
-    Ok(())
 }
 
 #[cfg(test)]
