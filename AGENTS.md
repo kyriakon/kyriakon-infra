@@ -4,6 +4,8 @@ kyriakon-infra is the public infrastructure repo for kyriakon.net, a low-extract
 no-shell hosting platform (mail, static/gemini sites, `pass`-compatible git repos) for
 the Orthodox Christian community, running on OpenBSD via Hetzner + Terraform.
 
+**This file is human-owned.** Propose edits as `AGENTS.proposed.md`; the operator renames it into place.
+
 ## Orientation
 
 **This repo is one of several `kyriakon-*` repos, cloned as siblings.** The founding
@@ -39,9 +41,10 @@ Pointers, so a search starts where the thing is.
   `/usr/local/libexec/filter-fromcheck`). The deployed state paths keep their old
   names (`/var/db/onboard`, `/etc/onboard`, `/etc/kyriakon/onboard`), the service
   account is still `_onboard`, and moving either is a data migration rather than a
-  rename. A package's `src/` root holds only its crate root, binary roots, and (in
-  core) `config.rs`, `util.rs` and `intent.rs`; a new module goes in its section
-  directory, or a new directory with a `mod.rs` that names its job.
+  rename. A package's `src/` root holds only its crate root, binary roots, and core's
+  shared modules (`config.rs`, `util.rs`, `intent.rs`, `error.rs`, `ipc.rs`,
+  `socket.rs`, `sandbox.rs`); a new module goes in its section directory, or a new
+  directory with a `mod.rs` that names its job.
 - `mailparse/`: the zero-dependency RFC 5322 and MIME parser, package
   `kyriakon-mailparse`. It sits outside the `control` workspace so each build root keeps
   its own lockfile and the encryptor keeps no third-party dependency. The encryptor, the
