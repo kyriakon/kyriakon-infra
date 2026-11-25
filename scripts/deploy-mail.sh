@@ -341,6 +341,24 @@ dkim_zone_check() {
 	esac
 }
 
+# ensure_virtual_address <account> <table> <domain>: add the identity line when
+# the writer's parser says the address is absent. A line that already maps the
+# address somewhere else is left where it is, so a deliberate forward survives a
+# redeploy; a same-value space-form line is not an abort.
+ensure_virtual_address() {
+	typeset account=$1 table=$2 domain=$3 line
+	line="$account@$domain: $account"
+	case $(mail_table check "$table" "$line") in
+	same | different*) return 0 ;;
+	esac
+	mail_table set "$table" "$line" >/dev/null || return 1
+	[ "$(mail_table check "$table" "$line")" = same ] || {
+		printf 'virtual entry did not land in %s: %s\n' "$table" "$line" >&2
+		return 1
+	}
+	printf 'virtual %s added\n' "$line"
+}
+
 # self_test — the writes this deploy makes into files the box reads, against
 # fixtures and the shipped smtpd.conf, and not the box. Each install moves a
 # candidate onto the live file, and that is what the checks are about: a write
@@ -1012,6 +1030,31 @@ EOF
 	check "a table that cannot be read is refused" "$code" 1
 	install_set="$script_dir/install-set.tsv"
 
+	# The deploy loop's guard is the same decision provision-member makes; drive
+	# it with the writer's double so a space-form forward and a same-value line
+	# are covered here too.
+	virtuals=$tree/deploy-virtuals
+	printf 'root: oliver\n  alice@kyriakon.net bob\n' >"$virtuals"
+	code=0
+	ensure_virtual_address alice "$virtuals" kyriakon.net >/dev/null 2>&1 || code=$?
+	check "a space-form forward does not abort the deploy" "$code" 0
+	check "and the forward is left in place" \
+		"$(grep -c '^  alice@kyriakon.net bob$' "$virtuals")" 1
+	check "and no colon line is written over it" \
+		"$(grep -c '^alice@kyriakon.net: alice$' "$virtuals")" 0
+	printf 'root: oliver\n  alice@kyriakon.net alice\n' >"$virtuals"
+	code=0
+	ensure_virtual_address alice "$virtuals" kyriakon.net >/dev/null 2>&1 || code=$?
+	check "a same-value space-form line is not an abort" "$code" 0
+	check "and it is left as it was" \
+		"$(grep -c '^  alice@kyriakon.net alice$' "$virtuals")" 1
+	printf 'root: oliver\n' >"$virtuals"
+	code=0
+	ensure_virtual_address bob "$virtuals" kyriakon.net >/dev/null 2>&1 || code=$?
+	check "an absent address is still added" "$code" 0
+	check "and lands as a colon line" \
+		"$(grep -c '^bob@kyriakon.net: bob$' "$virtuals")" 1
+
 	self_test_end
 }
 
@@ -1585,16 +1628,7 @@ EOF
 # is the drain's act.
 while IFS= read -r acct; do
 	[ -n "$acct" ] || continue
-	account_line="$acct@$platform_domain: $acct"
-	# The writer's parse, not a colon-only read: a hand-edited line may separate
-	# the columns with spaces, and set would repoint it.
-	case $(mail_table check "$virtuals_table" "$account_line") in
-	same | different*) continue ;;
-	esac
-	mail_table set "$virtuals_table" "$account_line" >/dev/null || exit 1
-	[ "$(mail_table check "$virtuals_table" "$account_line")" = same ] \
-		|| { printf 'virtual entry did not land in %s: %s\n' "$virtuals_table" "$account_line" >&2; exit 1; }
-	printf 'virtual %s added\n' "$acct@$platform_domain"
+	ensure_virtual_address "$acct" "$virtuals_table" "$platform_domain" || exit 1
 done <<EOF
 $(awk -F: '$6 ~ /^\/home\// { print $1 }' /etc/passwd)
 EOF
