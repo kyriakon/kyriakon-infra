@@ -22,6 +22,8 @@ pub mod mailbox;
 pub mod prepaid;
 pub mod sandbox;
 pub mod transitions;
+pub mod usage;
+pub mod validation;
 
 use serde_json::Value;
 
@@ -139,9 +141,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store) -> Result<(), Error> {
             &journal,
             "stripe-queue",
             "webhook",
-            &Error::Failed(format!(
-                "{unapplied} card deliveries remain unapplied and are retried on the next pass"
-            )),
+            &Error::Backlog { pending: unapplied },
         )
         .await;
     }
@@ -244,30 +244,35 @@ pub async fn verify(
         // `Decision` arm proves.
         Intent::Application(_) => Ok(None),
         Intent::Decision(intent) => {
-            let token = intent.application.status_token.as_deref().ok_or_else(|| {
-                Error::Failed("the status token is not 128 bits of Crockford".to_string())
-            })?;
+            let token = intent
+                .application
+                .status_token
+                .as_deref()
+                .ok_or(validation::Error::BadStatusToken)?;
             if !kyriakon_control_core::store::is_status_token(token) {
-                return Err(Error::Failed(
-                    "the status token is not 128 bits of Crockford".to_string(),
-                ));
+                return Err(validation::Error::BadStatusToken.into());
             }
             if let Some(why) =
                 kyriakon_control_core::flow::validate::username_shape(&intent.application.username)
             {
-                return Err(Error::Failed(format!("the username: {why}")));
+                return Err(validation::Error::InvalidUsername {
+                    username: intent.application.username.clone(),
+                    why,
+                }
+                .into());
             }
             let Some(decision) = decision_for_kind(&intent.kind) else {
-                return Err(Error::Failed(format!(
-                    "kind {:?} is not a decision",
-                    intent.kind
-                )));
+                return Err(validation::Error::NotADecision {
+                    kind: intent.kind.clone(),
+                }
+                .into());
             };
             if intent.action != decision.action {
-                return Err(Error::Failed(format!(
-                    "the action {:?} does not match the kind {:?}",
-                    intent.action, intent.kind
-                )));
+                return Err(validation::Error::ActionMismatch {
+                    action: intent.action.clone(),
+                    kind: intent.kind.clone(),
+                }
+                .into());
             }
             // The signature covers the record the approval installs, not only
             // the token: `applications/<token>.json` belongs to the handler, so
@@ -276,27 +281,31 @@ pub async fn verify(
             // approval that installs it, which re-checks the signature against
             // that second read.
             let Some(record) = store.application(token).await? else {
-                return Err(Error::Failed(
-                    "there is no application for this token".to_string(),
-                ));
+                return Err(validation::Error::NoApplication {
+                    token: token.to_string(),
+                }
+                .into());
             };
             // The signature covers the record's username; the intent's is
             // handler-written. A decision intent naming another account than
             // the record it authorizes is refused here, before any transition
             // reads the record a second time.
             if intent.application.username != record.username {
-                return Err(Error::Failed(
-                    "the intent's username is not the application's".to_string(),
-                ));
+                return Err(validation::Error::ForeignApplication {
+                    username: intent.application.username.clone(),
+                    application: record.username.clone(),
+                }
+                .into());
             }
             if !sign::verify(
                 key,
                 &sign::decide_payload(&record, &intent.action),
                 &intent.sig,
             ) {
-                return Err(Error::Failed(
-                    "the decision intent's signature does not verify".to_string(),
-                ));
+                return Err(validation::Error::SignatureInvalid {
+                    what: "the decision intent's",
+                }
+                .into());
             }
             Ok(None)
         }
@@ -346,9 +355,10 @@ pub async fn verify(
             if sign::verify(key, &sign::group_provision_payload(intent), &intent.sig) {
                 Ok(None)
             } else {
-                Err(Error::Failed(
-                    "the group intent's signature does not verify".to_string(),
-                ))
+                Err(validation::Error::SignatureInvalid {
+                    what: "the group intent's",
+                }
+                .into())
             }
         }
         Intent::GroupAddress(intent) => {
@@ -367,9 +377,10 @@ pub async fn verify(
             if sign::verify(key, &payload, &intent.sig) {
                 Ok(None)
             } else {
-                Err(Error::Failed(
-                    "the address intent's signature does not verify".to_string(),
-                ))
+                Err(validation::Error::SignatureInvalid {
+                    what: "the address intent's",
+                }
+                .into())
             }
         }
         Intent::RemoveGroup(intent) => {
@@ -380,9 +391,10 @@ pub async fn verify(
             ) {
                 Ok(None)
             } else {
-                Err(Error::Failed(
-                    "the remove-group intent's signature does not verify".to_string(),
-                ))
+                Err(validation::Error::SignatureInvalid {
+                    what: "the remove-group intent's",
+                }
+                .into())
             }
         }
         Intent::Close(intent) => {
@@ -416,9 +428,10 @@ pub async fn verify(
             ) {
                 Ok(None)
             } else {
-                Err(Error::Failed(
-                    "the token resend's signature does not verify".to_string(),
-                ))
+                Err(validation::Error::SignatureInvalid {
+                    what: "the token resend's",
+                }
+                .into())
             }
         }
         Intent::Credit(intent) => {
@@ -688,9 +701,7 @@ pub async fn apply(
             Intent::MailKey(intent) => transitions::lifecycle::mail_key(cfg, store, intent).await,
             Intent::TestMail(intent) => transitions::lifecycle::test_mail(cfg, store, intent).await,
             // `verify` refuses an unknown kind before this is reached.
-            Intent::Unknown { kind, .. } => Err(Error::Failed(format!(
-                "this build does not implement the kind {kind:?}"
-            ))),
+            Intent::Unknown { kind, .. } => Err(validation::Error::UnknownKind { kind }.into()),
         }
     })
     .await
@@ -770,7 +781,11 @@ fn disposition(intent: &Intent) -> transitions::Disposition {
 /// store. `Err` carries the reason, worded for the journal.
 fn account_name(username: &str) -> Result<(), Error> {
     match kyriakon_control_core::flow::validate::username_shape(username) {
-        Some(why) => Err(Error::Failed(format!("the username {username:?}: {why}"))),
+        Some(why) => Err(validation::Error::InvalidUsername {
+            username: username.to_string(),
+            why,
+        }
+        .into()),
         None => Ok(()),
     }
 }
@@ -828,14 +843,10 @@ pub async fn verify_session(
     filed_at: &str,
 ) -> Result<(), Error> {
     if !kyriakon_control_core::store::is_status_token(id) {
-        return Err(Error::Failed(
-            "the intent carries no usable session id".to_string(),
-        ));
+        return Err(validation::Error::SessionIdShape.into());
     }
     let Some(text) = store.session_text(id).await? else {
-        return Err(Error::Failed(
-            "the session named by the intent has gone".to_string(),
-        ));
+        return Err(validation::Error::SessionGone.into());
     };
     let value: Value = serde_json::from_str(&text)
         .map_err(|e| Error::context("the session record does not parse", e))?;
@@ -846,15 +857,11 @@ pub async fn verify_session(
     let filed = OffsetDateTime::parse(filed_at, &Rfc3339).ok();
     match (created, filed) {
         (Some(created), Some(filed)) if created > filed => {
-            return Err(Error::Failed(
-                "the session was opened after the intent was filed".to_string(),
-            ));
+            return Err(validation::Error::SessionOpenedLater.into());
         }
         (Some(_), Some(_)) => {}
         _ => {
-            return Err(Error::Failed(
-                "the intent or its session carries no comparable filing time".to_string(),
-            ));
+            return Err(validation::Error::NoFilingTime.into());
         }
     }
     let proof = value.get("proof").and_then(Value::as_str).unwrap_or("");

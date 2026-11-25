@@ -30,8 +30,19 @@ pub enum Error {
         status: std::process::ExitStatus,
         stderr: String,
     },
-    /// A value the drain refuses before it reaches the box.
-    Refused(String),
+    /// The script's stdin pipe was not created.
+    NoStdin { script: PathBuf },
+    /// The upload key material is empty.
+    EmptyKeyMaterial { username: String },
+    /// The application carries no mail key, so the account could not receive
+    /// mail.
+    NoMailKey { username: String },
+    /// A mail key's mailbox is not a name the box can serve.
+    MailKeyMailbox { localpart: String, why: String },
+    /// A mail key's material is empty.
+    MailKeyEmpty { localpart: String },
+    /// The address outside the platform does not pass the platform's rules.
+    OutsideAddress { address: String, why: String },
     /// A key file could not be created, written or chmodded.
     Io {
         context: &'static str,
@@ -53,7 +64,24 @@ impl fmt::Display for Error {
                 status,
                 stderr,
             } => write!(f, "{} exited {status}: {stderr}", script.display()),
-            Error::Refused(message) => f.write_str(message),
+            Error::NoStdin { script } => write!(f, "{} has no stdin", script.display()),
+            Error::EmptyKeyMaterial { username } => {
+                write!(f, "the upload key material for {username} is empty")
+            }
+            Error::NoMailKey { username } => write!(
+                f,
+                "the application for {username} carries no mail key, so the account could not \
+                 receive mail"
+            ),
+            Error::MailKeyMailbox { localpart, why } => {
+                write!(f, "the mail key's mailbox {localpart:?}: {why}")
+            }
+            Error::MailKeyEmpty { localpart } => {
+                write!(f, "the mail key for {localpart} is empty")
+            }
+            Error::OutsideAddress { address, why } => {
+                write!(f, "the address outside the platform {address:?}: {why}")
+            }
             Error::Io {
                 context,
                 path,
@@ -69,7 +97,13 @@ impl std::error::Error for Error {
         match self {
             Error::Spawn { source, .. } | Error::Io { source, .. } => Some(source),
             Error::Store(error) => Some(error),
-            Error::Exited { .. } | Error::Refused(_) => None,
+            Error::Exited { .. }
+            | Error::NoStdin { .. }
+            | Error::EmptyKeyMaterial { .. }
+            | Error::NoMailKey { .. }
+            | Error::MailKeyMailbox { .. }
+            | Error::MailKeyEmpty { .. }
+            | Error::OutsideAddress { .. } => None,
         }
     }
 }
@@ -155,7 +189,7 @@ pub(super) async fn spawn_script_with_stdin(
             source,
         })?;
     let Some(mut stdin) = child.stdin.take() else {
-        return Err(Error::Refused("the script has no stdin".to_string()));
+        return Err(Error::NoStdin { script: path });
     };
     if let Err(source) = stdin.write_all(input).await {
         let _ = child.kill().await;
@@ -232,9 +266,9 @@ pub(super) async fn write_public_key(
 ) -> Result<(), Error> {
     let body = material.trim();
     if body.is_empty() {
-        return Err(Error::Refused(
-            "the upload key material is empty".to_string(),
-        ));
+        return Err(Error::EmptyKeyMaterial {
+            username: username.to_string(),
+        });
     }
     store.ensure_dir("keys").await?;
     let mut bytes = body.as_bytes().to_vec();
@@ -268,10 +302,9 @@ pub(super) async fn publish_mail_keys(
     keys: &[KeyRecord],
 ) -> Result<(), Error> {
     if keys.is_empty() {
-        return Err(Error::Refused(
-            "the application carries no mail key, so the account could not receive mail"
-                .to_string(),
-        ));
+        return Err(Error::NoMailKey {
+            username: username.to_string(),
+        });
     }
     let dir = std::path::Path::new(&cfg.keyring_dir);
     std::fs::create_dir_all(dir).map_err(|source| Error::Io {
@@ -282,15 +315,16 @@ pub(super) async fn publish_mail_keys(
     for key in keys {
         let localpart = mail_key_localpart(username, key);
         if let Some(why) = validate::username_shape(localpart) {
-            return Err(Error::Refused(format!(
-                "the mail key's mailbox {localpart:?}: {why}"
-            )));
+            return Err(Error::MailKeyMailbox {
+                localpart: localpart.to_string(),
+                why,
+            });
         }
         let body = key.material.trim();
         if body.is_empty() {
-            return Err(Error::Refused(format!(
-                "the mail key for {localpart} is empty"
-            )));
+            return Err(Error::MailKeyEmpty {
+                localpart: localpart.to_string(),
+            });
         }
         let path = kyriakon_control_core::mail::keycheck::keyring_file(&cfg.keyring_dir, localpart);
         let mut bytes = body.as_bytes().to_vec();
@@ -361,9 +395,10 @@ pub(super) fn outside_address(record: &Record) -> Result<Option<String>, Error> 
     match record.outside_address.as_deref() {
         Some(addr) => {
             if let Some(why) = validate::address(addr) {
-                return Err(Error::Refused(format!(
-                    "the address outside the platform {addr:?}: {why}"
-                )));
+                return Err(Error::OutsideAddress {
+                    address: addr.to_string(),
+                    why,
+                });
             }
             Ok(Some(addr.to_string()))
         }

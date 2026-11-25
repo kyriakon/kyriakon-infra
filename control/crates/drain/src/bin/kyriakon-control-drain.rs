@@ -27,6 +27,7 @@ use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::mail::table::{DropMode, Lookup, Table};
 use kyriakon_control_core::store::Store;
 use kyriakon_control_drain::transitions::Error;
+use kyriakon_control_drain::usage;
 
 const DEFAULT_CONFIG: &str = "/etc/kyriakon/onboard/drain.toml";
 
@@ -39,15 +40,15 @@ async fn main() -> ExitCode {
             "--config" => match args.next() {
                 Some(p) => cfg_path = PathBuf::from(p),
                 None => {
-                    Error::Failed("--config needs a path".to_string()).report("the drain");
+                    Error::from(usage::Error::ConfigPathMissing).report("the drain");
                     return ExitCode::FAILURE;
                 }
             },
             "mail-table" => return mail_table(args.collect()),
             other => {
-                Error::Failed(format!(
-                    "unknown argument {other:?}; usage: kyriakon-control-drain [--config PATH]"
-                ))
+                Error::from(usage::Error::UnknownArgument {
+                    argument: other.to_string(),
+                })
                 .report("the drain");
                 return ExitCode::FAILURE;
             }
@@ -77,14 +78,15 @@ fn mail_table(args: Vec<String>) -> ExitCode {
 }
 
 fn run_mail_table(args: &[String]) -> Result<u8, Error> {
-    let usage = "usage: kyriakon-control-drain mail-table \
-                 <add|set|check|drop|map-add|regenerate> <table> ...";
     let (verb, rest) = args
         .split_first()
-        .ok_or_else(|| Error::Failed(usage.to_string()))?;
-    let (path, rest) = rest
-        .split_first()
-        .ok_or_else(|| Error::Failed(usage.to_string()))?;
+        .ok_or(usage::Error::MailTableVerbMissing)?;
+    let (path, rest) =
+        rest.split_first()
+            .ok_or_else(|| usage::Error::MailTableArgumentMissing {
+                verb: verb.clone(),
+                argument: "table",
+            })?;
     let table = Table::at(path).map_err(Error::from)?;
     let changed = |change: kyriakon_control_core::mail::table::Change| {
         if change.changed {
@@ -95,9 +97,12 @@ fn run_mail_table(args: &[String]) -> Result<u8, Error> {
     };
     match verb.as_str() {
         "add" => {
-            let (name, rest) = rest
-                .split_first()
-                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            let (name, rest) =
+                rest.split_first()
+                    .ok_or_else(|| usage::Error::MailTableArgumentMissing {
+                        verb: verb.clone(),
+                        argument: "name",
+                    })?;
             let value = rest.first().map(String::as_str);
             let change = table.ensure(name, value).map_err(Error::from)?;
             println!("{}", if change.added { "added" } else { "present" });
@@ -106,7 +111,10 @@ fn run_mail_table(args: &[String]) -> Result<u8, Error> {
         "set" => {
             let line = rest
                 .first()
-                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+                .ok_or_else(|| usage::Error::MailTableArgumentMissing {
+                    verb: verb.clone(),
+                    argument: "line",
+                })?;
             let change = table.set(line).map_err(Error::from)?;
             println!(
                 "{}",
@@ -123,7 +131,10 @@ fn run_mail_table(args: &[String]) -> Result<u8, Error> {
         "check" => {
             let line = rest
                 .first()
-                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+                .ok_or_else(|| usage::Error::MailTableArgumentMissing {
+                    verb: verb.clone(),
+                    argument: "line",
+                })?;
             match table.check(line).map_err(Error::from)? {
                 Lookup::Absent => println!("absent"),
                 Lookup::Same => println!("same"),
@@ -132,34 +143,55 @@ fn run_mail_table(args: &[String]) -> Result<u8, Error> {
             Ok(0)
         }
         "drop" => {
-            let (how, rest) = rest
-                .split_first()
-                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            let (how, rest) =
+                rest.split_first()
+                    .ok_or_else(|| usage::Error::MailTableArgumentMissing {
+                        verb: verb.clone(),
+                        argument: "how",
+                    })?;
             let text = rest
                 .first()
-                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+                .ok_or_else(|| usage::Error::MailTableArgumentMissing {
+                    verb: verb.clone(),
+                    argument: "text",
+                })?;
             let how = DropMode::parse(how).map_err(Error::from)?;
             Ok(changed(table.drop(how, text).map_err(Error::from)?))
         }
         "map-add" => {
-            let (key, rest) = rest
-                .split_first()
-                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            let (key, rest) =
+                rest.split_first()
+                    .ok_or_else(|| usage::Error::MailTableArgumentMissing {
+                        verb: verb.clone(),
+                        argument: "key",
+                    })?;
             let value = rest
                 .first()
-                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+                .ok_or_else(|| usage::Error::MailTableArgumentMissing {
+                    verb: verb.clone(),
+                    argument: "value",
+                })?;
             Ok(changed(table.map_add(key, value).map_err(Error::from)?))
         }
         "regenerate" => {
-            let (passwd, rest) = rest
-                .split_first()
-                .ok_or_else(|| Error::Failed(usage.to_string()))?;
-            let (virtuals, rest) = rest
-                .split_first()
-                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            let (passwd, rest) =
+                rest.split_first()
+                    .ok_or_else(|| usage::Error::MailTableArgumentMissing {
+                        verb: verb.clone(),
+                        argument: "passwd",
+                    })?;
+            let (virtuals, rest) =
+                rest.split_first()
+                    .ok_or_else(|| usage::Error::MailTableArgumentMissing {
+                        verb: verb.clone(),
+                        argument: "virtuals",
+                    })?;
             let domain = rest
                 .first()
-                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+                .ok_or_else(|| usage::Error::MailTableArgumentMissing {
+                    verb: verb.clone(),
+                    argument: "domain",
+                })?;
             let change = table
                 .regenerate_senders(Path::new(passwd), Path::new(virtuals), domain)
                 .map_err(Error::from)?;
@@ -173,7 +205,7 @@ fn run_mail_table(args: &[String]) -> Result<u8, Error> {
             );
             Ok(0)
         }
-        _ => Err(Error::Failed(usage.to_string())),
+        _ => Err(usage::Error::MailTableVerbUnknown { verb: verb.clone() }.into()),
     }
 }
 
