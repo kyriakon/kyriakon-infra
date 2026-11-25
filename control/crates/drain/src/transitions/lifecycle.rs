@@ -1258,21 +1258,24 @@ fn valid_contact(address: Option<&str>) -> Option<String> {
 /// because provisioning writes a group mailbox's account without an outside
 /// address of its own. Both are read through the typed accessors of #554, and
 /// both are held to the same validation rule as a person's notice.
-async fn group_notice_address(store: &Store, group: &GroupRecord) -> Result<String, Transitions> {
-    let account = store.account(&group.site_owner).await?.ok_or_else(|| {
-        Transitions::Lifecycle(Error::AccountRecordMissing {
-            username: group.site_owner.clone(),
-        })
-    })?;
+async fn group_notice_address(
+    store: &Store,
+    group: &GroupRecord,
+) -> Result<Option<String>, store::Error> {
+    let Some(account) = store.account(&group.site_owner).await? else {
+        return Ok(None);
+    };
     if let Some(to) = valid_contact(account.outside_address.as_deref()) {
-        return Ok(to);
+        return Ok(Some(to));
     }
     let copy = store
         .account_application_text(&group.site_owner)
         .await?
         .and_then(|text| serde_json::from_str::<Record>(&text).ok());
     let from_copy = copy.and_then(|copy| valid_contact(copy.outside_address.as_deref()));
-    Ok(from_copy.unwrap_or_else(|| account.platform_address()))
+    Ok(Some(
+        from_copy.unwrap_or_else(|| account.platform_address()),
+    ))
 }
 
 /// The recipient a group's lifecycle notice takes, or `None` when the site
@@ -1287,8 +1290,23 @@ async fn group_notice_recipient(
     group: &GroupRecord,
 ) -> Option<String> {
     match group_notice_address(store, group).await {
-        Ok(to) => Some(to),
-        Err(e) => {
+        Ok(Some(to)) => Some(to),
+        Ok(None) => {
+            report_record(
+                cfg,
+                store,
+                journal,
+                "account",
+                &group.site_owner,
+                &Transitions::Lifecycle(Error::SiteOwnerGone {
+                    owner: group.site_owner.clone(),
+                    domain: group.domain.clone(),
+                }),
+            )
+            .await;
+            None
+        }
+        Err(source) => {
             report_record(
                 cfg,
                 store,
@@ -1297,7 +1315,7 @@ async fn group_notice_recipient(
                 &group.site_owner,
                 &Transitions::Lifecycle(Error::NoAddressee {
                     domain: group.domain.clone(),
-                    source: Box::new(e),
+                    source,
                 }),
             )
             .await;

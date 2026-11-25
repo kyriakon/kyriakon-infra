@@ -5,9 +5,7 @@
 //! place that joins the shared catalogue to the handler's three renderers.
 
 use kyriakon_control_core::flow;
-use kyriakon_control_core::flow::catalogue::{
-    parse, row, Action, Job, Protocol, Row, Service, TRACKED,
-};
+use kyriakon_control_core::flow::catalogue::{parse, row, Action, Job, Protocol, Row, Service};
 use kyriakon_control_handler::{capsule, page};
 use kyriakon_control_tui as tui;
 
@@ -50,6 +48,10 @@ fn renderings(list: &[Service], member: Option<&str>) -> Vec<(&'static str, Vec<
 }
 
 /// A disagreement between the file and a front-end's rendering.
+///
+/// The fields are read by the derived `Debug` failure message when a test
+/// unwraps, not by the check itself.
+#[allow(dead_code)]
 #[derive(Debug)]
 enum Mismatch {
     /// The file did not parse.
@@ -98,7 +100,7 @@ fn compare(list: &[Service], rendered: &[(&'static str, Vec<Row>)]) -> Result<()
                 .map(|r| r.id.as_str())
                 .collect();
             return Err(Mismatch::Count {
-                front_end: *front_end,
+                front_end,
                 missing: missing.into_iter().map(str::to_string).collect(),
                 invented: invented.into_iter().map(str::to_string).collect(),
             });
@@ -106,7 +108,7 @@ fn compare(list: &[Service], rendered: &[(&'static str, Vec<Row>)]) -> Result<()
         for (s, r) in list.iter().zip(rows) {
             if r.id != s.id {
                 return Err(Mismatch::Order {
-                    front_end: *front_end,
+                    front_end,
                     shown: r.id.clone(),
                     expected: s.id.clone(),
                 });
@@ -117,7 +119,7 @@ fn compare(list: &[Service], rendered: &[(&'static str, Vec<Row>)]) -> Result<()
                 || r.action != s.action.word()
             {
                 return Err(Mismatch::Content {
-                    front_end: *front_end,
+                    front_end,
                     id: s.id.clone(),
                 });
             }

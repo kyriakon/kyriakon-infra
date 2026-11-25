@@ -13,9 +13,8 @@ use std::process::ExitStatus;
 
 use kyriakon_control_core::account::state::Standing;
 use kyriakon_control_core::flow::Reason;
+use kyriakon_control_core::store;
 use time::error::Parse as TimeParse;
-
-use crate::transitions::Error as Transitions;
 
 #[derive(Debug)]
 pub enum Error {
@@ -75,11 +74,11 @@ pub enum Error {
     // ---- a group notice with no addressee ----
     /// The site owner's record is gone, so the group has no addressee.
     SiteOwnerGone { owner: String, domain: String },
-    /// The site owner's address could not be read, so the group notice has no
-    /// addressee. The wrapped transition error is forwarded unchanged.
+    /// The store could not read the site owner's address, so the group notice
+    /// has no addressee.
     NoAddressee {
         domain: String,
-        source: Box<Transitions>,
+        source: store::Error,
     },
 
     // ---- an intent of the wrong kind ----
@@ -273,7 +272,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::NoAddressee { source, .. } => Some(source.as_ref()),
+            Error::NoAddressee { source, .. } => Some(source),
             Error::RemoveFile { source, .. } => Some(source),
             Error::ReadKeyFile { source, .. } => Some(source),
             Error::RotationWindowUnparseable { source, .. } => Some(source),
