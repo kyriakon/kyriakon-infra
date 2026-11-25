@@ -8,7 +8,7 @@
 use super::boxrun::{cancel_stripe_if_active, run_script};
 use super::groups::{application_token, group_record};
 use super::lifecycle::dns_contact;
-use super::Error;
+use super::Error as Transitions;
 use super::{AfterLine, Settlement};
 use kyriakon_control_core::account::state::Standing;
 use kyriakon_control_core::config::DrainConfig;
@@ -30,6 +30,9 @@ use kyriakon_control_core::store::{
 use kyriakon_control_core::util;
 use serde_json::json;
 use time::OffsetDateTime;
+
+mod error;
+pub use self::error::Error;
 
 /// The note a credit's applied line carries: the override's reason when the
 /// credit used one.
@@ -53,7 +56,7 @@ pub async fn credit(
     store: &Store,
     journal: &Journal,
     intent: CreditIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     // The ledger line is the settlement marker, and a credit settles in one of
     // two: a payment joined to a token, or a held line in the unattributed
     // queue. A second arrival of the same intent finds its line and stops before
@@ -107,7 +110,7 @@ async fn credit_account(
     amount: i64,
     received: time::Date,
     attributed_item: Option<&str>,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let (username, mut account, _payment) = match resolve_payment(store, &intent.token).await {
         Ok(found) => found,
         Err(problem) => return Ok(Settlement::refused(&problem)),
@@ -115,11 +118,11 @@ async fn credit_account(
     let price = match util::pence(&cfg.price_gbp) {
         Ok(price) if price > 0 => price,
         Ok(_) => {
-            return Err(Error::Failed(
-                "the drain's configured price_gbp must be more than zero".to_string(),
-            ))
+            return Err(Transitions::Payments(Error::PriceNotPositive {
+                field: "price_gbp",
+            }))
         }
-        Err(e) => return Err(Error::context("the drain's configured price_gbp", e)),
+        Err(e) => return Err(Transitions::context("the drain's configured price_gbp", e)),
     };
     let address = account.notice_address();
     let party = CreditParty::Account {
@@ -154,11 +157,12 @@ async fn credit_group(
     received: time::Date,
     domain: &str,
     attributed_item: Option<&str>,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     if let Some(why) = validate::domain(domain) {
-        return Err(Error::Failed(format!(
-            "the token's group domain {domain:?}: {why}"
-        )));
+        return Err(Transitions::Payments(Error::GroupDomainInvalid {
+            domain: domain.to_string(),
+            why,
+        }));
     }
     let Some(mut group) = group_record(store, domain).await? else {
         return Ok(Settlement::refused(
@@ -178,11 +182,16 @@ async fn credit_group(
     let price = match util::pence(&cfg.group_price_gbp) {
         Ok(price) if price > 0 => price,
         Ok(_) => {
-            return Err(Error::Failed(
-                "the drain's configured group_price_gbp must be more than zero".to_string(),
+            return Err(Transitions::Payments(Error::PriceNotPositive {
+                field: "group_price_gbp",
+            }))
+        }
+        Err(e) => {
+            return Err(Transitions::context(
+                "the drain's configured group_price_gbp",
+                e,
             ))
         }
-        Err(e) => return Err(Error::context("the drain's configured group_price_gbp", e)),
     };
     let address = match dns_contact(store, &group).await {
         Ok(address) => address,
@@ -214,73 +223,59 @@ async fn credit_group(
 /// The fields a credit's money arrives with, revalidated here because `intents/`
 /// belongs to the unprivileged half. Returns the amount in pence. A token is
 /// checked only when there is one: a payment with none is held, not refused.
-fn credit_fields(intent: &CreditIntent) -> Result<i64, Error> {
+fn credit_fields(intent: &CreditIntent) -> Result<i64, Transitions> {
     if !CREDIT_RAILS.contains(&intent.rail.as_str()) {
-        return Err(Error::Failed(
-            "the credit names a rail that is not cash, cash-hand or monero".to_string(),
-        ));
+        return Err(Transitions::Payments(Error::CreditRailUnknown));
     }
     if !intent.token.is_empty() && !store::is_payment_token(&intent.token) {
-        return Err(Error::Failed(
-            "the credit's token is not the shape of a payment token".to_string(),
-        ));
+        return Err(Transitions::Payments(Error::CreditTokenShape));
     }
     let Some(received) = util::parse_date(&intent.received) else {
-        return Err(Error::Failed(
-            "the credit's received date is not YYYY-MM-DD".to_string(),
-        ));
+        return Err(Transitions::Payments(Error::CreditReceivedDateShape));
     };
     // A hand-written intent can carry any date. Two years ahead is the ceiling
     // the paid-until arithmetic measures from, and a wake at this boundary is
     // the difference between a refused intent and a pass that panics and starves
     // every intent behind it.
     if util::received_beyond_window(received, OffsetDateTime::now_utc().date()) {
-        return Err(Error::Failed(format!(
-            "the credit's received date {} is more than two years ahead",
-            intent.received
-        )));
+        return Err(Transitions::Payments(Error::CreditReceivedTooFar {
+            received: intent.received.clone(),
+        }));
     }
     if !xmr::valid_txid(intent.txid.as_deref()) {
-        return Err(Error::Failed(
-            "the credit's transaction id is not 64 hexadecimal characters".to_string(),
-        ));
+        return Err(Transitions::Payments(Error::CreditTxidShape));
     }
     if !xmr::valid_xmr(intent.amount_xmr.as_deref()) {
-        return Err(Error::Failed(
-            "the credit's XMR amount is not a decimal amount".to_string(),
-        ));
+        return Err(Transitions::Payments(Error::CreditXmrShape));
     }
     if intent.rate.is_some() && intent.rail != "monero" {
-        return Err(Error::Failed(
-            "a --rate is only a monero credit's receipt-date rate".to_string(),
-        ));
+        return Err(Transitions::Payments(Error::CreditRateWithoutMonero));
     }
     if let Some(rate) = intent.rate.as_deref() {
         if !xmr::valid_rate(rate) {
-            return Err(Error::Failed(format!(
-                "the credit's rate {rate:?} is not a positive decimal amount"
-            )));
+            return Err(Transitions::Payments(Error::CreditRateShape {
+                rate: rate.to_string(),
+            }));
         }
     }
     match util::pence(&intent.amount_gbp) {
         Ok(amount) if amount > 0 => Ok(amount),
-        Ok(_) => Err(Error::Failed(
-            "the credit's amount must be more than zero".to_string(),
-        )),
-        Err(e) => Err(Error::from(e)),
+        Ok(_) => Err(Transitions::Payments(Error::CreditAmountNotPositive)),
+        Err(e) => Err(Transitions::from(e)),
     }
 }
 
 /// The token index entry a payment token names, when the entry is this token's.
 /// The index is the only join, so a token that is not in it resolves to nothing.
-pub(super) async fn token_join(store: &Store, token: &str) -> Result<Option<TokenRecord>, Error> {
+pub(super) async fn token_join(
+    store: &Store,
+    token: &str,
+) -> Result<Option<TokenRecord>, Transitions> {
     let Some(join) = store.token(token).await? else {
         return Ok(None);
     };
     if join.token != token {
-        return Err(Error::Failed(
-            "the token record does not name this token".to_string(),
-        ));
+        return Err(Transitions::Payments(Error::TokenRecordNamesOther));
     }
     Ok(Some(join))
 }
@@ -292,38 +287,25 @@ pub(super) async fn token_join(store: &Store, token: &str) -> Result<Option<Toke
 pub(super) async fn resolve_payment(
     store: &Store,
     token: &str,
-) -> Result<(String, Account, Payment), Error> {
+) -> Result<(String, Account, Payment), Transitions> {
     let Some(join) = token_join(store, token).await? else {
-        return Err(Error::Failed(
-            "the token is not in the index; an unattributed payment belongs in the queue"
-                .to_string(),
-        ));
+        return Err(Transitions::Payments(Error::TokenNotIndexed));
     };
     if join.group.is_some() {
-        return Err(Error::Failed(
-            "the token belongs to a group, whose payment is held on the group's record".to_string(),
-        ));
+        return Err(Transitions::Payments(Error::TokenBelongsToGroup));
     }
     if validate::username_shape(&join.username).is_some() {
-        return Err(Error::Failed(
-            "the token record does not name this token".to_string(),
-        ));
+        return Err(Transitions::Payments(Error::TokenRecordNamesOther));
     }
     let username = join.username;
     let Some(account) = store.account(&username).await? else {
-        return Err(Error::Failed(
-            "the token resolves to an account that is gone".to_string(),
-        ));
+        return Err(Transitions::Payments(Error::TokenAccountGone));
     };
     let Some(payment) = account.payment_state() else {
-        return Err(Error::Failed(
-            "the account carries no payment block".to_string(),
-        ));
+        return Err(Transitions::Payments(Error::AccountNoPayment));
     };
     if payment.token_ref.as_deref() != Some(token) {
-        return Err(Error::Failed(
-            "the token is not the one the account's payment block holds".to_string(),
-        ));
+        return Err(Transitions::Payments(Error::TokenNotHeld));
     }
     Ok((username, account, payment))
 }
@@ -375,7 +357,7 @@ async fn apply_credit(
     received: time::Date,
     price: i64,
     attributed_item: Option<&str>,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     // A pass that journaled `applying` and wrote the record but crashed before
     // the ledger append is finished here, from the values it recorded then. The
     // record is the witness: its paid-until date (or, for a shortfall, its
@@ -462,7 +444,7 @@ async fn apply_credit(
             }
         },
         Ok(None) => 0,
-        Err(e) => return Err(Error::from(e)),
+        Err(e) => return Err(Transitions::from(e)),
     };
     let applied = credit_money(price, balance, amount);
     // A group's year is one payment and the fee covers every mailbox, so there
@@ -672,7 +654,7 @@ async fn sync_payment_copy(
     target: &PaymentTarget<'_>,
     owner: &str,
     is_group: bool,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let application = if is_group {
         match application_token(store, owner).await {
             Some(token) => token,
@@ -684,7 +666,7 @@ async fn sync_payment_copy(
     target
         .sync_application_copy(store, &application)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// Bring back every mailbox in a group that lapsed with it: the group lapsed as
@@ -694,7 +676,7 @@ pub(super) async fn restore_group_mailboxes(
     cfg: &DrainConfig,
     store: &Store,
     group: &GroupRecord,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     for mailbox in &group.accounts {
         let Some(account) = store.account(mailbox).await? else {
             continue;
@@ -712,7 +694,7 @@ pub(super) async fn restore_group_mailboxes(
                         account.notice_stopped = None;
                     }
                 }
-                Ok::<(), Error>(())
+                Ok::<(), Transitions>(())
             })
             .await?;
     }
@@ -734,22 +716,22 @@ struct PaymentLine {
     paid_until_after: Option<String>,
 }
 
-async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentLine>, Error> {
+async fn last_payment_line(store: &Store, token: &str) -> Result<Option<PaymentLine>, Transitions> {
     let Some(line) = Ledger::open(store).last_payment(token).await? else {
         return Ok(None);
     };
     let amount = line
         .amount_gbp
         .as_deref()
-        .ok_or_else(|| Error::Failed("a payment line carries no amount".to_string()))?;
+        .ok_or_else(|| Transitions::Payments(Error::PaymentLineNoAmount))?;
     Ok(Some(PaymentLine {
         seq: line.seq,
         rail: line.rail,
         amount: util::pence(amount)
-            .map_err(|e| Error::context("the payment line's amount cannot be read", e))?,
+            .map_err(|e| Transitions::context("the payment line's amount cannot be read", e))?,
         applied_gbp: match line.applied_gbp.as_deref() {
             Some(text) => Some(util::pence(text).map_err(|e| {
-                Error::context("the payment line's applied amount cannot be read", e)
+                Transitions::context("the payment line's applied amount cannot be read", e)
             })?),
             None => None,
         },
@@ -809,7 +791,7 @@ pub async fn refund(
     store: &Store,
     journal: &Journal,
     intent: RefundIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let amount_text = intent.amount_gbp.as_deref().unwrap_or("");
     let rail = intent.rail.as_deref().unwrap_or("");
     let reason = intent.reason.as_deref().unwrap_or("");
@@ -1027,7 +1009,7 @@ async fn refund_total(
     original: &PaymentLine,
     amount: i64,
     excess: bool,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let ceiling = if excess {
         unapplied(original).unwrap_or(0)
     } else {
@@ -1041,10 +1023,10 @@ async fn refund_total(
     for line in &refunds.lines {
         let on = line.received_on.as_deref().unwrap_or("an earlier date");
         if line.amount_gbp.as_deref() == Some(deducted.as_str()) {
-            return Err(Error::Failed(format!(
-                "an identical refund is already recorded at ledger seq {} on {on}",
-                line.seq
-            )));
+            return Err(Transitions::Payments(Error::RefundAlreadyRecorded {
+                seq: line.seq,
+                on: on.to_string(),
+            }));
         }
     }
     if refunds.total + amount > ceiling {
@@ -1053,13 +1035,13 @@ async fn refund_total(
         } else {
             "that arrived"
         };
-        return Err(Error::Failed(format!(
-            "refunds of ledger seq {} already total GBP {}; another GBP {} would exceed the GBP {} {what}",
-            original.seq,
-            util::gbp(refunds.total),
-            util::gbp(amount),
-            util::gbp(ceiling)
-        )));
+        return Err(Transitions::Payments(Error::RefundExceedsCeiling {
+            seq: original.seq,
+            total: util::gbp(refunds.total),
+            amount: util::gbp(amount),
+            ceiling: util::gbp(ceiling),
+            what,
+        }));
     }
     Ok(())
 }
@@ -1125,7 +1107,7 @@ async fn apply_refund(
     reason: &str,
     rate: Option<&str>,
     original: &PaymentLine,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let received_on = util::filed_at()[..10].to_string();
     let settlement_by = util::date_after_days(14);
     let deducted = format!("-{}", util::gbp(amount));
@@ -1246,7 +1228,7 @@ async fn journal_refund_applying(
     intent: &RefundIntent,
     username: &str,
     progress: &RefundProgress,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let line = JournalLine {
         version: 1,
         at: util::filed_at(),
@@ -1260,7 +1242,10 @@ async fn journal_refund_applying(
         credit: None,
         refund: Some(progress.clone()),
     };
-    journal.append(store, &line).await.map_err(Error::from)
+    journal
+        .append(store, &line)
+        .await
+        .map_err(Transitions::from)
 }
 
 /// The refund notice: what was refunded, by which rail, and the date reg 34(4)
@@ -1337,7 +1322,7 @@ async fn append_refund_ledger(
     rate: Option<&str>,
     received_on: &str,
     paid_until_after: Option<&str>,
-) -> Result<u64, Error> {
+) -> Result<u64, Transitions> {
     let partial = amount < original.amount;
     let refund_basis = match rail {
         "monero" => Some(if rate.is_some() {
@@ -1371,7 +1356,10 @@ async fn append_refund_ledger(
         refund_basis: refund_basis.map(str::to_string),
         rate_refund: rate.map(str::to_string),
     });
-    Ledger::open(store).append(line).await.map_err(Error::from)
+    Ledger::open(store)
+        .append(line)
+        .await
+        .map_err(Transitions::from)
 }
 
 /// A settlement rewrites the refund line at the intent's `seq`, under the
@@ -1382,7 +1370,7 @@ async fn settle_refund(
     store: &Store,
     intent: &RefundIntent,
     on: &str,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let settled_on = util::date_string(util::parse_date(on).expect("the date was validated"));
     let Some(seq) = intent.seq else {
         return Ok(Settlement::refused(
@@ -1422,7 +1410,7 @@ async fn hold(
     intent: &CreditIntent,
     amount: i64,
     received: time::Date,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     if intent.rail == "cash-hand" {
         return Ok(Settlement::refused(
             "cash in hand is credited against a username; give --username",
@@ -1467,7 +1455,7 @@ async fn hold(
         "intent": intent.id.as_str(),
         "note": note,
     });
-    let encoded = serde_json::to_string(&line).map_err(|source| Error::Json {
+    let encoded = serde_json::to_string(&line).map_err(|source| Transitions::Json {
         context: "encode the queue",
         source,
     })?;
@@ -1491,7 +1479,7 @@ pub async fn reconcile_attribute(
     store: &Store,
     journal: &Journal,
     intent: AttributeIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     if !store::is_unattributed_id(&intent.item) {
         return Ok(Settlement::refused(
             "the held item's id is not the shape of an unattributed payment",
@@ -1599,7 +1587,10 @@ pub async fn reconcile_attribute(
 
 /// Close a held payment with the evidence it went back or was kept. No payment
 /// line and no notice: no money moved and no account was touched.
-pub async fn reconcile_return(store: &Store, intent: ReturnIntent) -> Result<Settlement, Error> {
+pub async fn reconcile_return(
+    store: &Store,
+    intent: ReturnIntent,
+) -> Result<Settlement, Transitions> {
     if !store::is_unattributed_id(&intent.item) {
         return Ok(Settlement::refused(
             "the held item's id is not the shape of an unattributed payment",
@@ -1635,7 +1626,10 @@ pub async fn reconcile_return(store: &Store, intent: ReturnIntent) -> Result<Set
     let item = intent.item.clone();
     rewrite_unattributed(store, &item, |line| {
         if line.state != "held" {
-            return Err(Error::Failed(format!("{item} is {}, not held", line.state)));
+            return Err(Transitions::Payments(Error::HeldNotHeld {
+                item: item.clone(),
+                state: line.state.clone(),
+            }));
         }
         line.state = "returned".to_string();
         line.returned_at = Some(util::filed_at());
@@ -1653,14 +1647,18 @@ pub async fn reconcile_return(store: &Store, intent: ReturnIntent) -> Result<Set
 
 /// Mark one held line attributed to a token. Idempotent for the replay path, and
 /// a returned item is refused rather than relabelled.
-pub(super) async fn mark_attributed(store: &Store, item: &str, token: &str) -> Result<(), Error> {
+pub(super) async fn mark_attributed(
+    store: &Store,
+    item: &str,
+    token: &str,
+) -> Result<(), Transitions> {
     let id = item.to_string();
     let token = token.to_string();
     rewrite_unattributed(store, item, move |line| {
         if line.state == "returned" {
-            return Err(Error::Failed(format!(
-                "{id} was returned, so it cannot be attributed"
-            )));
+            return Err(Transitions::Payments(Error::HeldReturned {
+                id: id.clone(),
+            }));
         }
         if line.state == "held" {
             line.state = "attributed".to_string();
@@ -1681,41 +1679,43 @@ pub(super) async fn mark_attributed(store: &Store, item: &str, token: &str) -> R
 async fn rewrite_unattributed(
     store: &Store,
     id: &str,
-    change: impl FnOnce(&mut store::HeldItem) -> Result<(), Error>,
-) -> Result<(), Error> {
+    change: impl FnOnce(&mut store::HeldItem) -> Result<(), Transitions>,
+) -> Result<(), Transitions> {
     let _guard = store.log(store::UNATTRIBUTED).lock().await?;
     let mut items = store.held().await?;
     let at = items
         .iter()
         .position(|line| line.id == id)
-        .ok_or_else(|| Error::Failed(format!("no held payment with id {id}")))?;
+        .ok_or_else(|| Transitions::Payments(Error::HeldMissing { id: id.to_string() }))?;
     change(&mut items[at])?;
     let mut bytes = String::new();
     for item in &items {
-        bytes.push_str(&serde_json::to_string(item).map_err(|source| Error::Json {
-            context: "encode the queue",
-            source,
-        })?);
+        bytes.push_str(
+            &serde_json::to_string(item).map_err(|source| Transitions::Json {
+                context: "encode the queue",
+                source,
+            })?,
+        );
         bytes.push('\n');
     }
     store
         .rewrite_log(store::UNATTRIBUTED, bytes.as_bytes())
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// Whether the unattributed queue already holds this intent's line.
-async fn held_has_intent(store: &Store, id: &str) -> Result<bool, Error> {
+async fn held_has_intent(store: &Store, id: &str) -> Result<bool, Transitions> {
     store
         .log(store::UNATTRIBUTED)
         .jsonl_any(|line: &store::HeldItem| line.intent == id)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// The held line carrying this transaction id, with its id and the date it was
 /// received, so a second sighting of one payment can name both.
-async fn held_txid(store: &Store, txid: &str) -> Result<Option<(String, String)>, Error> {
+async fn held_txid(store: &Store, txid: &str) -> Result<Option<(String, String)>, Transitions> {
     Ok(store
         .held()
         .await?
@@ -1770,7 +1770,7 @@ async fn journal_credit_applying(
     intent: &CreditIntent,
     username: &str,
     progress: &CreditProgress,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let line = JournalLine {
         version: 1,
         at: util::filed_at(),
@@ -1784,12 +1784,15 @@ async fn journal_credit_applying(
         credit: Some(progress.clone()),
         refund: None,
     };
-    journal.append(store, &line).await.map_err(Error::from)
+    journal
+        .append(store, &line)
+        .await
+        .map_err(Transitions::from)
 }
 
 /// The ledger line carrying this transaction id, with the date it was first
 /// credited and its `seq`, so a second credit can name both.
-async fn ledger_txid(store: &Store, txid: &str) -> Result<Option<(u64, String)>, Error> {
+async fn ledger_txid(store: &Store, txid: &str) -> Result<Option<(u64, String)>, Transitions> {
     Ok(Ledger::open(store).by_txid(txid).await?.map(|line| {
         (
             line.seq,
@@ -1855,7 +1858,7 @@ async fn append_credit_ledger(
     amount_gbp: &str,
     applied_gbp: &str,
     paid_until_after: Option<&str>,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let quoted = quote.filter(|_| intent.rail == "monero");
     let mut line = LedgerLine::empty(&intent.token, "payment", &intent.rail);
     line.received_on = Some(received_on.to_string());
@@ -2333,7 +2336,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                Error::Core(kyriakon_control_core::Error::Payments(
+                Transitions::Core(kyriakon_control_core::Error::Payments(
                     kyriakon_control_core::payments::Error::ParseLine { line: 2, .. }
                 ))
             ),

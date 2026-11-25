@@ -47,6 +47,10 @@ pub enum Error {
     Review(review::Error),
     /// A group transition failed.
     Groups(groups::Error),
+    /// A card transition failed.
+    Stripe(stripe::Error),
+    /// A payments transition failed.
+    Payments(payments::Error),
     /// A JSON record did not encode or parse.
     Json {
         context: &'static str,
@@ -65,6 +69,8 @@ impl fmt::Display for Error {
             Error::Lifecycle(error) => error.fmt(f),
             Error::Review(error) => error.fmt(f),
             Error::Groups(error) => error.fmt(f),
+            Error::Stripe(error) => error.fmt(f),
+            Error::Payments(error) => error.fmt(f),
             Error::Json { context, source } => write!(f, "cannot {context}: {source}"),
         }
     }
@@ -81,6 +87,8 @@ impl std::error::Error for Error {
             Error::Lifecycle(error) => Some(error),
             Error::Review(error) => Some(error),
             Error::Groups(error) => Some(error),
+            Error::Stripe(error) => Some(error),
+            Error::Payments(error) => Some(error),
             Error::Json { source, .. } => Some(source),
         }
     }
@@ -138,6 +146,18 @@ impl From<review::Error> for Error {
 impl From<groups::Error> for Error {
     fn from(error: groups::Error) -> Self {
         Error::Groups(error)
+    }
+}
+
+impl From<stripe::Error> for Error {
+    fn from(error: stripe::Error) -> Self {
+        Error::Stripe(error)
+    }
+}
+
+impl From<payments::Error> for Error {
+    fn from(error: payments::Error) -> Self {
+        Error::Payments(error)
     }
 }
 
