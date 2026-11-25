@@ -322,7 +322,10 @@ fn signature_parts<'a>(
         match name {
             "t" => {
                 timestamp = Some(value.parse::<i64>().map_err(|source| {
-                    Transitions::context(format!("the timestamp {value:?} is not a number"), source)
+                    Transitions::Stripe(Error::TimestampNotNumber {
+                        value: value.to_string(),
+                        source,
+                    })
                 })?);
             }
             "v1" => signatures.push(value),
@@ -1083,7 +1086,7 @@ fn invoice_covers(
     }
     let (field, price) = billing.price(cfg);
     let price = util::pence(price)
-        .map_err(|e| Transitions::context(format!("the drain's configured {field}"), e))?;
+        .map_err(|source| Transitions::Stripe(Error::ConfigPrice { field, source }))?;
     if price <= 0 {
         return Err(Transitions::Stripe(Error::PriceNotPositive { field }));
     }
@@ -1104,9 +1107,9 @@ fn invoice_applied(
 ) -> Result<String, Transitions> {
     let (field, price) = billing.price(cfg);
     let price = util::pence(price)
-        .map_err(|e| Transitions::context(format!("the drain's configured {field}"), e))?;
-    let amount =
-        util::pence(amount_gbp).map_err(|e| Transitions::context("the invoice's amount", e))?;
+        .map_err(|source| Transitions::Stripe(Error::ConfigPrice { field, source }))?;
+    let amount = util::pence(amount_gbp)
+        .map_err(|source| Transitions::Stripe(Error::InvoiceAmount { source }))?;
     Ok(util::gbp(amount.min(price)))
 }
 

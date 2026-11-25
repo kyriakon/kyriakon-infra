@@ -34,9 +34,10 @@ pub enum Error {
     SessionIdle,
     /// The terminal sent bytes that are not UTF-8.
     InputNotText,
-    /// The sandbox refused the narrowed view. `reason` is that boundary's own
-    /// text, which names the call and the path it refused.
-    Restrict { reason: String },
+    /// The sandbox refused the narrowed view.
+    Restrict {
+        source: kyriakon_control_core::sandbox::Error,
+    },
     /// The store failed.
     Store(store::Error),
     /// The configuration failed.
@@ -98,7 +99,7 @@ impl fmt::Display for Error {
             Error::SessionTooLong => f.write_str("the session has reached its maximum length"),
             Error::SessionIdle => f.write_str("the session was idle for too long"),
             Error::InputNotText => f.write_str("the session's input is not text"),
-            Error::Restrict { reason } => f.write_str(reason),
+            Error::Restrict { source } => source.fmt(f),
             Error::Store(error) => error.fmt(f),
             Error::Config(error) => error.fmt(f),
             Error::Core(error) => error.fmt(f),
@@ -126,8 +127,8 @@ impl std::error::Error for Error {
             | Error::NoServices { .. }
             | Error::SessionTooLong
             | Error::SessionIdle
-            | Error::InputNotText
-            | Error::Restrict { .. } => None,
+            | Error::InputNotText => None,
+            Error::Restrict { source } => Some(source),
             #[cfg(test)]
             Error::NoStatusScripted | Error::StatusNotAsked | Error::FilesNothing => None,
         }
@@ -137,13 +138,6 @@ impl std::error::Error for Error {
 impl Error {
     pub fn report(&self, context: &str) {
         kyriakon_control_core::util::report(self, context);
-    }
-
-    pub fn context(
-        context: impl Into<String>,
-        source: impl Into<kyriakon_control_core::Source>,
-    ) -> Self {
-        Error::Core(CoreError::context(context, source))
     }
 }
 

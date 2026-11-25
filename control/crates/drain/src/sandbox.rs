@@ -34,13 +34,21 @@ use kyriakon_control_core::sandbox;
 #[derive(Debug)]
 pub enum Error {
     /// `unveil(2)` refused a path.
-    Unveil { reason: String },
+    Unveil {
+        source: kyriakon_control_core::sandbox::Error,
+    },
     /// `unveil(2)` refused to lock the list.
-    Lock { reason: String },
+    Lock {
+        source: kyriakon_control_core::sandbox::Error,
+    },
     /// `access(2)` refused a path the pass reads.
-    Probe { reason: String },
+    Probe {
+        source: kyriakon_control_core::sandbox::Error,
+    },
     /// `pledge(2)` refused the syscall set.
-    Pledge { reason: String },
+    Pledge {
+        source: kyriakon_control_core::sandbox::Error,
+    },
     /// A configured path has no directory to unveil.
     NoParent { path: String },
     /// The temp directory is not UTF-8.
@@ -50,17 +58,27 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Unveil { reason }
-            | Error::Lock { reason }
-            | Error::Probe { reason }
-            | Error::Pledge { reason } => f.write_str(reason),
+            Error::Unveil { source }
+            | Error::Lock { source }
+            | Error::Probe { source }
+            | Error::Pledge { source } => source.fmt(f),
             Error::NoParent { path } => write!(f, "{path} has no directory to unveil"),
             Error::TempDirNotUtf8 => f.write_str("the temp directory is not UTF-8"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Unveil { source }
+            | Error::Lock { source }
+            | Error::Probe { source }
+            | Error::Pledge { source } => Some(source),
+            Error::NoParent { .. } | Error::TempDirNotUtf8 => None,
+        }
+    }
+}
 
 /// The promises a full pass needs, one per operation the pass performs:
 ///
@@ -172,7 +190,7 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
     // Lock the list: after this, no later unveil can widen the view and a path
     // not named above is invisible. Strongly recommended by unveil(2), and the
     // only state a pass cannot undo.
-    sandbox::lock().map_err(|reason| Error::Lock { reason })?;
+    sandbox::lock().map_err(|source| Error::Lock { source })?;
 
     // With the list locked, a read path named above is reachable and one that
     // is not fails with `ENOENT`. Probe every path the pass reads here, before
@@ -183,7 +201,7 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
     // The exec promise set is NULL on purpose: the scripts and helpers are
     // themselves OpenBSD programs with their own pledge or none, and forcing
     // this pass's file view on a `/root/bin` script would fail its own reads.
-    sandbox::pledge(PROMISES).map_err(|reason| Error::Pledge { reason })?;
+    sandbox::pledge(PROMISES).map_err(|source| Error::Pledge { source })?;
     Ok(())
 }
 
@@ -198,7 +216,7 @@ pub fn restrict(_cfg: &DrainConfig) -> Result<(), Transitions> {
 /// call, so the pass reads which call failed without parsing the kernel's text.
 #[cfg(target_os = "openbsd")]
 fn unveil(path: &str, permissions: &str) -> Result<(), Transitions> {
-    sandbox::unveil(path, permissions).map_err(|reason| Transitions::from(Error::Unveil { reason }))
+    sandbox::unveil(path, permissions).map_err(|source| Transitions::from(Error::Unveil { source }))
 }
 
 /// The directory an atomic rewrite creates its temp file and lock in.
@@ -269,5 +287,5 @@ fn probe_pass_paths(cfg: &DrainConfig) -> Result<(), Transitions> {
 /// The policy's spelling of the shared probe.
 #[cfg(target_os = "openbsd")]
 fn probe(path: &str) -> Result<(), Transitions> {
-    sandbox::probe(path).map_err(|reason| Transitions::from(Error::Probe { reason }))
+    sandbox::probe(path).map_err(|source| Transitions::from(Error::Probe { source }))
 }

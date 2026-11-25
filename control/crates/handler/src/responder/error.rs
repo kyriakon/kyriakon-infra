@@ -30,9 +30,10 @@ pub enum Error {
     NoServices { path: &'static str },
     /// A mirrored page exists and holds only whitespace.
     EmptyPage { path: String },
-    /// The sandbox refused the narrowed view. `reason` is that boundary's own
-    /// text, which names the call and the path it refused.
-    Restrict { reason: String },
+    /// The sandbox refused the narrowed view.
+    Restrict {
+        source: kyriakon_control_core::sandbox::Error,
+    },
     /// The store failed while reading or writing a form record.
     Store(store::Error),
     /// The configuration failed.
@@ -70,7 +71,7 @@ pub enum Error {
     Fastcgi(crate::fastcgi::Error),
     /// A failure whose context is what the operator needs, with its source.
     Context {
-        context: String,
+        context: &'static str,
         source: Box<kyriakon_control_core::Source>,
     },
 }
@@ -120,7 +121,7 @@ impl fmt::Display for Error {
             Error::NoQuestions { path } => write!(f, "{path} has no questions"),
             Error::NoServices { path } => write!(f, "{path} has no services"),
             Error::EmptyPage { path } => write!(f, "{path} is empty"),
-            Error::Restrict { reason } => f.write_str(reason),
+            Error::Restrict { source } => source.fmt(f),
             Error::Refused(refusal) => refusal.fmt(f),
             Error::Store(error) => error.fmt(f),
             Error::Core(error) => error.fmt(f),
@@ -156,11 +157,11 @@ impl std::error::Error for Error {
             | Error::NoQuestions { .. }
             | Error::NoServices { .. }
             | Error::EmptyPage { .. }
-            | Error::Restrict { .. }
             | Error::Refused(_)
             | Error::Line { .. }
             | Error::TitanTimeout => None,
             Error::Store(error) | Error::Lookup(error) => Some(error),
+            Error::Restrict { source } => Some(source),
             Error::Core(error) => Some(error),
             Error::Fastcgi(error) => Some(error),
             Error::Config(error) => Some(error),
@@ -178,11 +179,11 @@ impl Error {
     }
 
     pub fn context(
-        context: impl Into<String>,
+        context: &'static str,
         source: impl Into<kyriakon_control_core::Source>,
     ) -> Self {
         Error::Context {
-            context: context.into(),
+            context,
             source: Box::new(source.into()),
         }
     }

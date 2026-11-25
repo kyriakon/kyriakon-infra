@@ -16,10 +16,8 @@ use kyriakon_control_core::sandbox;
 /// pledge. `tty` is true only when the full-screen mode will call `tcsetattr`:
 /// the plain mode is a line reader and gives up the promise rather than carry
 /// a terminal operation it never makes.
-pub fn restrict(cfg: &Config, state: &Path, tty: bool) -> Result<(), String> {
-    let state = state
-        .to_str()
-        .ok_or_else(|| format!("the state path is not UTF-8: {}", state.display()))?;
+pub fn restrict(cfg: &Config, state: &Path, tty: bool) -> Result<(), sandbox::Error> {
+    let state = sandbox::path(state, "state")?;
     sandbox::unveil(&cfg.catalogue, "r")?;
     sandbox::unveil(&cfg.reserved, "r")?;
     sandbox::unveil(state, "rwc")?;

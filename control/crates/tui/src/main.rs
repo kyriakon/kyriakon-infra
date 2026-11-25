@@ -99,28 +99,34 @@ fn run() -> Result<Departure, Error> {
     }
 
     let cfg = config::Config::load(&cfg_path)?;
-    let text = std::fs::read_to_string(&cfg.catalogue)
-        .map_err(|e| Error::context(format!("cannot read {}", cfg.catalogue), e))?;
+    let text = std::fs::read_to_string(&cfg.catalogue).map_err(|source| Error::Io {
+        what: "read",
+        path: Some(cfg.catalogue.clone().into()),
+        source,
+    })?;
     let list = catalogue::parse(&text)?;
     let questions = questions::shipped()?;
-    let reserved = validate::reserved(
-        &std::fs::read_to_string(&cfg.reserved)
-            .map_err(|e| Error::context(format!("cannot read {}", cfg.reserved), e))?,
-    );
+    let reserved =
+        validate::reserved(&std::fs::read_to_string(&cfg.reserved).map_err(|source| {
+            Error::Io {
+                what: "read",
+                path: Some(cfg.reserved.clone().into()),
+                source,
+            }
+        })?);
     // The session directory is created while the view is still whole: the
     // deploy makes the live one, and a run whose `--state` names a new directory
     // must not fail because the veil cannot create it.
-    std::fs::create_dir_all(&state).map_err(|e| {
-        Error::context(
-            format!("cannot create the state directory {}", state.display()),
-            e,
-        )
+    std::fs::create_dir_all(&state).map_err(|source| Error::Io {
+        what: "create",
+        path: Some(state.clone()),
+        source,
     })?;
     // The mode is decided before the view narrows, because the full screen needs
     // the `tty` promise and the plain one does not.
     let mode = forced.unwrap_or_else(chosen);
     sandbox::restrict(&cfg, &state, mode != Mode::Plain)
-        .map_err(|reason| Error::Restrict { reason })?;
+        .map_err(|source| Error::Restrict { source })?;
 
     // The session's member, where the key it presented names one: [#381] asks the
     // handler which account a key fingerprint belongs to and passes the answer

@@ -304,7 +304,7 @@ pub async fn serve(cfg: config::Config) -> Result<(), Error> {
             path: Some(app.cfg.titan_listener.clone().into()),
             source,
         })?;
-    crate::sandbox::restrict(&app.cfg).map_err(|reason| Error::Restrict { reason })?;
+    crate::sandbox::restrict(&app.cfg).map_err(|source| Error::Restrict { source })?;
     kyriakon_control_core::util::log(&format!(
         "kyriakon-control: httpd {}, gemini {}, portal {}, titan {}, store {}, {} questions",
         app.cfg.httpd_socket,

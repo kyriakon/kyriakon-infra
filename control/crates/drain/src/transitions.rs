@@ -128,7 +128,7 @@ impl Error {
     }
 
     pub fn context(
-        context: impl Into<String>,
+        context: &'static str,
         source: impl Into<kyriakon_control_core::Source>,
     ) -> Self {
         Error::Core(kyriakon_control_core::Error::context(context, source))

@@ -123,7 +123,7 @@ impl fmt::Display for Error {
             ),
             Error::SymlinkAtAppend { path } => write!(
                 f,
-                "a symlink is planted at {}; an append is not written through it",
+                "a symlink or non-regular file is planted at {}; an append is not written through it",
                 path.display()
             ),
             Error::LockNotRegularFile { path } => write!(
