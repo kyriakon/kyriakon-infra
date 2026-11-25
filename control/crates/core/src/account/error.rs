@@ -16,14 +16,14 @@ use crate::store;
 pub enum Error {
     /// The store failed while reading or writing an account record.
     Store(store::Error),
-    /// The payment ledger failed. The ledger's own error is still flat until
-    /// #1012, so it is wrapped whole and forwarded unchanged.
+    /// The payment ledger failed; the wrapped payments error is forwarded
+    /// unchanged. Boxed because `core::Error` wraps this enum.
     Ledger(Box<crate::Error>),
-    /// The ready notice could not be sent. The mail error is still flat until
-    /// #1012, so it is wrapped whole and forwarded unchanged.
+    /// The ready notice could not be sent; the wrapped mail error is forwarded
+    /// unchanged. Boxed because `core::Error` wraps this enum.
     Notice(Box<crate::Error>),
-    /// The bundle could not be encrypted. The mail error is still flat until
-    /// #1012, so it is wrapped whole and forwarded unchanged.
+    /// The bundle could not be encrypted; the wrapped mail error is forwarded
+    /// unchanged. Boxed because `core::Error` wraps this enum.
     Encrypt(Box<crate::Error>),
 
     // ---- the DNS recipe a body publishes ----
