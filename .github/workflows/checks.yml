@@ -64,6 +64,14 @@ jobs:
       # fails the check rather than scrolling past.
       - name: clippy
         run: cargo clippy --manifest-path control/Cargo.toml --all-targets -- -D warnings
+      # The typed-error shape is a rule, not a convention: a `Failed(String)`
+      # or a message-carrying `Refused` is how the old errors lost their state.
+      # The gate runs after the build, so a compile failure is not reported as
+      # a clean search.
+      - name: error shapes
+        run: |
+          set -eu
+          ! rg -n 'Error::Failed|Failed\(String\)|Refused\(String\)|Startup\(String\)|Malformed\(String\)' control/crates kyriakon-encrypt
       # The package cut is a rule, not a convention: the unprivileged handler
       # must not link the root drain, and the terminal must not link the handler.
       # The tree is captured before it is searched: piped into grep under `bash

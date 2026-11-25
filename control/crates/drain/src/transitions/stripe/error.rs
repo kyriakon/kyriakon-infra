@@ -28,6 +28,20 @@ pub enum Error {
     NoEventObject,
     /// The configured price is not more than zero.
     PriceNotPositive { field: &'static str },
+    /// The signature's `t=` value is not a Unix timestamp.
+    TimestampNotNumber {
+        value: String,
+        source: std::num::ParseIntError,
+    },
+    /// The drain's configured price is not a GBP amount.
+    ConfigPrice {
+        field: &'static str,
+        source: kyriakon_control_core::util::Error,
+    },
+    /// The invoice's amount is not a GBP amount.
+    InvoiceAmount {
+        source: kyriakon_control_core::util::Error,
+    },
     /// The paid invoice says nothing about its amount.
     InvoiceNoAmount,
     /// The paid invoice says nothing about when it was paid.
@@ -58,6 +72,13 @@ impl fmt::Display for Error {
             Error::PriceNotPositive { field } => {
                 write!(f, "the drain's configured {field} must be more than zero")
             }
+            Error::TimestampNotNumber { value, source } => {
+                write!(f, "the timestamp {value:?} is not a number: {source}")
+            }
+            Error::ConfigPrice { field, source } => {
+                write!(f, "the drain's configured {field}: {source}")
+            }
+            Error::InvoiceAmount { source } => write!(f, "the invoice's amount: {source}"),
             Error::InvoiceNoAmount => f.write_str("the paid invoice carries no amount_paid"),
             Error::InvoiceNoPaidTimestamp => {
                 f.write_str("the paid invoice carries no paid timestamp")
@@ -82,6 +103,9 @@ impl std::error::Error for Error {
         match self {
             Error::SubscriptionUnreadable { source } => Some(source),
             Error::SessionUnreadable { source } => Some(source),
+            Error::TimestampNotNumber { source, .. } => Some(source),
+            Error::ConfigPrice { source, .. } => Some(source),
+            Error::InvoiceAmount { source } => Some(source),
             _ => None,
         }
     }

@@ -147,11 +147,10 @@ impl Sessions {
     /// session with no address to key on: a manual run rather than an sshd
     /// session, which always carries `SSH_CONNECTION`.
     pub fn open(dir: &Path, address: Option<IpAddr>) -> Result<Admission, Error> {
-        fs::create_dir_all(dir).map_err(|e| {
-            Error::context(
-                format!("cannot open the session directory {}", dir.display()),
-                e,
-            )
+        fs::create_dir_all(dir).map_err(|source| Error::Io {
+            what: "create",
+            path: Some(dir.into()),
+            source,
         })?;
         // One directory-wide lock, so the prune, the counts and the create are one
         // critical section across every address. It is the only permanent file
@@ -168,7 +167,11 @@ impl Sessions {
             .truncate(false)
             .write(true)
             .open(&count_path)
-            .map_err(|e| Error::context(format!("cannot open {}", count_path.display()), e))?;
+            .map_err(|source| Error::Io {
+                what: "open",
+                path: Some(count_path.clone()),
+                source,
+            })?;
         lock_exclusive(count_lock.as_raw_fd(), &count_path)?;
         prune(dir)?;
 
@@ -182,11 +185,16 @@ impl Sessions {
         let prefix = session_prefix(address);
         let mut held = 0;
         let mut total = 0;
-        for entry in fs::read_dir(dir)
-            .map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?
-        {
-            let entry =
-                entry.map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?;
+        for entry in fs::read_dir(dir).map_err(|source| Error::Io {
+            what: "read",
+            path: Some(dir.into()),
+            source,
+        })? {
+            let entry = entry.map_err(|source| Error::Io {
+                what: "read",
+                path: Some(dir.into()),
+                source,
+            })?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if !name.contains('@') {
@@ -217,7 +225,11 @@ impl Sessions {
             .create_new(true)
             .write(true)
             .open(&path)
-            .map_err(|e| Error::context(format!("cannot write {}", path.display()), e))?;
+            .map_err(|source| Error::Io {
+                what: "write",
+                path: Some(path.clone()),
+                source,
+            })?;
         lock_exclusive(file.as_raw_fd(), &path)?;
         Ok(Admission::Open(Sessions {
             path: Some(path),
@@ -278,11 +290,16 @@ fn lock_exclusive(fd: i32, path: &Path) -> Result<(), Error> {
 /// open is left alone: the directory is the portal's, but a name it did not write
 /// is not evidence of a session.
 fn prune(dir: &Path) -> Result<(), Error> {
-    for entry in fs::read_dir(dir)
-        .map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?
-    {
-        let entry =
-            entry.map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?;
+    for entry in fs::read_dir(dir).map_err(|source| Error::Io {
+        what: "read",
+        path: Some(dir.into()),
+        source,
+    })? {
+        let entry = entry.map_err(|source| Error::Io {
+            what: "read",
+            path: Some(dir.into()),
+            source,
+        })?;
         let name = entry.file_name();
         if !name.to_string_lossy().contains('@') {
             continue;
@@ -459,7 +476,11 @@ impl Watch {
                 if error.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                return Err(Error::context("cannot wait for the session's input", error));
+                return Err(Error::Io {
+                    what: "wait for the session's input",
+                    path: None,
+                    source: error,
+                });
             }
             // The wait ran out; the loop says which deadline it was.
         }
@@ -1437,7 +1458,11 @@ pub trait Output: Write {
     fn put(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.write_all(bytes)
             .and_then(|()| self.flush())
-            .map_err(|e| Error::context("cannot write to the session", e))
+            .map_err(|source| Error::Io {
+                what: "write to the session",
+                path: None,
+                source,
+            })
     }
 }
 
@@ -1487,7 +1512,11 @@ impl<W: Write> Output for SessionOut<W> {
         self.inner
             .write_all(bytes)
             .and_then(|()| self.inner.flush())
-            .map_err(|e| Error::context("cannot write to the session", e))
+            .map_err(|source| Error::Io {
+                what: "write to the session",
+                path: None,
+                source,
+            })
     }
 }
 

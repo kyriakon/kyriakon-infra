@@ -48,10 +48,8 @@ enum Error {
         arg: String,
     },
     /// The sandbox refused a path or a pledge.
-    /// shortcut: `core::sandbox` still returns a sentence; type it there and
-    /// drop the `String` when that boundary is converted.
     Restrict {
-        refusal: String,
+        source: kyriakon_control_core::sandbox::Error,
     },
 }
 
@@ -67,7 +65,7 @@ impl std::fmt::Display for Error {
                 f,
                 "unknown argument {arg:?}; usage: kyriakon-control-static [--config PATH]"
             ),
-            Error::Restrict { refusal } => f.write_str(refusal),
+            Error::Restrict { source } => source.fmt(f),
         }
     }
 }
@@ -77,7 +75,8 @@ impl std::error::Error for Error {
         match self {
             Error::Core(error) => Some(error),
             Error::ConfigParse { source, .. } => Some(source),
-            Error::ConfigNeedsPath | Error::UnknownArgument { .. } | Error::Restrict { .. } => None,
+            Error::ConfigNeedsPath | Error::UnknownArgument { .. } => None,
+            Error::Restrict { source } => Some(source),
         }
     }
 }
@@ -315,7 +314,7 @@ async fn run() -> Result<(), Error> {
                 source,
             }
         })?;
-    sandbox::restrict(&cfg.root, &cfg.hosts).map_err(|refusal| Error::Restrict { refusal })?;
+    sandbox::restrict(&cfg.root, &cfg.hosts).map_err(|source| Error::Restrict { source })?;
     util::log(&format!(
         "kyriakon-control-static: httpd {}, gemini {}, root {}",
         cfg.httpd_socket.display(),

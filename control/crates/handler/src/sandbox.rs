@@ -28,7 +28,7 @@ use kyriakon_control_core::sandbox;
 /// alone.
 const PROMISES: &str = "stdio rpath wpath cpath fattr flock unix inet proc exec";
 
-pub fn restrict(cfg: &Config) -> Result<(), String> {
+pub fn restrict(cfg: &Config) -> Result<(), sandbox::Error> {
     sandbox::unveil(&cfg.store_root, "rwc")?;
     sandbox::unveil("/dev/urandom", "r")?;
     sandbox::unveil("/dev/null", "rw")?;
