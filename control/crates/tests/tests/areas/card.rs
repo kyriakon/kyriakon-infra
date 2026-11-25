@@ -1231,11 +1231,69 @@ fn a_record_rewritten_after_approval_cannot_redirect_a_card_payment() {
     let warden_token = approved_paid(&fix, "warden", "card");
     assert_ne!(secretary_token, warden_token);
 
-    // The handler rewrites the application record after the approval. The
-    // payment block it names is the other account's.
+    let snapshot = fix.read(&format!("reviewed/{TOKEN}.json"));
+    assert!(!snapshot.is_empty(), "the approval wrote no snapshot");
+
+    // The handler plants a second record naming the victim's token, with an old
+    // filing date and an open window so the purge keeps the join, and its own
+    // payment target. The sweep derives the token from the file name, so this
+    // record cannot reach the victim's snapshot.
+    let mut evil: Value =
+        serde_json::from_str(&fix.read(&format!("applications/{TOKEN}.json"))).unwrap();
+    evil["status_token"] = json!(TOKEN);
+    evil["filed_at"] = json!(kyriakon_control_core::util::after_days(-100));
+    evil["payment"]["token_ref"] = json!(warden_token);
+    evil["payment"]["window"]["state"] = json!("open");
+    evil["payment"]["window"]["closes_at"] = json!("2099-01-01T00:00:00Z");
+    std::fs::write(
+        fix.dir.join("store/applications/evil.json"),
+        serde_json::to_vec_pretty(&evil).unwrap(),
+    )
+    .unwrap();
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(fix.read("reviewed/evil.json").is_empty());
+    assert_eq!(
+        fix.read(&format!("reviewed/{TOKEN}.json")),
+        snapshot,
+        "a planted record replaced the victim's snapshot"
+    );
+
+    // The same rewrite on the victim's own record. The file name is the token,
+    // so the purge must strip the answers from the snapshot itself rather than
+    // rebuild it from the handler's record.
     fix.amend_application(TOKEN, |record| {
+        record["filed_at"] = json!(kyriakon_control_core::util::after_days(-100));
         record["payment"]["token_ref"] = json!(warden_token);
+        record["payment"]["window"]["state"] = json!("open");
+        record["payment"]["window"]["closes_at"] = json!("2099-01-01T00:00:00Z");
     });
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    let reviewed: Value =
+        serde_json::from_str(&fix.read(&format!("reviewed/{TOKEN}.json"))).unwrap();
+    assert_eq!(
+        reviewed["payment"]["token_ref"],
+        json!(secretary_token),
+        "the purge rebuilt the snapshot from the handler's record: {reviewed}"
+    );
+
+    // A pre-snapshot approval has no root copy. The purge must not create one
+    // from the handler's record, and the card pass resolves the legacy approval
+    // from the root-owned account below.
+    std::fs::remove_file(fix.dir.join(format!("store/reviewed/{TOKEN}.json"))).unwrap();
+    fix.amend_application(TOKEN, |record| {
+        record["filed_at"] = json!(kyriakon_control_core::util::after_days(-100));
+        record["payment"]["token_ref"] = json!(warden_token);
+        record["payment"]["window"]["state"] = json!("open");
+        record["payment"]["window"]["closes_at"] = json!("2099-01-01T00:00:00Z");
+    });
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.read(&format!("reviewed/{TOKEN}.json")).is_empty(),
+        "the purge built a snapshot from the handler's record"
+    );
 
     fix.webhook(
         "evt_snapshot_checkout",

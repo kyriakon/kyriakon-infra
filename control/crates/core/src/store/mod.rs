@@ -322,9 +322,10 @@ impl Store {
         self.typed_record(&format!("reviewed/{token}.json")).await
     }
 
-    /// Write the root-only review snapshot. A retry leaves an existing snapshot
-    /// alone unless it is the approval's own update, which the caller signals by
-    /// writing the payment-bearing copy itself.
+    /// Write the root-only review snapshot. The approval writes it with the
+    /// payment block the card pass resolves through; the purge rewrites the
+    /// snapshot it already holds with the answers stripped. Neither builds it
+    /// from a handler-owned record.
     pub async fn write_reviewed_application(&self, token: &str, bytes: &[u8]) -> Result<(), Error> {
         check_name(token)?;
         self.ensure_dir("reviewed").await?;

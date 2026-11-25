@@ -4312,12 +4312,25 @@ pub async fn purge_declined(
         if !name.ends_with(".json") {
             continue;
         }
-        let Some(record) =
-            sweep_application(cfg, store, journal, name.trim_end_matches(".json")).await
-        else {
+        let token = name.trim_end_matches(".json");
+        let Some(record) = sweep_application(cfg, store, journal, token).await else {
             continue;
         };
         if !record.stage.starts_with("declined") {
+            continue;
+        }
+        // The record is the handler's, so its token can name another file: the
+        // write below lands under the name this loop derived, never the field.
+        if !store::is_status_token(token) || record.status_token.as_str() != token {
+            report_record(
+                cfg,
+                store,
+                journal,
+                "application",
+                token,
+                &Error::Failed(format!("application {name} names another token; skipped")),
+            )
+            .await;
             continue;
         }
         let Some(decided_at) = record.decided_at.as_deref() else {
@@ -4332,7 +4345,7 @@ pub async fn purge_declined(
         // days. Keep the facts the status page renders and clear the answers,
         // so the data ends on time without cutting the week short.
         if util::link_answers(decided_at, now) {
-            keep_record_join(store, &record.status_token, &record).await?;
+            keep_record_join(store, token, &record).await?;
             continue;
         }
         // The record was written by the unprivileged half, so the username is
@@ -4464,18 +4477,23 @@ async fn keep_copy_join(
         .map_err(Error::from)
 }
 
+/// Drop the fields ADR 0005 bounds from an application record.
+fn strip_answers(record: &mut Record) {
+    record.answers.clear();
+    record.mail_keys.clear();
+    record.upload_key = None;
+    record.acceptances.clear();
+    record.outside_address = None;
+    record.password_link = None;
+    record.confirmation_at = None;
+}
+
 /// Write the shared record back with its answers gone, keeping the payment join
 /// and the domain, so the card pass can resolve a payment through it and a
 /// declined body is still known to be a body.
 async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result<(), Error> {
     let mut kept = record.clone();
-    kept.answers.clear();
-    kept.mail_keys.clear();
-    kept.upload_key = None;
-    kept.acceptances.clear();
-    kept.outside_address = None;
-    kept.password_link = None;
-    kept.confirmation_at = None;
+    strip_answers(&mut kept);
     let bytes = serde_json::to_vec_pretty(&kept).map_err(|source| Error::Json {
         context: "encode the application record",
         source,
@@ -4484,8 +4502,25 @@ async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result
         .write_filed_application(token, &bytes)
         .await
         .map_err(Error::from)?;
-    // The root snapshot keeps the same join and loses the same answers. Without
-    // this it would retain a second, un-purged copy of the application.
+    // The snapshot is what the card pass resolves a payment through, so it is
+    // never rebuilt from this handler-owned record: strip the answers from the
+    // snapshot itself, keeping the payment block root wrote. An approval that
+    // predates snapshots has none, and the card pass resolves it from the
+    // root-owned account; creating one here would install the handler's block.
+    // A damaged snapshot is left alone for the operator.
+    let mut snapshot = match store.reviewed_application(token).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            Error::from(e).report("the purge sweep");
+            return Ok(());
+        }
+    };
+    strip_answers(&mut snapshot);
+    let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|source| Error::Json {
+        context: "encode the reviewed application",
+        source,
+    })?;
     store
         .write_reviewed_application(token, &bytes)
         .await
@@ -4652,11 +4687,24 @@ pub async fn purge_applications(
         if !name.ends_with(".json") {
             continue;
         }
-        let Some(record) =
-            sweep_application(cfg, store, journal, name.trim_end_matches(".json")).await
-        else {
+        let token = name.trim_end_matches(".json");
+        let Some(record) = sweep_application(cfg, store, journal, token).await else {
             continue;
         };
+        // The record is the handler's, so its token can name another file: the
+        // write below lands under the name this loop derived, never the field.
+        if !store::is_status_token(token) || record.status_token.as_str() != token {
+            report_record(
+                cfg,
+                store,
+                journal,
+                "application",
+                token,
+                &Error::Failed(format!("application {name} names another token; skipped")),
+            )
+            .await;
+            continue;
+        }
         if !purge_due(&record.filed_at, today) {
             continue;
         }
@@ -4664,7 +4712,7 @@ pub async fn purge_applications(
         // link can still be charged, and this record is what resolves that
         // payment to the account. Keep the join, and take the answers out.
         if payment_window_open(record.payment.as_ref(), today) {
-            keep_record_join(store, &record.status_token, &record).await?;
+            keep_record_join(store, token, &record).await?;
             continue;
         }
         // A received record with its decision still queued is mid-approval, not
