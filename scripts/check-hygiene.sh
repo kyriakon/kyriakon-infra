@@ -186,10 +186,11 @@ alert_address_problem() {
 # deployed_drift <checkout-scripts> <table> <destination> <dir>
 #
 # One line per table row for <destination> with no installed copy, per installed
-# file whose copy is not the checkout's, per a retired row that is still
-# installed, and per directory that is gone. The table's rows are what the
-# deploys install, so a row with nothing installed is a finding: comparing only
-# the copies that happen to be there cannot see the install a deploy never made.
+# file whose copy is not the checkout's, per script row whose checkout source is
+# gone, per a retired row that is still installed, and per directory that is
+# gone. The table's rows are what the deploys install, so a row with nothing
+# installed is a finding: comparing only the copies that happen to be there
+# cannot see the install a deploy never made.
 # The installed name is the row's, so a file installed without its .sh suffix is
 # compared like any other.
 #
@@ -212,6 +213,15 @@ deployed_drift() {
 		# A compiled binary row names the build's output, not a file under
 		# scripts/. Presence is checkable; its content belongs to the build.
 		if [ ! -f "$checkout/$source" ]; then
+			# A script row's source is in the checkout, so an absent one leaves
+			# the installed copy uncompared. Reporting it is the finding; only a
+			# binary row, whose name has no .sh suffix, is presence-only.
+			case "$source" in
+			*.sh)
+				printf '%s: its source %s is not in the checkout\n' \
+					"$dir/$name" "$checkout/$source"
+				;;
+			esac
 			continue
 		fi
 		cmp -s "$dir/$name" "$checkout/$source" \
@@ -751,11 +761,14 @@ EOF
 	# The member session shell and the renamed login checker are the
 	# /usr/local/libexec rows; a stale copy is a finding for the same reason
 	# /root/bin's is, and the installed name comes from the row.
-	printf 'wrap.sh\t/usr/local/libexec\t-\t\tmail\t-\tactive\nkyriakon-authcheck.sh\t/usr/local/libexec\t-\t\tcontrol\tkyriakon-authcheck\tactive\n' \
+	printf 'wrap.sh\t/usr/local/libexec\t-\t\tmail\t-\tactive\nkyriakon-authcheck.sh\t/usr/local/libexec\t-\t\tcontrol\tkyriakon-authcheck\tactive\nkyriakon-fromcheck\t/usr/local/libexec\t-\t\tcontrol\tfilter-fromcheck\tactive\n' \
 		>"$dir/libexec-table"
 	mkdir -p "$dir/libexec"
 	printf 'new\n' > "$dir/checkout/wrap.sh"
 	printf 'old\n' > "$dir/libexec/wrap.sh"
+	# The compiled filter row has no source in the checkout: presence is all a
+	# binary row can be checked for, so an installed copy is not a finding.
+	printf 'new\n' > "$dir/libexec/filter-fromcheck"
 	printf 'new\n' > "$dir/checkout/kyriakon-authcheck.sh"
 	printf 'new\n' > "$dir/libexec/kyriakon-authcheck"
 	out=$(deployed_drift "$dir/checkout" "$dir/libexec-table" /usr/local/libexec "$dir/libexec")
@@ -796,6 +809,28 @@ EOF
 	*"$dir/libexec/kyriakon-authcheck: not installed"*) ;;
 	*)
 		printf 'FAIL: a missing suffixless install is a finding; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
+
+	# A script row whose checkout source is gone while its installed copy is
+	# still there: the installed copy is what runs, so a manifest loop that
+	# skipped the row would call the tree clean. The suffixless checker is only
+	# visible through its row, and the compiled filter row beside it stays
+	# presence-only, so it must not appear in the same output.
+	printf 'new\n' > "$dir/libexec/kyriakon-authcheck"
+	rm -f "$dir/checkout/kyriakon-authcheck.sh"
+	out=$(deployed_drift "$dir/checkout" "$dir/libexec-table" /usr/local/libexec "$dir/libexec")
+	case "$out" in
+	*"$dir/libexec/kyriakon-authcheck: its source $dir/checkout/kyriakon-authcheck.sh is not in the checkout"*) ;;
+	*)
+		printf 'FAIL: a script row whose checkout source is missing is a finding; got [%s]\n' "$out" >&2
+		exit 1
+		;;
+	esac
+	case "$out" in
+	*filter-fromcheck*)
+		printf 'FAIL: a compiled binary row is presence-only; got [%s]\n' "$out" >&2
 		exit 1
 		;;
 	esac
