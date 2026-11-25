@@ -293,6 +293,11 @@ impl Filter {
             return Verdict::Reject("the message headers are too large".into());
         }
         let block = &transaction.block;
+        // smtpd strips the only legal CR, so any CR left here ends a line for
+        // mailparse while the signer hashes the raw bytes past it.
+        if block.contains(&b'\r') {
+            return Verdict::Reject("a header line contains a bare CR".into());
+        }
         let mut from_values = Vec::new();
         for header in headers(block) {
             if header.is("from") {
@@ -570,6 +575,15 @@ mod tests {
             auth("(\\)\" )\"<alice@kyriakon.net>(\" <secretary@otherparish.org> (\\))")
                 .contains("550 5.7.1 secretary@otherparish.org")
         );
+    }
+
+    #[test]
+    fn a_bare_cr_in_a_header_line_is_refused() {
+        // mailparse ends the line at the CR and would see only the first
+        // mailbox, but the signer hashes the address after it too.
+        assert!(auth("alice@kyriakon.net\r,hello@evil.example")
+            .contains("550 5.7.1 a header line contains a bare CR"));
+        assert!(auth("alice@kyriakon.net, secretary@parish.example").ends_with("|proceed"));
     }
 
     #[test]
