@@ -297,7 +297,7 @@ mail_from_ensure() {
 # ensure_mail_address: the address line, and the smtpd restart that makes it
 # live. A function so the self-test drives the same body against a fixture tree.
 ensure_mail_address() {
-	typeset domain key current mail_changed=no
+	typeset domain key current verdict mail_changed=no
 	if [ ! -f "$virtuals" ]; then
 		printf 'note: no %s yet, so %s has no address until the mail deploy runs\n' \
 			"$virtuals" "$user" >&2
@@ -310,21 +310,29 @@ ensure_mail_address() {
 	fi
 	domain=$(mail_domains_first "$mail_domains_table")
 	key="$user@$domain"
-	if awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals"; then
+	# The writer's parse, not a colon-only read: a hand-edited line may separate
+	# the columns with spaces, and set would repoint it.
+	verdict=$(mail_table check "$virtuals" "$key: $user")
+	case $verdict in
+	same) ;;
+	different*)
 		# An address aimed somewhere else on purpose is left where it is: this
 		# script provisions an account, it does not overrule a forward.
-		current=$(awk -F: -v k="$key" '$1 == k { sub(/^[^:]*:[ \t]*/, ""); print; exit }' "$virtuals")
-		if [ "$current" != "$user" ]; then
+		current=${verdict#different}
+		current=${current# }
+		if [ -n "$current" ] && [ "$current" != "$user" ]; then
 			printf 'note: %s maps to %s, so mail for this member goes there\n' "$key" "$current" >&2
 		fi
-	else
+		;;
+	*)
 		mail_table set "$virtuals" "$key: $user" >/dev/null
-		awk -F: -v k="$key" '$1 == k { found = 1 } END { exit !found }' "$virtuals" \
+		[ "$(mail_table check "$virtuals" "$key: $user")" = same ] \
 			|| { printf 'could not add %s to %s\n' "$key" "$virtuals" >&2; exit 1; }
 		printf 'virtual %s added\n' "$key"
 		changed=yes
 		mail_changed=yes
-	fi
+		;;
+	esac
 	mail_from_ensure "$key" "$user"
 	# smtpd reads the table when it starts, so a line is not live until it is
 	# restarted: /etc/rc.d/smtpd defines no reload verb, and delete-user.sh restarts
@@ -430,6 +438,31 @@ self_test() {
 		"$(cmp -s "$smtpd_conf" "$tree/anchor.expected" && printf same || printf changed)" same
 	user=alice
 	printf 'kyriakon.net\nparish.example\n' > "$dkim_domains_table"
+
+	# A hand edit may use the space form the writer documents. The guard reads
+	# it with the writer's parser, so a deliberate forward survives and a line
+	# that already maps the account is not an abort.
+	changed=no
+	printf 'root: oliver\n  alice@kyriakon.net bob\n' > "$virtuals"
+	mail_run=0
+	ensure_mail_address > "$tree/space.out" 2>&1 || mail_run=$?
+	check "a space-form forward does not abort the run" "$mail_run" 0
+	check "and the forward is left in place" \
+		"$(grep -c '^  alice@kyriakon.net bob$' "$virtuals")" 1
+	check "and no colon line is written over it" \
+		"$(grep -c '^alice@kyriakon.net: alice$' "$virtuals")" 0
+	check "and the run says where the address goes" \
+		"$(grep -c '^note: alice@kyriakon.net maps to bob' "$tree/space.out")" 1
+
+	changed=no
+	printf 'root: oliver\n  alice@kyriakon.net alice\n' > "$virtuals"
+	mail_run=0
+	ensure_mail_address > "$tree/space-same.out" 2>&1 || mail_run=$?
+	check "a space-form line already mapping the account is not an abort" "$mail_run" 0
+	check "and it is left as it was" \
+		"$(grep -c '^  alice@kyriakon.net alice$' "$virtuals")" 1
+	check "and the run adds nothing" \
+		"$(grep -c '^virtual alice@kyriakon.net added$' "$tree/space-same.out")" 0
 
 	# The post-condition the run ends with: a path in the shape it wants passes,
 	# and one whose mode has drifted fails. Both run in a subshell because

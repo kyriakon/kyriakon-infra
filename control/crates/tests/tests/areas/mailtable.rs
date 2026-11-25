@@ -7,6 +7,7 @@
 
 use crate::common::*;
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
@@ -77,6 +78,24 @@ fn the_mail_table_command_is_the_writer_the_scripts_run() {
     assert!(out.status.success(), "{out:?}");
     let text = std::fs::read_to_string(&table).unwrap();
     assert!(text.contains("carol@kyriakon.net: carol"), "{text}");
+
+    // `check` gives both guards the writer's three answers, space form included.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&table)
+        .unwrap();
+    writeln!(file, "  dave@kyriakon.net dave").unwrap();
+    let check = |line: &str| {
+        let out = Command::new(&bin)
+            .args(["mail-table", "check", table.as_str(), line])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(check("dave@kyriakon.net: dave"), "same");
+    assert_eq!(check("dave@kyriakon.net: alice"), "different dave");
+    assert_eq!(check("erin@kyriakon.net: erin"), "absent");
 
     // Drop uses 0 changed and 1 unchanged, the codes remove-group.sh reads.
     let out = Command::new(&bin)

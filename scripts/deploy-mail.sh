@@ -1586,11 +1586,13 @@ EOF
 while IFS= read -r acct; do
 	[ -n "$acct" ] || continue
 	account_line="$acct@$platform_domain: $acct"
-	if awk -F: -v k="$acct@$platform_domain" '$1 == k { found = 1 } END { exit !found }' "$virtuals_table"; then
-		continue
-	fi
+	# The writer's parse, not a colon-only read: a hand-edited line may separate
+	# the columns with spaces, and set would repoint it.
+	case $(mail_table check "$virtuals_table" "$account_line") in
+	same | different*) continue ;;
+	esac
 	mail_table set "$virtuals_table" "$account_line" >/dev/null || exit 1
-	awk -F: -v k="$acct@$platform_domain" '$1 == k { found = 1 } END { exit !found }' "$virtuals_table" \
+	[ "$(mail_table check "$virtuals_table" "$account_line")" = same ] \
 		|| { printf 'virtual entry did not land in %s: %s\n' "$virtuals_table" "$account_line" >&2; exit 1; }
 	printf 'virtual %s added\n' "$acct@$platform_domain"
 done <<EOF
