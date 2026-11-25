@@ -1234,6 +1234,23 @@ fn a_record_rewritten_after_approval_cannot_redirect_a_card_payment() {
         "the purge rebuilt the snapshot from the handler's record: {reviewed}"
     );
 
+    // A pre-snapshot approval has no root copy. The purge must not create one
+    // from the handler's record, and the card pass resolves the legacy approval
+    // from the root-owned account below.
+    std::fs::remove_file(fix.dir.join(format!("store/reviewed/{TOKEN}.json"))).unwrap();
+    fix.amend_application(TOKEN, |record| {
+        record["filed_at"] = json!(kyriakon_control_core::util::after_days(-100));
+        record["payment"]["token_ref"] = json!(warden_token);
+        record["payment"]["window"]["state"] = json!("open");
+        record["payment"]["window"]["closes_at"] = json!("2099-01-01T00:00:00Z");
+    });
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+    assert!(
+        fix.read(&format!("reviewed/{TOKEN}.json")).is_empty(),
+        "the purge built a snapshot from the handler's record"
+    );
+
     fix.webhook(
         "evt_snapshot_checkout",
         "checkout.session.completed",

@@ -4322,8 +4322,15 @@ pub async fn purge_declined(
         // The record is the handler's, so its token can name another file: the
         // write below lands under the name this loop derived, never the field.
         if !store::is_status_token(token) || record.status_token.as_str() != token {
-            Error::Failed(format!("application {name} names another token; skipped"))
-                .report("the purge sweep");
+            report_record(
+                cfg,
+                store,
+                journal,
+                "application",
+                token,
+                &Error::Failed(format!("application {name} names another token; skipped")),
+            )
+            .await;
             continue;
         }
         let Some(decided_at) = record.decided_at.as_deref() else {
@@ -4497,33 +4504,27 @@ async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result
         .map_err(Error::from)?;
     // The snapshot is what the card pass resolves a payment through, so it is
     // never rebuilt from this handler-owned record: strip the answers from the
-    // snapshot itself, keeping the payment block root wrote. A damaged snapshot
-    // is left alone for the operator. Without the clearing it would retain a
-    // second, un-purged copy of the application.
-    let snapshot = match store.reviewed_application(token).await {
-        Ok(snapshot) => snapshot,
+    // snapshot itself, keeping the payment block root wrote. An approval that
+    // predates snapshots has none, and the card pass resolves it from the
+    // root-owned account; creating one here would install the handler's block.
+    // A damaged snapshot is left alone for the operator.
+    let mut snapshot = match store.reviewed_application(token).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return Ok(()),
         Err(e) => {
             Error::from(e).report("the purge sweep");
             return Ok(());
         }
     };
-    let (bytes, replace) = match snapshot {
-        Some(mut snapshot) => {
-            strip_answers(&mut snapshot);
-            let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|source| Error::Json {
-                context: "encode the reviewed application",
-                source,
-            })?;
-            (bytes, true)
-        }
-        None => (bytes, false),
-    };
-    if replace {
-        store.update_reviewed_application(token, &bytes).await
-    } else {
-        store.write_reviewed_application(token, &bytes).await
-    }
-    .map_err(Error::from)
+    strip_answers(&mut snapshot);
+    let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|source| Error::Json {
+        context: "encode the reviewed application",
+        source,
+    })?;
+    store
+        .write_reviewed_application(token, &bytes)
+        .await
+        .map_err(Error::from)
 }
 
 /// The status tokens queued intents name. An approval writes `mark_decided`
@@ -4693,8 +4694,15 @@ pub async fn purge_applications(
         // The record is the handler's, so its token can name another file: the
         // write below lands under the name this loop derived, never the field.
         if !store::is_status_token(token) || record.status_token.as_str() != token {
-            Error::Failed(format!("application {name} names another token; skipped"))
-                .report("the purge sweep");
+            report_record(
+                cfg,
+                store,
+                journal,
+                "application",
+                token,
+                &Error::Failed(format!("application {name} names another token; skipped")),
+            )
+            .await;
             continue;
         }
         if !purge_due(&record.filed_at, today) {
