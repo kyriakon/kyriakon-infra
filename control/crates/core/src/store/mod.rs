@@ -1264,11 +1264,11 @@ impl Store {
     /// it would let a third create a new file and lock that instead, which is
     /// no lock at all.
     ///
-    /// The open refuses a symlink: most of these directories belong to the
-    /// unprivileged handler, and a name in one can be planted. The descriptor is
-    /// then handed to the directory's owner, because the drain takes some of
-    /// these locks as root and a root-owned 0600 lock in the handler's directory
-    /// is one the handler can no longer take.
+    /// The open refuses a symlink or a hardlink: most of these directories
+    /// belong to the unprivileged handler, and a name in one can be planted.
+    /// The descriptor is then handed to the directory's owner, because the
+    /// drain takes some of these locks as root and a root-owned 0600 lock in
+    /// the handler's directory is one the handler can no longer take.
     pub async fn lock(&self, rel: &str) -> Result<tokio::fs::File, Error> {
         let file = self.open_lock(rel).await?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
@@ -1323,9 +1323,26 @@ impl Store {
             path: path.clone(),
             source,
         })?;
+        // A hardlink is a regular file, so O_NOFOLLOW does not see it: the
+        // handler can link a record to a lock name in its own directory and
+        // have root chown the shared inode. A lock name is never shared, so
+        // more than one link, or anything but a regular file, is planted.
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata().await.map_err(|source| Error::Io {
+            action: Action::Lock,
+            path: path.clone(),
+            source,
+        })?;
+        if !meta.is_file() || meta.nlink() != 1 {
+            return Err(Error::Refused(format!(
+                "the lock {} is not a regular file with one link; it is not used",
+                path.display()
+            )));
+        }
         // chown needs root, and only root ever hands a lock to another owner: a
-        // test runs as the directory's own owner already.
-        if unsafe { libc::geteuid() } == 0 {
+        // test runs as the directory's own owner already. A lock the handler
+        // made is already its own, and is not handed a second owner.
+        if unsafe { libc::geteuid() } == 0 && meta.uid() == 0 {
             if let Some((uid, gid)) = self.dir_owner(dir) {
                 // The descriptor, after the no-follow open: a `chown` of the
                 // path would follow whatever the name points at by then.
@@ -3683,6 +3700,44 @@ mod tests {
             (lock.uid(), lock.gid(), lock.mode() & 0o777),
             (apps.uid(), apps.gid(), 0o600)
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A hardlink is a regular file, so `O_NOFOLLOW` does not refuse it. A lock
+    /// planted as a second link to a record must be refused, and the record's
+    /// owner, mode and bytes left alone.
+    #[tokio::test]
+    async fn a_lock_refuses_a_hardlink_and_leaves_its_target_alone() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir =
+            std::env::temp_dir().join(format!("onboard-lock-hardlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("applications")).unwrap();
+        std::fs::create_dir_all(dir.join("accounts/alice")).unwrap();
+        let store = Store::new(dir.to_str().unwrap());
+        let target = dir.join("accounts/alice/account.json");
+        let body = b"{\"state\":\"active\"}\n";
+        std::fs::write(&target, body).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&target).unwrap();
+        let lock_path = dir.join("applications/.confirmation.lock");
+        std::fs::hard_link(&target, &lock_path).unwrap();
+
+        let err = store
+            .lock("applications/.confirmation.lock")
+            .await
+            .expect_err("a planted hardlink must be refused");
+        assert!(matches!(&err, Error::Refused(_)), "{err}");
+        let after = std::fs::metadata(&target).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode() & 0o777),
+            (before.uid(), before.gid(), 0o640)
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+
+        // With the link gone the same name is a normal lock again.
+        std::fs::remove_file(&lock_path).unwrap();
+        let _lock = store.lock("applications/.confirmation.lock").await.unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
