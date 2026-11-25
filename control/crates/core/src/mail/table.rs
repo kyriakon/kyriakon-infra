@@ -97,6 +97,17 @@ impl Change {
     }
 }
 
+/// Where a wanted line stands in the table, from the writer's own parse. A
+/// line written in the space form counts as present, unlike a colon-only read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lookup {
+    Absent,
+    Same,
+    /// The key is there and maps elsewhere; the line's value is carried so a
+    /// caller can say where.
+    Different(String),
+}
+
 /// One table file.
 #[derive(Clone, Debug)]
 pub struct Table {
@@ -476,6 +487,27 @@ impl Table {
             .filter_map(|line| line.entry())
             .find(|entry| same(&entry.key, name))
             .and_then(|entry| entry.value.clone()))
+    }
+
+    /// How a wanted line stands, with the same parse and comparison `set` uses:
+    /// so a space-form line is present, and `Same` is exactly the no-op `set`
+    /// would report. Read under the same lock as a write.
+    pub fn check(&self, line: &str) -> Result<Lookup, Error> {
+        let entry = self.parse_entry(line)?;
+        let _lock = self.lock()?;
+        let text = self.read()?;
+        let doc = Document::parse(self, &text)?;
+        for existing in doc.lines.iter().filter_map(|line| line.entry()) {
+            if !same(&existing.key, &entry.key) {
+                continue;
+            }
+            return Ok(if line_matches(existing, &entry) {
+                Lookup::Same
+            } else {
+                Lookup::Different(existing.value.clone().unwrap_or_default())
+            });
+        }
+        Ok(Lookup::Absent)
     }
 
     /// How many lines key a name on `suffix`: `@domain` counts every address on
@@ -1040,6 +1072,40 @@ mod tests {
         assert!(text.contains("alice@kyriakon.net: alice"), "{text}");
         assert!(text.contains("bob@kyriakon.net: bob"), "{text}");
         assert!(text.contains("dave@kyriakon.net: dave"), "{text}");
+    }
+
+    #[test]
+    fn a_check_reads_a_space_form_line_like_the_set_that_rewrites_it() {
+        let fix = Fixture::new("check");
+        let path = fix.write(
+            "virtuals",
+            "alice@kyriakon.net bob\nbob@kyriakon.net: dave\ncarol@kyriakon.net: carol\n",
+        );
+        let table = Table::at(&path).unwrap();
+        // The space form is present, and the wanted line the scripts pass is
+        // exactly what set would make of it: a forward is Different, a line
+        // already mapping the account is Same.
+        assert_eq!(
+            table.check("alice@kyriakon.net: alice").unwrap(),
+            Lookup::Different("bob".to_string())
+        );
+        assert_eq!(
+            table.check("alice@kyriakon.net: bob").unwrap(),
+            Lookup::Same
+        );
+        assert_eq!(table.check("bob@kyriakon.net: dave").unwrap(), Lookup::Same);
+        assert_eq!(
+            table.check("bob@kyriakon.net: alice").unwrap(),
+            Lookup::Different("dave".to_string())
+        );
+        assert_eq!(
+            table.check("carol@kyriakon.net: carol").unwrap(),
+            Lookup::Same
+        );
+        assert_eq!(
+            table.check("dave@kyriakon.net: dave").unwrap(),
+            Lookup::Absent
+        );
     }
 
     #[test]

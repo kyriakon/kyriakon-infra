@@ -14,8 +14,9 @@
 //!
 //! `mail-table` is the one writer of the five `/etc/mail` tables. The shell
 //! scripts run it rather than carrying their own writer; the verbs are
-//! `add`, `set`, `drop`, `map-add` and `regenerate` (rebuild `mail_from` from
-//! passwd and the virtual table, under the lock).
+//! `add`, `set`, `drop`, `map-add`, `check` and `regenerate` (rebuild
+//! `mail_from` from passwd and the virtual table, under the lock). `check`
+//! answers absent, same or different with the same parse `set` uses.
 //!
 //! The config defaults to `/etc/kyriakon/onboard/drain.toml`.
 
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use kyriakon_control_core::config::DrainConfig;
-use kyriakon_control_core::mail::table::{DropMode, Table};
+use kyriakon_control_core::mail::table::{DropMode, Lookup, Table};
 use kyriakon_control_core::store::Store;
 use kyriakon_control_drain::transitions::Error;
 
@@ -63,7 +64,8 @@ async fn main() -> ExitCode {
 
 /// Exit codes the scripts act on: 0 changed, 1 unchanged, 2 failed. `add`,
 /// `set` and `regenerate` return 0 on success whether or not they changed the
-/// file; `drop` and `map-add` use 1 for "nothing to do".
+/// file; `drop` and `map-add` use 1 for "nothing to do". `check` prints its
+/// answer and returns 0, because all three answers are a successful read.
 fn mail_table(args: Vec<String>) -> ExitCode {
     match run_mail_table(&args) {
         Ok(code) => ExitCode::from(code),
@@ -76,7 +78,7 @@ fn mail_table(args: Vec<String>) -> ExitCode {
 
 fn run_mail_table(args: &[String]) -> Result<u8, Error> {
     let usage = "usage: kyriakon-control-drain mail-table \
-                 <add|set|drop|map-add|regenerate> <table> ...";
+                 <add|set|check|drop|map-add|regenerate> <table> ...";
     let (verb, rest) = args
         .split_first()
         .ok_or_else(|| Error::Failed(usage.to_string()))?;
@@ -116,6 +118,17 @@ fn run_mail_table(args: &[String]) -> Result<u8, Error> {
                     "unchanged"
                 }
             );
+            Ok(0)
+        }
+        "check" => {
+            let line = rest
+                .first()
+                .ok_or_else(|| Error::Failed(usage.to_string()))?;
+            match table.check(line).map_err(Error::from)? {
+                Lookup::Absent => println!("absent"),
+                Lookup::Same => println!("same"),
+                Lookup::Different(value) => println!("different {value}"),
+            }
             Ok(0)
         }
         "drop" => {

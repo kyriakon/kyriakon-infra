@@ -412,8 +412,8 @@ uid_warnings() {
 #
 # The exit codes are the command's: 0 changed, 1 unchanged, 2 failed. `add`,
 # `set` and `regenerate` return 0 on success whether or not they changed the
-# file; `drop` and `map-add` use 1 for "nothing to do". Callers must keep 2
-# apart from 1.
+# file; `drop` and `map-add` use 1 for "nothing to do"; `check` prints absent,
+# same or different and returns 0. Callers must keep 2 apart from 1.
 
 # mail_table <verb> <table> ...
 #
@@ -577,6 +577,39 @@ set)
 		: >"$table.lock"
 		printf 'added\n'
 	fi
+	;;
+check)
+	line=$1; key=${line%%:*}; want=${line#*:}
+	[ -f "$table" ] || { printf 'no table at %s\n' "$table" >&2; exit 2; }
+	awk -v k="$key" -v w="$want" '
+		function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+		{
+			raw = $0
+			sub(/#.*/, "", raw)
+			raw = trim(raw)
+			if (raw == "") next
+			if (index(raw, ":")) {
+				key = trim(substr(raw, 1, index(raw, ":") - 1))
+				value = trim(substr(raw, index(raw, ":") + 1))
+			} else if (match(raw, /[ \t]+/)) {
+				key = trim(substr(raw, 1, RSTART - 1))
+				value = trim(substr(raw, RSTART + RLENGTH))
+			} else {
+				key = raw
+				value = ""
+			}
+			if (tolower(key) == tolower(k)) {
+				found = 1
+				if (value == trim(w)) same = 1
+				else current = value
+				exit
+			}
+		}
+		END {
+			if (!found) print "absent"
+			else if (same) print "same"
+			else printf "different %s\n", current
+		}' "$table"
 	;;
 drop)
 	how=$1; text=$2
