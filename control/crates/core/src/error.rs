@@ -1,7 +1,8 @@
 //! The core's shared error for the account, mail, flow, payment and IPC
-//! modules. `store` and `config` keep their own enums because every other
-//! module converts through them; the rest name the few cases their callers act
-//! on here.
+//! modules. Each area owns its own enum and `Display`; this one wraps the areas
+//! that have moved and keeps `Refused`/`Failed` only until #1011 and #1012
+//! replace them. `store` and `config` keep their own enums because every other
+//! module converts through them.
 
 use std::fmt;
 use std::io;
@@ -13,8 +14,10 @@ use crate::store;
 #[derive(Debug)]
 pub enum Error {
     /// A request or record the core refuses, in the words the caller shows.
+    /// Temporary: #1011 and #1012 replace this with the area's own variant.
     Refused(String),
     /// A failure with no more specific case yet.
+    /// Temporary: #1011 and #1012 replace this with the area's own variant.
     Failed(String),
     /// The store failed.
     Store(store::Error),

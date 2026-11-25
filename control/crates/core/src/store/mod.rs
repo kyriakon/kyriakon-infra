@@ -183,10 +183,7 @@ impl Store {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => {
                 if source.raw_os_error() == Some(libc::ELOOP) {
-                    return Err(Error::Refused(format!(
-                        "a symlink is planted at {}; it is not read",
-                        path.display()
-                    )));
+                    return Err(Error::SymlinkAtRecord { path });
                 }
                 return Err(Error::Io {
                     action: Action::Read,
@@ -205,10 +202,7 @@ impl Store {
             })?
             .is_file()
         {
-            return Err(Error::Refused(format!(
-                "a symlink or non-regular file is planted at {}; it is not read",
-                path.display()
-            )));
+            return Err(Error::NotRegularFile { path });
         }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
@@ -469,9 +463,9 @@ impl Store {
             // rather than overwritten by a copy built before it existed.
             let _lock = self.lock(&R::lock_path(name)).await.map_err(E::from)?;
             if R::load(self, name).await.map_err(E::from)?.is_some() {
-                return Err(E::from(Error::Refused(format!(
-                    "{name} appeared while it was being created; retry"
-                ))));
+                return Err(E::from(Error::AppearedWhileCreating {
+                    name: name.to_string(),
+                }));
             }
             let record = current.as_mut().expect("the closure created a record");
             R::write(self, record).await.map_err(E::from)?;
@@ -640,20 +634,18 @@ impl Store {
         // so a root-only mode here is a page that reads as missing. Refuse it
         // rather than letting three call sites rediscover the rule.
         if matches!(name, "account.json" | "group.json") && mode & 0o040 == 0 {
-            return Err(Error::Refused(format!(
-                "{name} is read by the unprivileged handler; write it 0640 through \
-                 write_account_record or write_group_state"
-            )));
+            return Err(Error::UnreadableByHandler {
+                name: name.to_string(),
+            });
         }
         // An append-only record is not replaced whole. The type already refuses
         // it through `Store::log`; this is the same rule for a caller that names
         // the file as a path, and the error says the name of the write that is
         // allowed to.
         if name.ends_with(".jsonl") {
-            return Err(Error::Refused(format!(
-                "{name} is an append-only record; Store::rewrite_log is the one write \
-                 that completes a line already recorded"
-            )));
+            return Err(Error::AppendOnlyName {
+                name: name.to_string(),
+            });
         }
         self.place_record(dir, name, bytes, owner, mode).await
     }
@@ -886,10 +878,7 @@ impl Store {
         // one the handler can redirect. Refuse it rather than unlink it.
         if let Ok(md) = tokio::fs::symlink_metadata(&tmp).await {
             if md.file_type().is_symlink() {
-                return Err(Error::Refused(format!(
-                    "a symlink is planted at {}; a record is not written through it",
-                    tmp.display()
-                )));
+                return Err(Error::SymlinkAtTemporary { path: tmp });
             }
             let _ = tokio::fs::remove_file(&tmp).await;
         }
@@ -1055,9 +1044,7 @@ impl Store {
         // The account page lists every notice, so the handler reads this one
         // append file; a root-only line is a notice the member cannot see.
         if path.ends_with("notices.jsonl") && mode & 0o040 == 0 {
-            return Err(Error::Refused(
-                "notices.jsonl is read by the unprivileged handler; append it 0640".to_string(),
-            ));
+            return Err(Error::NoticeUnreadableByHandler);
         }
         use std::os::unix::fs::PermissionsExt;
         let p = self.root.join(path);
@@ -1080,12 +1067,22 @@ impl Store {
         // FIFO from hanging the pass while it holds the lock.
         if let Ok(meta) = tokio::fs::symlink_metadata(&p).await {
             if !meta.file_type().is_file() {
-                return Err(Error::Refused(format!(
-                    "a symlink is planted at {}; an append is not written through it",
-                    p.display()
-                )));
+                return Err(Error::SymlinkAtAppend { path: p });
             }
         }
+        // O_NOFOLLOW answers ELOOP for a planted symlink; say which record and
+        // why rather than reporting an append that failed for no reason.
+        let fail = |source: std::io::Error| {
+            if source.raw_os_error() == Some(libc::ELOOP) {
+                Error::SymlinkAtAppend { path: p.clone() }
+            } else {
+                Error::Io {
+                    action: Action::Append,
+                    path: p.clone(),
+                    source,
+                }
+            }
+        };
         let placed = async {
             let mut f = tokio::fs::OpenOptions::new()
                 .read(true)
@@ -1094,65 +1091,49 @@ impl Store {
                 .mode(mode)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(&p)
-                .await?;
+                .await
+                .map_err(&fail)?;
             // The path could change between the check and the open; the
             // descriptor is what is appended to.
-            if !f.metadata().await?.is_file() {
-                return Err(std::io::Error::other(format!(
-                    "{} is not a regular file; it is not appended to",
-                    p.display()
-                )));
+            if !f.metadata().await.map_err(&fail)?.is_file() {
+                return Err(Error::SymlinkAtAppend { path: p.clone() });
             }
             // A crash between a short write and its newline leaves a partial
             // tail. A new line appended after it would otherwise be glued to
             // the fragment and wedge every later read: complete a full JSON
             // line, and quarantine bytes that are not one.
-            repair_tail(&mut f, &p, mode, sync).await?;
+            repair_tail(&mut f, &p, mode, sync).await.map_err(&fail)?;
             // The mode argument above applies only at creation, and an upgrade
             // finds the file already 0600; both are corrected here.
             f.set_permissions(std::fs::Permissions::from_mode(mode))
-                .await?;
+                .await
+                .map_err(&fail)?;
             if let Some((uid, gid)) = owner {
                 if unsafe { libc::geteuid() } == 0 {
                     // The open descriptor, as `write_record_mode` does: the
                     // record is appended, never replaced, so the path and the
                     // file are the same thing only while nobody else can
                     // rename over it.
-                    fchown(&f, Some(uid), Some(gid)).map_err(|e| {
-                        std::io::Error::other(format!(
-                            "cannot hand {} to its group: {e}",
-                            p.display()
-                        ))
+                    fchown(&f, Some(uid), Some(gid)).map_err(|source| Error::Io {
+                        action: Action::Chown,
+                        path: p.clone(),
+                        source,
                     })?;
                 }
             }
-            f.write_all(&line).await?;
+            f.write_all(&line).await.map_err(&fail)?;
             // See `place_record`: the write is still in the blocking pool when
             // `write_all` returns, so its error would surface on a later call,
             // or never on the test store's path.
-            f.flush().await?;
+            f.flush().await.map_err(&fail)?;
             if sync {
-                f.sync_all().await
+                f.sync_all().await.map_err(&fail)
             } else {
                 Ok(())
             }
         }
         .await;
-        placed.map_err(|source| {
-            // O_NOFOLLOW answers ELOOP for a planted symlink; say which record
-            // and why rather than reporting an append that failed for no reason.
-            if source.raw_os_error() == Some(libc::ELOOP) {
-                return Error::Refused(format!(
-                    "a symlink is planted at {}; an append is not written through it",
-                    p.display()
-                ));
-            }
-            Error::Io {
-                action: Action::Append,
-                path: p,
-                source,
-            }
-        })
+        placed
     }
 
     /// Create a directory under the root with its parents, 0700. The mode is
@@ -1335,10 +1316,7 @@ impl Store {
             source,
         })?;
         if !meta.is_file() || meta.nlink() != 1 {
-            return Err(Error::Refused(format!(
-                "the lock {} is not a regular file with one link; it is not used",
-                path.display()
-            )));
+            return Err(Error::LockNotRegularFile { path });
         }
         // chown needs root, and only root ever hands a lock to another owner: a
         // test runs as the directory's own owner already. A lock the handler
@@ -1909,9 +1887,11 @@ fn check_version(rel: &str, value: &serde_json::Value) -> Result<(), Error> {
         return Ok(());
     };
     if version.as_u64() != Some(SUPPORTED) {
-        return Err(Error::Refused(format!(
-            "{rel} is version {version}; this build reads version {SUPPORTED}"
-        )));
+        return Err(Error::UnsupportedVersion {
+            name: rel.to_string(),
+            version: version.clone(),
+            supported: SUPPORTED,
+        });
     }
     Ok(())
 }
@@ -1970,9 +1950,9 @@ async fn repair_tail(
 /// handler owns into names, and `../../x` would leave the store.
 fn check_name(name: &str) -> Result<(), Error> {
     if name.contains(['/', '\0']) || name.starts_with('.') {
-        return Err(Error::Refused(format!(
-            "{name:?} is not a record name; it must be one component inside its directory"
-        )));
+        return Err(Error::BadRecordName {
+            name: name.to_string(),
+        });
     }
     Ok(())
 }
@@ -2661,8 +2641,10 @@ pub async fn free_account_count(store: &Store) -> Result<usize, Error> {
                     free += 1;
                 }
             }
-            Ok(None) => Error::Refused("is missing, not counted".into())
-                .report(&format!("accounts/{username}/account.json")),
+            Ok(None) => Error::ListedAccountMissing {
+                name: username.clone(),
+            }
+            .report("accounts"),
             Err(e) => e.report("an account could not be read, not counted"),
         }
     }
@@ -3298,7 +3280,7 @@ mod tests {
             .await
             .expect_err("a root-only account record must be refused");
         assert!(
-            matches!(&err, Error::Refused(message) if message.contains("0640")),
+            matches!(&err, Error::UnreadableByHandler { name } if name == "account.json"),
             "{err}"
         );
         assert!(store
@@ -3639,7 +3621,7 @@ mod tests {
             .await
             .expect_err("an append-only record must be refused");
         assert!(
-            matches!(&err, Error::Refused(message) if message.contains("rewrite_log")),
+            matches!(&err, Error::AppendOnlyName { name } if name == "payments.jsonl"),
             "{err}"
         );
         assert!(!store.path("ledger/payments.jsonl").exists());
@@ -3728,7 +3710,7 @@ mod tests {
             .lock("applications/.confirmation.lock")
             .await
             .expect_err("a planted hardlink must be refused");
-        assert!(matches!(&err, Error::Refused(_)), "{err}");
+        assert!(matches!(&err, Error::LockNotRegularFile { .. }), "{err}");
         let after = std::fs::metadata(&target).unwrap();
         assert_eq!(
             (after.uid(), after.gid(), after.mode() & 0o777),
@@ -3766,7 +3748,7 @@ mod tests {
             .await
             .expect_err("a planted symlink must be refused");
         assert!(
-            matches!(&err, Error::Refused(message) if message.contains("ledger/payments.jsonl")),
+            matches!(&err, Error::SymlinkAtAppend { path } if path.ends_with("ledger/payments.jsonl")),
             "{err}"
         );
         let after = std::fs::metadata(&target).unwrap();
@@ -3791,12 +3773,18 @@ mod tests {
             .write_record("accounts", "../x.json", b"{}")
             .await
             .expect_err("a name that leaves its directory must be refused");
-        assert!(matches!(&err, Error::Refused(_)), "{err}");
+        assert!(
+            matches!(&err, Error::BadRecordName { name } if name == "../x.json"),
+            "{err}"
+        );
         let err = store
             .remove("accounts", "../x.json")
             .await
             .expect_err("a removal that leaves its directory must be refused");
-        assert!(matches!(&err, Error::Refused(_)), "{err}");
+        assert!(
+            matches!(&err, Error::BadRecordName { name } if name == "../x.json"),
+            "{err}"
+        );
         assert!(!dir.join("x.json").exists(), "the escape wrote a file");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -4090,7 +4078,7 @@ mod tests {
             .err()
             .expect("a complete version 2 line must not read as absent");
         assert!(
-            matches!(&err, Error::Refused(message) if message.contains("version 2")),
+            matches!(&err, Error::UnsupportedVersion { version, .. } if version.as_u64() == Some(2)),
             "{err}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -4209,11 +4197,16 @@ mod tests {
         let err = store
             .update_account::<(), Error>("typo", |current| {
                 assert!(current.is_none(), "a record appeared for an unknown name");
-                Err(Error::Refused("no account for typo".to_string()))
+                Err(Error::ListedAccountMissing {
+                    name: "typo".to_string(),
+                })
             })
             .await
             .expect_err("an unknown account was updated");
-        assert!(matches!(&err, Error::Refused(_)), "{err}");
+        assert!(
+            matches!(&err, Error::ListedAccountMissing { name } if name == "typo"),
+            "{err}"
+        );
         assert!(
             !dir.join("accounts/typo").exists(),
             "a phantom account directory was created"
@@ -4241,7 +4234,7 @@ mod tests {
             .await
             .expect_err("version 2 must not read as version 1");
         assert!(
-            matches!(&err, Error::Refused(message) if message.contains("version 2")),
+            matches!(&err, Error::UnsupportedVersion { version, .. } if version.as_u64() == Some(2)),
             "{err}"
         );
         std::fs::remove_dir_all(&dir).unwrap();

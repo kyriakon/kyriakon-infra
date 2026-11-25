@@ -108,9 +108,9 @@ mod tests {
     use super::*;
 
     fn store_failure() -> Error {
-        Error::Store(kyriakon_control_core::store::Error::Refused(
-            "boom".to_string(),
-        ))
+        Error::Store(kyriakon_control_core::store::Error::ListedAccountMissing {
+            name: "boom".to_string(),
+        })
     }
 
     #[test]
@@ -138,9 +138,9 @@ mod tests {
         assert_eq!(respond(&store_failure(), FrontEnd::Gemini).code(), 40);
         assert_eq!(
             respond(
-                &Error::Lookup(kyriakon_control_core::store::Error::Refused(
-                    "boom".to_string()
-                )),
+                &Error::Lookup(kyriakon_control_core::store::Error::ListedAccountMissing {
+                    name: "boom".to_string(),
+                }),
                 FrontEnd::Gemini
             )
             .code(),

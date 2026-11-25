@@ -113,16 +113,43 @@ impl Request {
 /// A FastCGI record that does not parse, or a socket read that failed.
 #[derive(Debug)]
 pub enum Error {
-    /// The front end sent a record the protocol does not allow.
-    Malformed(String),
+    /// The connection ended inside a request that had begun.
+    Truncated,
+    /// The version byte is not the one this responder reads.
+    BadVersion { version: u8 },
+    /// A record arrived before the begin record.
+    UnexpectedRecord { kind: u8 },
+    /// A record carries another request's id.
+    WrongRequestId { id: u16, request: u16 },
+    /// A second begin record inside one request.
+    SecondBegin,
+    /// A begin record whose content is not its fixed eight bytes. `what` is
+    /// the record's noun, e.g. "a begin record".
+    BadLength { what: &'static str, length: usize },
+    /// A begin record names a role this responder does not answer.
+    UnknownRole { role: u16 },
+    /// The parameters of one request together exceed the cap.
+    ParamsTooLong { length: usize, max: usize },
+    /// The front end aborted the request.
+    Aborted,
+    /// A record type this responder does not speak.
+    UnknownType { kind: u8 },
+    /// A parameter's name and value run past the bytes left in its record.
+    ParameterPastRecord {
+        name: usize,
+        value: usize,
+        remaining: usize,
+    },
+    /// A parameter record ends inside a length field.
+    EndsInsideLength,
     /// Reading a record from the socket failed.
     Io {
         what: &'static str,
         source: std::io::Error,
     },
-    /// A failure whose context is the value the caller needs, with its source.
+    /// A failure whose context is the fixed label `what`, with its source.
     Context {
-        context: String,
+        what: &'static str,
         source: Box<crate::Source>,
     },
 }
@@ -130,9 +157,34 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Malformed(message) => f.write_str(message),
+            Error::Truncated => f.write_str("the connection ended inside a request"),
+            Error::BadVersion { version } => write!(f, "record version {version}"),
+            Error::UnexpectedRecord { kind } => {
+                write!(f, "record type {kind} arrived before the request began")
+            }
+            Error::WrongRequestId { id, request } => {
+                write!(f, "record id {id} inside request {request}")
+            }
+            Error::SecondBegin => f.write_str("a second begin record inside one request"),
+            Error::BadLength { what, length } => write!(f, "{what} of {length} bytes"),
+            Error::UnknownRole { role } => write!(f, "role {role}"),
+            Error::ParamsTooLong { length, max } => write!(
+                f,
+                "the parameters of one request are {length} bytes, over the {max} this responder reads"
+            ),
+            Error::Aborted => f.write_str("the front-end aborted the request"),
+            Error::UnknownType { kind } => write!(f, "record type {kind}"),
+            Error::ParameterPastRecord {
+                name,
+                value,
+                remaining,
+            } => write!(
+                f,
+                "a parameter of {name} name and {value} value bytes runs past the {remaining} left in its record"
+            ),
+            Error::EndsInsideLength => f.write_str("a parameter record ends inside a length"),
             Error::Io { what, source } => write!(f, "cannot {what}: {source}"),
-            Error::Context { context, source } => write!(f, "{context}: {source}"),
+            Error::Context { what, source } => write!(f, "{what}: {source}"),
         }
     }
 }
@@ -140,9 +192,9 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Malformed(_) => None,
             Error::Io { source, .. } => Some(source),
             Error::Context { source, .. } => Some(source.as_ref()),
+            _ => None,
         }
     }
 }
@@ -157,9 +209,9 @@ impl From<std::io::Error> for Error {
 }
 
 impl Error {
-    pub fn context(context: impl Into<String>, source: impl Into<crate::Source>) -> Self {
+    pub fn context(what: &'static str, source: impl Into<crate::Source>) -> Self {
         Error::Context {
-            context: context.into(),
+            what,
             source: Box::new(source.into()),
         }
     }
@@ -192,15 +244,11 @@ pub async fn read_request<R: AsyncRead + Unpin>(
             // finish a connection. Closing inside one is a truncated request
             // rather than a tidy end, and it is reported as that.
             Err(e) if e.kind() == ErrorKind::UnexpectedEof && !begun => return Ok(None),
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                return Err(Error::Malformed(
-                    "the connection ended inside a request".to_string(),
-                ))
-            }
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(Error::Truncated),
             Err(e) => return Err(Error::context("cannot read a record header", e)),
         }
         if header[0] != VERSION {
-            return Err(Error::Malformed(format!("record version {}", header[0])));
+            return Err(Error::BadVersion { version: header[0] });
         }
         let kind = header[1];
         let record_id = u16::from_be_bytes([header[2], header[3]]);
@@ -215,9 +263,7 @@ pub async fn read_request<R: AsyncRead + Unpin>(
         content.truncate(len);
 
         if !begun && kind != BEGIN_REQUEST {
-            return Err(Error::Malformed(
-                "a record arrived before the request began".to_string(),
-            ));
+            return Err(Error::UnexpectedRecord { kind });
         }
 
         // One request per connection at a time, numbered by its begin record.
@@ -225,30 +271,29 @@ pub async fn read_request<R: AsyncRead + Unpin>(
         // is not in, and accepting it would merge two requests: the reply would
         // carry one request's id and the other's date.
         if begun && kind != BEGIN_REQUEST && record_id != id {
-            return Err(Error::Malformed(format!(
-                "record id {record_id} inside request {id}"
-            )));
+            return Err(Error::WrongRequestId {
+                id: record_id,
+                request: id,
+            });
         }
 
         match kind {
             BEGIN_REQUEST => {
                 if begun {
-                    return Err(Error::Malformed(
-                        "a second begin record inside one request".to_string(),
-                    ));
+                    return Err(Error::SecondBegin);
                 }
                 if content.len() != 8 {
-                    return Err(Error::Malformed(format!(
-                        "a begin record of {} bytes",
-                        content.len()
-                    )));
+                    return Err(Error::BadLength {
+                        what: "a begin record",
+                        length: content.len(),
+                    });
                 }
                 // Role is big-endian in the first two bytes and is 1 for a
                 // responder. Another role is another conversation, and this one
                 // answers the responder's only.
                 let role = u16::from_be_bytes([content[0], content[1]]);
                 if role != 1 {
-                    return Err(Error::Malformed(format!("role {role}")));
+                    return Err(Error::UnknownRole { role });
                 }
                 id = record_id;
                 keep_conn = content[2] & 1 == 1;
@@ -256,9 +301,10 @@ pub async fn read_request<R: AsyncRead + Unpin>(
             }
             PARAMS => {
                 if env_buf.len() + content.len() > MAX_PARAMS {
-                    return Err(Error::Malformed(
-                        "the parameters of one request are too long".to_string(),
-                    ));
+                    return Err(Error::ParamsTooLong {
+                        length: env_buf.len() + content.len(),
+                        max: MAX_PARAMS,
+                    });
                 }
                 env_buf.extend_from_slice(&content);
             }
@@ -280,12 +326,8 @@ pub async fn read_request<R: AsyncRead + Unpin>(
                 }
                 body.extend_from_slice(&content);
             }
-            ABORT_REQUEST => {
-                return Err(Error::Malformed(
-                    "the front-end aborted the request".to_string(),
-                ))
-            }
-            other => return Err(Error::Malformed(format!("record type {other}"))),
+            ABORT_REQUEST => return Err(Error::Aborted),
+            other => return Err(Error::UnknownType { kind: other }),
         }
     }
 
@@ -314,9 +356,11 @@ fn params(buf: &[u8]) -> Result<Params, Error> {
         let name_len = length(buf, &mut i)?;
         let value_len = length(buf, &mut i)?;
         if name_len + value_len > buf.len() - i {
-            return Err(Error::Malformed(
-                "a parameter runs past the end of its record".to_string(),
-            ));
+            return Err(Error::ParameterPastRecord {
+                name: name_len,
+                value: value_len,
+                remaining: buf.len() - i,
+            });
         }
         let name = String::from_utf8_lossy(&buf[i..i + name_len]).into_owned();
         let value =
@@ -330,16 +374,12 @@ fn params(buf: &[u8]) -> Result<Params, Error> {
 /// One length field: a byte below 128, four bytes with the high bit of the first
 /// set above it.
 fn length(buf: &[u8], i: &mut usize) -> Result<usize, Error> {
-    let first = *buf
-        .get(*i)
-        .ok_or_else(|| Error::Malformed("a parameter record ends inside a length".to_string()))?;
+    let first = *buf.get(*i).ok_or(Error::EndsInsideLength)?;
     if first & 0x80 == 0 {
         *i += 1;
         return Ok(first as usize);
     }
-    let four = buf
-        .get(*i..*i + 4)
-        .ok_or_else(|| Error::Malformed("a parameter record ends inside a length".to_string()))?;
+    let four = buf.get(*i..*i + 4).ok_or(Error::EndsInsideLength)?;
     *i += 4;
     Ok(u32::from_be_bytes([four[0] & 0x7f, four[1], four[2], four[3]]) as usize)
 }
