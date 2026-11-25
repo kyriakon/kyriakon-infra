@@ -526,13 +526,14 @@ impl BillingTarget {
         Ok(())
     }
 
-    /// Write the payment block this pass changed. An account that lapsed when
-    /// the pass read it is restored under its own lock too, because a console
-    /// suspension can land between the read and the write.
-    async fn save(&mut self, store: &Store) -> Result<(), Error> {
+    /// Write the payment block this pass changed. Only a payment that moved the
+    /// paid date restores a lapsed account, and then under its own lock too,
+    /// because a console suspension can land between the read and the write.
+    /// Every other event records its facts and leaves the standing alone.
+    async fn save(&mut self, store: &Store, restore: bool) -> Result<(), Error> {
         match self {
             BillingTarget::Account(a) => PaymentTarget::account(a)
-                .save(store, true)
+                .save(store, restore)
                 .await
                 .map_err(Error::from),
             BillingTarget::Group(g) => PaymentTarget::group(g)
@@ -891,7 +892,7 @@ async fn attach_subscription(
     let stripe = billing.stripe_mut();
     stripe.subscription = Some(subscription.to_string());
     stripe.customer = customer.map(str::to_string);
-    billing.save(store).await
+    billing.save(store, false).await
 }
 
 /// `checkout.session.completed`: the `client_reference_id` is the account's or
@@ -981,7 +982,7 @@ async fn invoice_paid(
         stripe.subscription = Some(subscription.to_string());
     }
     if status != "active" {
-        billing.save(store).await?;
+        billing.save(store, false).await?;
         return Ok(Settled::Applied);
     }
     // The ledger line must carry what the invoice says was paid, on the day it
@@ -1013,7 +1014,7 @@ async fn invoice_paid(
             "check the member's payment and access by hand; the invoice was settled and no date was extended",
         )
         .await;
-        billing.save(store).await?;
+        billing.save(store, false).await?;
         return Ok(Settled::Applied);
     }
     let applied_gbp = invoice_applied(cfg, &billing, &amount_gbp)?;
@@ -1031,7 +1032,7 @@ async fn invoice_paid(
             &received_on,
         )
         .await?;
-        billing.save(store).await?;
+        billing.save(store, false).await?;
         return Ok(Settled::Applied);
     }
     let received = util::filed_at();
@@ -1043,7 +1044,7 @@ async fn invoice_paid(
     billing.stripe_mut().last_invoice = Some(invoice.to_string());
     billing.stripe_mut().failed_attempts = 0;
     billing.stripe_mut().next_payment_attempt = None;
-    billing.save(store).await?;
+    billing.save(store, true).await?;
     if let BillingTarget::Account(account) = &billing {
         if let Some(payment) = &account.payment {
             store.write_payment_copy(&account.username, payment).await?;
@@ -1256,7 +1257,7 @@ async fn invoice_payment_failed(
         stripe.failed_attempts = attempts.min(u64::from(u32::MAX)) as u32;
         stripe.next_payment_attempt = next;
     }
-    billing.save(store).await?;
+    billing.save(store, false).await?;
     Ok(Settled::Applied)
 }
 
@@ -1291,7 +1292,7 @@ async fn invoice_payment_action_required(
         stripe.failed_attempts = attempts.min(u64::from(u32::MAX)) as u32;
         stripe.next_payment_attempt = object.get("next_payment_attempt").and_then(stamp);
     }
-    billing.save(store).await?;
+    billing.save(store, false).await?;
     let owner = billing.notice_owner();
     let body = format!(
         "A card payment for your membership needs you to complete it: the bank has \
@@ -1362,7 +1363,7 @@ async fn subscription_changed(
     if let Some(customer) = object.get("customer").and_then(Value::as_str) {
         stripe.customer = Some(customer.to_string());
     }
-    billing.save(store).await?;
+    billing.save(store, false).await?;
     Ok(Settled::Applied)
 }
 
@@ -1385,7 +1386,7 @@ async fn invoice_upcoming(
         return Ok(Settled::Ignored);
     };
     billing.stripe_mut().current_period_end = period_end(object);
-    billing.save(store).await?;
+    billing.save(store, false).await?;
     Ok(Settled::Applied)
 }
 

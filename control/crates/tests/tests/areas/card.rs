@@ -1085,6 +1085,50 @@ fn a_card_payment_restores_a_lapsed_account() {
     );
 }
 
+/// #1001: a card event that moves no date used to restore a lapsed account, so
+/// a failed attempt cleared the grace and the operator's notice hold and the
+/// deletion clock restarted. It records the attempt and changes nothing else.
+#[test]
+fn a_failed_invoice_does_not_restore_a_lapsed_account() {
+    let fix = Fix::new("card-failed-no-restore");
+    fix.card_account("secretary", None);
+    let grace = kyriakon_control_core::util::date_after_days(40);
+    fix.amend_account("secretary", |account| {
+        account["state"] = json!("lapsed");
+        account["grace_until"] = json!(grace);
+        account["notice_stopped"] = json!({
+            "address": "secretary@example.org",
+            "status": "5.1.1",
+            "at": "2026-11-01T09:00:00Z",
+        });
+        account["payment"]["window"]["state"] = json!("closed");
+    });
+
+    fix.webhook("evt_failed", "invoice.payment_failed", invoice("in_failed"));
+    let out = fix.drain();
+    assert!(out.status.success(), "{}", body(&out));
+
+    let account = fix.account("secretary");
+    assert_eq!(account["state"], json!("lapsed"), "{account}");
+    assert_eq!(account["grace_until"], json!(grace), "{account}");
+    assert_eq!(
+        account["notice_stopped"]["status"],
+        json!("5.1.1"),
+        "a failed invoice cleared the operator's notice hold: {account}"
+    );
+    assert_eq!(
+        account["payment"]["stripe"]["failed_attempts"],
+        json!(1),
+        "the failed attempt was not recorded: {account}"
+    );
+    assert!(
+        !fix.scripts_log()
+            .contains("lapse-user.sh --restore secretary"),
+        "a failed invoice restored access: {}",
+        fix.scripts_log()
+    );
+}
+
 /// A zero-amount, foreign-currency or under-price invoice is not a year: the
 /// date stays where it was and no payment line opens.
 #[test]
