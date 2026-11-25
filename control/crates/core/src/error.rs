@@ -56,7 +56,7 @@ pub enum Error {
     },
     /// A failure whose context is the value the caller needs, with its source.
     Context {
-        context: String,
+        context: &'static str,
         source: Box<Source>,
         suffix: &'static str,
     },
@@ -122,21 +122,21 @@ impl Error {
         crate::util::report(self, context);
     }
 
-    pub fn context(context: impl Into<String>, source: impl Into<Source>) -> Self {
+    pub fn context(context: &'static str, source: impl Into<Source>) -> Self {
         Error::Context {
-            context: context.into(),
+            context,
             source: Box::new(source.into()),
             suffix: "",
         }
     }
 
     pub fn context_with_suffix(
-        context: impl Into<String>,
+        context: &'static str,
         source: impl Into<Source>,
         suffix: &'static str,
     ) -> Self {
         Error::Context {
-            context: context.into(),
+            context,
             source: Box::new(source.into()),
             suffix,
         }

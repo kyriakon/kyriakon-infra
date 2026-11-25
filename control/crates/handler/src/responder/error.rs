@@ -71,7 +71,7 @@ pub enum Error {
     Fastcgi(crate::fastcgi::Error),
     /// A failure whose context is what the operator needs, with its source.
     Context {
-        context: String,
+        context: &'static str,
         source: Box<kyriakon_control_core::Source>,
     },
 }
@@ -179,11 +179,11 @@ impl Error {
     }
 
     pub fn context(
-        context: impl Into<String>,
+        context: &'static str,
         source: impl Into<kyriakon_control_core::Source>,
     ) -> Self {
         Error::Context {
-            context: context.into(),
+            context,
             source: Box::new(source.into()),
         }
     }
