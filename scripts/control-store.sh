@@ -141,7 +141,9 @@ settle_lock() {
 		[ "$(stat -f '%l' "$1")" -ne 1 ] ||
 		[ "$(stat -f '%Su %Sg' "$1")" != "$2 $3" ]; then
 		changed=1
-		rm -f "$1"
+		# -r so a directory planted at the path is removed rather than refused
+		# and turned into a failed deploy by `set -e`.
+		rm -rf -- "$1"
 	fi
 }
 
@@ -156,7 +158,9 @@ migrate_processed() {
 	[ -e "$old" ] || [ -L "$old" ] || return 0
 	if [ -L "$old" ] || [ ! -f "$old" ]; then
 		changed=1
-		rm -f "$old"
+		# The handler owns webhooks/, so this can be a directory, which plain rm
+		# refuses. rm -rf unlinks a top-level symlink rather than following it.
+		rm -rf -- "$old"
 		return 0
 	fi
 	if [ -L "$new" ]; then
@@ -172,7 +176,7 @@ migrate_processed() {
 	if [ "$(id -u)" -eq 0 ]; then
 		chown root:wheel "$new"
 	fi
-	rm -f "$old"
+	rm -rf -- "$old"
 	changed=1
 }
 
@@ -211,6 +215,14 @@ self_test() {
 		"$([ -e "$tree/store/.lock" ] && printf no || printf yes)" yes
 	check "the original record keeps its owner, mode and inode" \
 		"$(stat -f '%Su %Sg %Lp %i' "$tree/record.json")" "$before"
+	# #1003 hardening: the same removal shape, so a directory at a lock path is
+	# removed instead of refusing and aborting the deploy.
+	mkdir "$tree/store/nested.lock"
+	code=0
+	( settle_lock "$tree/store/nested.lock" "$(id -un)" "$(id -gn)" ) >/dev/null 2>&1 || code=$?
+	check "a directory at a lock path is removed" "$code" 0
+	check "and the path is gone" \
+		"$([ -e "$tree/store/nested.lock" ] && printf no || printf yes)" yes
 
 	# The old handler-owned seen-set is folded into the root-only one, and the
 	# old file goes, so a re-delivered event is still deduplicated after upgrade.
@@ -224,6 +236,24 @@ self_test() {
 		"$([ -e "$tree/store/webhooks/processed.jsonl" ] && printf no || printf yes)" yes
 	check "the root processed log is private" \
 		"$(stat -f '%Lp' "$tree/store/verified/processed.jsonl")" 600
+
+	# #1003: webhooks/ is the handler's, so the old path can be a directory or a
+	# link. Neither may abort the deploy, and a link must not be followed.
+	mkdir "$tree/store/webhooks/processed.jsonl"
+	printf 'planted\n' >"$tree/store/webhooks/processed.jsonl/file"
+	code=0
+	( migrate_processed ) >/dev/null 2>&1 || code=$?
+	check "a directory at the old processed path does not fail the run" "$code" 0
+	check "and it is removed" \
+		"$([ -e "$tree/store/webhooks/processed.jsonl" ] && printf no || printf yes)" yes
+	printf 'keep\n' >"$tree/processed-target"
+	ln -s "$tree/processed-target" "$tree/store/webhooks/processed.jsonl"
+	code=0
+	( migrate_processed ) >/dev/null 2>&1 || code=$?
+	check "a symlink at the old processed path does not fail the run" "$code" 0
+	check "and the link is unlinked" \
+		"$([ -L "$tree/store/webhooks/processed.jsonl" ] && printf no || printf yes)" yes
+	check "and its target is untouched" "$(cat "$tree/processed-target")" keep
 	self_test_end
 }
 
