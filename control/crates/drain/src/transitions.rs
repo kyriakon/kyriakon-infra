@@ -41,6 +41,8 @@ pub enum Error {
     Script(boxrun::Error),
     /// A core read or parse failed.
     Core(kyriakon_control_core::Error),
+    /// A lifecycle transition failed.
+    Lifecycle(lifecycle::Error),
     /// A JSON record did not encode or parse.
     Json {
         context: &'static str,
@@ -56,6 +58,7 @@ impl fmt::Display for Error {
             Error::Config(error) => error.fmt(f),
             Error::Script(error) => error.fmt(f),
             Error::Core(error) => error.fmt(f),
+            Error::Lifecycle(error) => error.fmt(f),
             Error::Json { context, source } => write!(f, "cannot {context}: {source}"),
         }
     }
@@ -69,6 +72,7 @@ impl std::error::Error for Error {
             Error::Config(error) => Some(error),
             Error::Script(error) => Some(error),
             Error::Core(error) => Some(error),
+            Error::Lifecycle(error) => Some(error),
             Error::Json { source, .. } => Some(source),
         }
     }
@@ -108,6 +112,12 @@ impl From<boxrun::Error> for Error {
 impl From<kyriakon_control_core::Error> for Error {
     fn from(error: kyriakon_control_core::Error) -> Self {
         Error::Core(error)
+    }
+}
+
+impl From<lifecycle::Error> for Error {
+    fn from(error: lifecycle::Error) -> Self {
+        Error::Lifecycle(error)
     }
 }
 
