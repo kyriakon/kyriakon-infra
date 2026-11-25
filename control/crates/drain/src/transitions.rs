@@ -45,6 +45,8 @@ pub enum Error {
     Lifecycle(lifecycle::Error),
     /// A review transition failed.
     Review(review::Error),
+    /// A group transition failed.
+    Groups(groups::Error),
     /// A JSON record did not encode or parse.
     Json {
         context: &'static str,
@@ -62,6 +64,7 @@ impl fmt::Display for Error {
             Error::Core(error) => error.fmt(f),
             Error::Lifecycle(error) => error.fmt(f),
             Error::Review(error) => error.fmt(f),
+            Error::Groups(error) => error.fmt(f),
             Error::Json { context, source } => write!(f, "cannot {context}: {source}"),
         }
     }
@@ -77,6 +80,7 @@ impl std::error::Error for Error {
             Error::Core(error) => Some(error),
             Error::Lifecycle(error) => Some(error),
             Error::Review(error) => Some(error),
+            Error::Groups(error) => Some(error),
             Error::Json { source, .. } => Some(source),
         }
     }
@@ -128,6 +132,12 @@ impl From<lifecycle::Error> for Error {
 impl From<review::Error> for Error {
     fn from(error: review::Error) -> Self {
         Error::Review(error)
+    }
+}
+
+impl From<groups::Error> for Error {
+    fn from(error: groups::Error) -> Self {
+        Error::Groups(error)
     }
 }
 
