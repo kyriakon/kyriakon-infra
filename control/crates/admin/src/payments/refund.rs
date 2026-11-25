@@ -30,29 +30,27 @@ pub(crate) async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) ->
     if let Some(settled) = flags.get("settled").map(String::as_str) {
         for name in ["amount", "rail", "reason", "rate"] {
             if flags.contains_key(name) {
-                return Err(Error::Failed(format!("--settled takes no --{name}")));
+                return Err(Error::SettledFlagNotAllowed { name });
             }
         }
         if close || excess {
-            return Err(Error::Failed(
-                "--settled takes no --close or --excess".to_string(),
-            ));
+            return Err(Error::SettledWithClosing);
         }
         if util::parse_date(settled).is_none() {
-            return Err(Error::Failed(format!(
-                "--settled {settled:?} is not YYYY-MM-DD"
-            )));
+            return Err(Error::SettledInvalid {
+                settled: settled.to_string(),
+            });
         }
         // A settlement names the ledger line it completes. Without the seq the
         // drain would settle whichever refund looked newest, and a retried
         // command would mark the next one paid (#880).
         let seq = flags
             .get("seq")
-            .ok_or_else(|| Error::Failed("--settled needs --seq <ledger seq>".to_string()))?
+            .ok_or(Error::SettlementSeqMissing)?
             .parse::<u64>()
-            .map_err(|_| Error::Failed("--seq is not a ledger sequence".to_string()))?;
+            .map_err(|_| Error::SeqUnreadable)?;
         if seq == 0 {
-            return Err(Error::Failed("--seq must be a ledger sequence".to_string()));
+            return Err(Error::SeqZero);
         }
         let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
         let sig = sign::sign(
@@ -74,39 +72,32 @@ pub(crate) async fn refund(cfg: &DrainConfig, store: &Store, args: &[String]) ->
 
     let rail = need(&flags, "rail")?;
     if !intent::REFUND_RAILS.contains(&rail) {
-        return Err(Error::Failed(format!(
-            "--rail {rail:?} is not one of {}",
-            intent::REFUND_RAILS.join(", ")
-        )));
+        return Err(Error::UnknownRefundRail {
+            rail: rail.to_string(),
+        });
     }
     let amount = need(&flags, "amount")?;
     match util::pence(amount) {
         Ok(pence) if pence > 0 => {}
-        Ok(_) => return Err(Error::Failed("--amount must be more than zero".to_string())),
-        Err(e) => return Err(Error::Failed(format!("--amount: {e}"))),
+        Ok(_) => return Err(Error::AmountNotPositive),
+        Err(source) => return Err(Error::AmountUnreadable { source }),
     }
     let reason = need(&flags, "reason")?;
     if reason.trim().is_empty() {
-        return Err(Error::Failed(
-            "--reason must say why the money is going back".to_string(),
-        ));
+        return Err(Error::RefundReasonEmpty);
     }
     if close == excess {
-        return Err(Error::Failed(
-            "give exactly one of --close or --excess".to_string(),
-        ));
+        return Err(Error::CloseOrExcess);
     }
     let rate = flags.get("rate").map(String::as_str);
     if let Some(rate) = rate {
         if rail != "monero" {
-            return Err(Error::Failed(
-                "--rate is only a monero refund paid in sterling".to_string(),
-            ));
+            return Err(Error::RefundRateOnlyMonero);
         }
         match util::pence(rate) {
             Ok(pence) if pence > 0 => {}
-            Ok(_) => return Err(Error::Failed("--rate must be more than zero".to_string())),
-            Err(e) => return Err(Error::Failed(format!("--rate: {e}"))),
+            Ok(_) => return Err(Error::RateNotPositive),
+            Err(source) => return Err(Error::RateUnreadable { source }),
         }
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;

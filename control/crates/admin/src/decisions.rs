@@ -23,18 +23,21 @@ pub(crate) async fn sign_and_file(
     token: &str,
 ) -> Result<(), Error> {
     if !store::is_status_token(token) {
-        return Err(Error::Failed(format!(
-            "the token {token:?} is not a status token (26 Crockford characters)"
-        )));
+        return Err(Error::NotStatusToken {
+            token: token.to_string(),
+        });
     }
     let Some(record) = store.application(token).await? else {
-        return Err(Error::Failed(format!("no application at token {token}")));
+        return Err(Error::NoApplicationAtToken {
+            token: token.to_string(),
+        });
     };
     if record.username != username {
-        return Err(Error::Failed(format!(
-            "the application at token {token} is for {}, not {username}",
-            record.username
-        )));
+        return Err(Error::TokenForOtherUser {
+            token: token.to_string(),
+            actual: record.username.clone(),
+            expected: username.to_string(),
+        });
     }
     // What this command is about to sign, printed before it signs. Every field
     // here is the handler's to write and the signature's to cover.
@@ -50,11 +53,9 @@ pub(crate) async fn sign_and_file(
     match Journal::load(store).await?.reviewed(token) {
         Some(reviewed) => {
             if let Some(changed) = reviewed.changed(&now) {
-                return Err(Error::Failed(format!(
-                    "the application record changed after the review mail: {changed}. \
-                     Nothing was signed; read the application again and check it \
-                     against the mail before deciding"
-                )));
+                return Err(Error::RecordChanged {
+                    changed: changed.to_string(),
+                });
             }
         }
         // A review line from a release before this one carries no fields to
