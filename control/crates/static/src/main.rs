@@ -31,19 +31,43 @@ use kyriakon_control_core::util::{self, percent_decode};
 use kyriakon_control_static::{open, sandbox, Refusal, Served};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
-/// The process's own error: the core's typed failures, and the two startup
-/// refusals whose only fact is the words the operator reads.
+/// The process's own error: the core's typed failures and the startup refusals
+/// that have no lower-level type yet.
 #[derive(Debug)]
 enum Error {
     Core(kyriakon_control_core::Error),
-    Message(String),
+    /// The configuration file did not parse as TOML.
+    ConfigParse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+    /// `--config` was the last argument.
+    ConfigNeedsPath,
+    /// An argument the binary does not accept.
+    UnknownArgument {
+        arg: String,
+    },
+    /// The sandbox refused a path or a pledge.
+    /// shortcut: `core::sandbox` still returns a sentence; type it there and
+    /// drop the `String` when that boundary is converted.
+    Restrict {
+        refusal: String,
+    },
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Core(error) => error.fmt(f),
-            Error::Message(message) => f.write_str(message),
+            Error::ConfigParse { path, source } => {
+                write!(f, "{} does not parse: {source}", path.display())
+            }
+            Error::ConfigNeedsPath => f.write_str("--config needs a path"),
+            Error::UnknownArgument { arg } => write!(
+                f,
+                "unknown argument {arg:?}; usage: kyriakon-control-static [--config PATH]"
+            ),
+            Error::Restrict { refusal } => f.write_str(refusal),
         }
     }
 }
@@ -52,7 +76,8 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Core(error) => Some(error),
-            Error::Message(_) => None,
+            Error::ConfigParse { source, .. } => Some(source),
+            Error::ConfigNeedsPath | Error::UnknownArgument { .. } | Error::Restrict { .. } => None,
         }
     }
 }
@@ -140,8 +165,9 @@ impl Config {
                 path: Some(path.into()),
                 source,
             })?;
-        toml::from_str(&text).map_err(|source| {
-            Error::Message(format!("{} does not parse: {source}", path.display()))
+        toml::from_str(&text).map_err(|source| Error::ConfigParse {
+            path: path.into(),
+            source,
         })
     }
 
@@ -259,15 +285,12 @@ async fn run() -> Result<(), Error> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => {
-                cfg_path = PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| Error::Message("--config needs a path".to_string()))?,
-                );
+                cfg_path = PathBuf::from(args.next().ok_or(Error::ConfigNeedsPath)?);
             }
             other => {
-                return Err(Error::Message(format!(
-                    "unknown argument {other:?}; usage: kyriakon-control-static [--config PATH]"
-                )))
+                return Err(Error::UnknownArgument {
+                    arg: other.to_string(),
+                });
             }
         }
     }
@@ -292,7 +315,7 @@ async fn run() -> Result<(), Error> {
                 source,
             }
         })?;
-    sandbox::restrict(&cfg.root, &cfg.hosts).map_err(Error::Message)?;
+    sandbox::restrict(&cfg.root, &cfg.hosts).map_err(|refusal| Error::Restrict { refusal })?;
     util::log(&format!(
         "kyriakon-control-static: httpd {}, gemini {}, root {}",
         cfg.httpd_socket.display(),
