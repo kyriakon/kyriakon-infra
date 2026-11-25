@@ -43,6 +43,8 @@ pub enum Error {
     Core(kyriakon_control_core::Error),
     /// A lifecycle transition failed.
     Lifecycle(lifecycle::Error),
+    /// A review transition failed.
+    Review(review::Error),
     /// A JSON record did not encode or parse.
     Json {
         context: &'static str,
@@ -59,6 +61,7 @@ impl fmt::Display for Error {
             Error::Script(error) => error.fmt(f),
             Error::Core(error) => error.fmt(f),
             Error::Lifecycle(error) => error.fmt(f),
+            Error::Review(error) => error.fmt(f),
             Error::Json { context, source } => write!(f, "cannot {context}: {source}"),
         }
     }
@@ -73,6 +76,7 @@ impl std::error::Error for Error {
             Error::Script(error) => Some(error),
             Error::Core(error) => Some(error),
             Error::Lifecycle(error) => Some(error),
+            Error::Review(error) => Some(error),
             Error::Json { source, .. } => Some(source),
         }
     }
@@ -118,6 +122,12 @@ impl From<kyriakon_control_core::Error> for Error {
 impl From<lifecycle::Error> for Error {
     fn from(error: lifecycle::Error) -> Self {
         Error::Lifecycle(error)
+    }
+}
+
+impl From<review::Error> for Error {
+    fn from(error: review::Error) -> Self {
+        Error::Review(error)
     }
 }
 
