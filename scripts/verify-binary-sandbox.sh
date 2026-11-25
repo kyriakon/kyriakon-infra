@@ -4,8 +4,12 @@
 # forbids.
 #
 # Usage:
-#   doas ksh scripts/verify-binary-sandbox.sh              # OpenBSD, real binaries
+#   doas ksh scripts/verify-binary-sandbox.sh              # OpenBSD VM, root
 #        ksh scripts/verify-binary-sandbox.sh --self-test  # fixture only
+#
+# On a box that already has the installed login checker, set
+# KYRIAKON_SANDBOX_SWAP_CHECKER=yes: the run saves it, replaces it with a
+# one-password stand-in for the duration, and restores it on exit or signal.
 #
 # Why this exists: unveil and pledge are OpenBSD-only, and a wrong promise kills
 # the process with SIGABRT on the first forbidden operation rather than failing a
@@ -231,6 +235,7 @@ full_run() {
 
 	work=$(mktemp -d /var/db/kyriakon-binsandbox.XXXXXX) || exit 1
 	trap restore_system EXIT
+	trap 'exit 1' HUP INT TERM
 	[ "$(id -u)" -eq 0 ] ||
 		die "the full run installs a stand-in checker and a doas rule; run it as root"
 	# The login check is `doas` plus the fixed checker. A successful login is
@@ -246,6 +251,10 @@ full_run() {
 	borrowed_doas=no
 	mkdir -p /usr/local/libexec
 	if [ -e "$authcheck" ]; then
+		# Replacing an installed checker would hand a login bypass to anyone
+		# who can reach the live portal until this run restores it.
+		[ "${KYRIAKON_SANDBOX_SWAP_CHECKER:-no}" = yes ] ||
+			die "$authcheck is installed; set KYRIAKON_SANDBOX_SWAP_CHECKER=yes to replace it for this run"
 		cp -p "$authcheck" "$authcheck_saved" || die "could not save $authcheck"
 	fi
 	# From here the path may be truncated or rewritten, so the trap must put the
@@ -253,6 +262,9 @@ full_run() {
 	borrowed_authcheck=yes
 	cat > "$authcheck" <<EOF
 #!/bin/ksh
+# Only the fixture handler gets a proof: a stand-in left behind by a killed
+# run must not admit a live login, whose proof directory is elsewhere.
+[ "\$2" = '$work/fixture/proofs' ] || exit 1
 read -r given
 [ "\$given" = '$fixture_password' ] || exit 1
 printf '%s\n' '$proof_token'
