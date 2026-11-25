@@ -23,7 +23,7 @@
 
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,31 +41,79 @@ pub const DEFAULT_GPG_HOME: &str = "/var/run/kyriakon/gpg";
 pub enum Error {
     /// Recipient base localpart is not a single DNS label: empty, more than 31
     /// characters, or outside `[a-z0-9-]` / beginning or ending with a hyphen.
-    InvalidUser(String),
+    InvalidUser {
+        localpart: String,
+    },
     /// No `<base-localpart>.asc` in the keyring.
-    MissingKey(String),
-    /// gpg failed (bad key file, expired/revoked key, ...).
-    Gpg(String),
+    MissingKey {
+        localpart: String,
+    },
+    /// gpg ran and refused the message. `stderr` is gpg's own diagnostic.
+    Gpg {
+        stderr: String,
+    },
     /// The message has no empty line this parser accepts, and its header block
     /// is not all headers. Reading it as headers could copy text from an
     /// unrecognised body into the clear wrapper, so the save is refused.
-    Malformed(String),
+    Malformed {
+        source: kyriakon_mailparse::Malformed,
+    },
+    /// gpg could not be started, waited for, or written to.
+    GpgIo {
+        what: &'static str,
+        source: io::Error,
+    },
+    /// gpg's stdin writer thread panicked before it finished.
+    GpgWriterPanicked,
+    /// The gpg scratch directory could not be created.
+    GpgHome {
+        path: PathBuf,
+        source: io::Error,
+    },
     Io(io::Error),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::InvalidUser(u) => write!(f, "invalid recipient localpart: {u:?}"),
-            Error::MissingKey(b) => write!(f, "no public key for {b:?} in keyring"),
-            Error::Gpg(e) => write!(f, "gpg failed: {e}"),
-            Error::Malformed(e) => write!(f, "refusing malformed message: {e}"),
+            Error::InvalidUser { localpart } => {
+                write!(f, "invalid recipient localpart: {localpart:?}")
+            }
+            Error::MissingKey { localpart } => {
+                write!(f, "no public key for {localpart:?} in keyring")
+            }
+            Error::Gpg { stderr } => write!(f, "gpg failed: {stderr}"),
+            Error::Malformed { source } => {
+                write!(f, "refusing malformed message: {}", source.reason())
+            }
+            Error::GpgIo { what, source } => write!(f, "cannot {what} gpg: {source}"),
+            Error::GpgWriterPanicked => f.write_str("the gpg stdin writer panicked"),
+            Error::GpgHome { path, source } => {
+                write!(
+                    f,
+                    "cannot create the gpg homedir {}: {source}",
+                    path.display()
+                )
+            }
             Error::Io(e) => write!(f, "io error: {e}"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Malformed { source } => Some(source),
+            Error::GpgIo { source, .. } => Some(source),
+            Error::GpgHome { source, .. } => Some(source),
+            Error::Io(e) => Some(e),
+            Error::InvalidUser { .. }
+            | Error::MissingKey { .. }
+            | Error::Gpg { .. }
+            | Error::GpgWriterPanicked => None,
+        }
+    }
+}
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
@@ -75,7 +123,7 @@ impl From<io::Error> for Error {
 
 impl From<kyriakon_mailparse::Malformed> for Error {
     fn from(e: kyriakon_mailparse::Malformed) -> Self {
-        Error::Malformed(e.reason().to_string())
+        Error::Malformed { source: e }
     }
 }
 
@@ -91,7 +139,9 @@ pub fn base_localpart(user: &str) -> Result<&str, Error> {
         && alnum(base.as_bytes()[0])
         && alnum(base.as_bytes()[base.len() - 1]);
     if !ok {
-        return Err(Error::InvalidUser(user.to_string()));
+        return Err(Error::InvalidUser {
+            localpart: base.to_string(),
+        });
     }
     Ok(base)
 }
@@ -109,7 +159,9 @@ pub fn encrypt(
     let base = base_localpart(user)?;
     let key = keyring.join(format!("{base}.asc"));
     if !key.is_file() {
-        return Err(Error::MissingKey(base.to_string()));
+        return Err(Error::MissingKey {
+            localpart: base.to_string(),
+        });
     }
     let message = split_message(input)?;
     let (block, sep, body) = (message.headers, message.separator, message.body);
@@ -145,7 +197,10 @@ fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| Error::Gpg(format!("cannot spawn gpg: {e}")))?;
+        .map_err(|e| Error::GpgIo {
+            what: "spawn",
+            source: e,
+        })?;
     let stdin = child.stdin.take().expect("stdin piped");
     // gpg writes as it reads, and its armour outgrows the ~64 KiB pipe on any
     // message past ~200 KiB: writing all of stdin here before draining stdout
@@ -158,16 +213,22 @@ fn armored_ciphertext(key: &Path, gpg_home: &Path, input: &[u8]) -> Result<Vec<u
         let out = child.wait_with_output();
         (out, writer.join())
     });
-    let out = out.map_err(|e| Error::Gpg(format!("cannot wait for gpg: {e}")))?;
+    let out = out.map_err(|e| Error::GpgIo {
+        what: "wait for",
+        source: e,
+    })?;
     if !out.status.success() {
         // gpg's own complaint, not the EPIPE its early exit gives the writer.
-        return Err(Error::Gpg(
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        ));
+        return Err(Error::Gpg {
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
     }
     written
-        .map_err(|_| Error::Gpg("gpg stdin writer panicked".to_string()))?
-        .map_err(|e| Error::Gpg(format!("cannot write to gpg: {e}")))?;
+        .map_err(|_| Error::GpgWriterPanicked)?
+        .map_err(|e| Error::GpgIo {
+            what: "write to",
+            source: e,
+        })?;
     Ok(out.stdout)
 }
 
@@ -510,8 +571,10 @@ fn list_packets(input: &[u8], gpg_home: &Path) -> Option<Vec<u8>> {
 /// exist; the save path calls it per message because it cannot assume external
 /// setup completed.
 pub fn ensure_gpg_home(gpg_home: &Path) -> Result<(), Error> {
-    std::fs::create_dir_all(gpg_home)
-        .map_err(|e| Error::Gpg(format!("cannot create gpg homedir: {e}")))?;
+    std::fs::create_dir_all(gpg_home).map_err(|e| Error::GpgHome {
+        path: gpg_home.to_path_buf(),
+        source: e,
+    })?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(gpg_home, std::fs::Permissions::from_mode(0o700)).ok();
     Ok(())
@@ -1068,7 +1131,7 @@ mod tests {
         let msg = b"not a header\rFrom: SECRET-BODY-TEXT\r";
         assert!(matches!(
             split_message(msg).map_err(Error::from),
-            Err(Error::Malformed(_))
+            Err(Error::Malformed { .. })
         ));
         // A message that ends in its header block is still encrypted as before.
         assert!(split_message(b"From: a@b\rSubject: s\r").is_ok());

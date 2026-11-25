@@ -276,7 +276,10 @@ pub(super) async fn account_close(app: &App, call: &Call<'_>) -> Reply {
             Reply::html(200, page_html(&notice("Closing your account", &message)))
         }
         Err(e) => respond(
-            &Error::Failed(format!("the closure could not be filed: {e}")),
+            &Error::Filed {
+                what: "the closure",
+                source: e,
+            },
             FrontEnd::Httpd,
         ),
     }
@@ -325,7 +328,10 @@ pub(super) async fn account_cancel_close(app: &App, request: &Request) -> Reply 
             Reply::html(200, page_html(&page))
         }
         Err(e) => respond(
-            &Error::Failed(format!("the cancellation could not be filed: {e}")),
+            &Error::Filed {
+                what: "the cancellation",
+                source: e,
+            },
             FrontEnd::Httpd,
         ),
     }
@@ -400,7 +406,10 @@ pub(super) async fn account_password(app: &App, call: &Call<'_>) -> Reply {
             Reply::html(200, page_html(&page))
         }
         Err(e) => respond(
-            &Error::Failed(format!("the password change could not be filed: {e}")),
+            &Error::Filed {
+                what: "the password change",
+                source: e,
+            },
             FrontEnd::Httpd,
         ),
     }
@@ -470,7 +479,10 @@ pub(super) async fn account_upload_key(app: &App, call: &Call<'_>) -> Reply {
                     Reply::html(200, page_html(&page))
                 }
                 Err(e) => respond(
-                    &Error::Failed(format!("the upload key could not be filed: {e}")),
+                    &Error::Filed {
+                        what: "the upload key",
+                        source: e,
+                    },
                     FrontEnd::Httpd,
                 ),
             }
@@ -507,7 +519,10 @@ pub(super) async fn account_upload_key(app: &App, call: &Call<'_>) -> Reply {
                     Reply::html(200, page_html(&page))
                 }
                 Err(e) => respond(
-                    &Error::Failed(format!("the key removal could not be filed: {e}")),
+                    &Error::Filed {
+                        what: "the key removal",
+                        source: e,
+                    },
                     FrontEnd::Httpd,
                 ),
             }
@@ -561,7 +576,10 @@ pub(super) async fn account_address(app: &App, request: &Request) -> Reply {
             )
         }
         Err(e) => respond(
-            &Error::Failed(format!("the address change could not be filed: {e}")),
+            &Error::Filed {
+                what: "the address change",
+                source: e,
+            },
             FrontEnd::Httpd,
         ),
     }
@@ -603,7 +621,10 @@ pub(super) async fn account_serving(app: &App, request: &Request) -> Reply {
             Reply::html(200, page_html(&page))
         }
         Err(e) => respond(
-            &Error::Failed(format!("the serving change could not be filed: {e}")),
+            &Error::Filed {
+                what: "the serving change",
+                source: e,
+            },
             FrontEnd::Httpd,
         ),
     }
@@ -666,7 +687,10 @@ pub(super) async fn account_renewal(app: &App, request: &Request) -> Reply {
             Reply::html(200, page_html(&page))
         }
         Err(e) => respond(
-            &Error::Failed(format!("the cancellation could not be filed: {e}")),
+            &Error::Filed {
+                what: "the cancellation",
+                source: e,
+            },
             FrontEnd::Httpd,
         ),
     }
@@ -749,7 +773,10 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
                     )
                 }
                 Err(e) => respond(
-                    &Error::Failed(format!("the key replacement could not be filed: {e}")),
+                    &Error::Filed {
+                        what: "the key replacement",
+                        source: e,
+                    },
                     FrontEnd::Httpd,
                 ),
             }
@@ -776,7 +803,10 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
                     Reply::html(200, page_html(&page))
                 }
                 Err(e) => respond(
-                    &Error::Failed(format!("the cancellation could not be filed: {e}")),
+                    &Error::Filed {
+                        what: "the cancellation",
+                        source: e,
+                    },
                     FrontEnd::Httpd,
                 ),
             }
@@ -849,7 +879,10 @@ pub(super) async fn account_test_mail(app: &App, request: &Request) -> Reply {
             Reply::html(200, page_html(&page))
         }
         Err(e) => respond(
-            &Error::Failed(format!("the test message could not be filed: {e}")),
+            &Error::Filed {
+                what: "the test message",
+                source: e,
+            },
             FrontEnd::Httpd,
         ),
     }

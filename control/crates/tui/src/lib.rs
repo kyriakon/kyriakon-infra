@@ -33,7 +33,7 @@
 pub mod error;
 pub mod sandbox;
 
-pub use error::Error;
+pub use error::{Error, Refusal};
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -264,11 +264,11 @@ fn lock_exclusive(fd: i32, path: &Path) -> Result<(), Error> {
     if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
         Ok(())
     } else {
-        Err(Error::Failed(format!(
-            "cannot lock {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        )))
+        Err(Error::Io {
+            what: "lock",
+            path: Some(path.to_path_buf()),
+            source: std::io::Error::last_os_error(),
+        })
     }
 }
 
@@ -435,15 +435,11 @@ impl Watch {
             let now = Instant::now();
             let lifetime_end = self.started + self.lifetime;
             if now >= lifetime_end {
-                return Err(Error::Failed(
-                    "the session has reached its maximum length".to_string(),
-                ));
+                return Err(Error::SessionTooLong);
             }
             let idle_end = self.last_activity + self.idle;
             if now >= idle_end {
-                return Err(Error::Failed(
-                    "the session was idle for too long".to_string(),
-                ));
+                return Err(Error::SessionIdle);
             }
             let wait = (idle_end - now).min(lifetime_end - now);
             let mut ready = libc::pollfd {
@@ -541,18 +537,22 @@ impl<R: Read> Reader<R> {
                     if error.kind() == std::io::ErrorKind::Interrupted {
                         continue;
                     }
-                    return Err(Error::Failed(format!(
-                        "cannot read the session's input: {error}"
-                    )));
+                    return Err(Error::Io {
+                        what: "read the session's input",
+                        path: None,
+                        source: error,
+                    });
                 },
                 None => match self.inner.read(&mut self.held) {
                     Ok(0) => return Ok(false),
                     Ok(n) => n,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        return Err(Error::Failed(format!(
-                            "cannot read the session's input: {e}"
-                        )))
+                        return Err(Error::Io {
+                            what: "read the session's input",
+                            path: None,
+                            source: e,
+                        })
                     }
                 },
             };
@@ -617,7 +617,7 @@ impl<R: Read> Reader<R> {
         }
         String::from_utf8(line)
             .map(|line| Some(Word::Line(line)))
-            .map_err(|_| Error::Failed("the session's input is not text".to_string()))
+            .map_err(|_| Error::InputNotText)
     }
 }
 
@@ -649,10 +649,9 @@ pub fn run(
     out: &mut dyn Output,
 ) -> Result<Departure, Error> {
     if rows.is_empty() {
-        return Err(Error::Failed(format!(
-            "{} names no services, so there is nothing to show",
-            catalogue::TRACKED
-        )));
+        return Err(Error::NoServices {
+            path: catalogue::TRACKED,
+        });
     }
 
     put(out, OPENING)?;
@@ -1599,7 +1598,7 @@ mod tests {
         fn read(&mut self, _token: &str) -> Result<StatusAnswer, Error> {
             self.answers
                 .pop_front()
-                .unwrap_or_else(|| Err(Error::Failed("no status was scripted".to_string())))
+                .unwrap_or_else(|| Err(Error::NoStatusScripted))
         }
     }
 
@@ -1608,7 +1607,7 @@ mod tests {
 
     impl StatusSource for NoStatus {
         fn read(&mut self, _token: &str) -> Result<StatusAnswer, Error> {
-            Err(Error::Failed("this session asks no status".to_string()))
+            Err(Error::StatusNotAsked)
         }
     }
 
@@ -1631,7 +1630,7 @@ mod tests {
 
     impl Filing for NoFiles {
         fn file(&mut self, _form: &BTreeMap<String, String>) -> Result<String, Error> {
-            Err(Error::Failed("this session files nothing".to_string()))
+            Err(Error::FilesNothing)
         }
     }
 
@@ -1896,7 +1895,11 @@ mod tests {
     fn a_status_read_that_fails_leaves_the_session_open() {
         let rows = rows(None);
         let mut statuses = Statuses {
-            answers: VecDeque::from([Err(Error::Failed("connection refused".to_string()))]),
+            answers: VecDeque::from([Err(Error::Io {
+                what: "read the status",
+                path: None,
+                source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            })]),
         };
         let mut script = Script::lines(&["status", "abcdefghjkmnpqrstvwxyz0123", "", "quit"]);
         let (left, seen) =
@@ -2955,7 +2958,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(&why, Error::Failed(message) if message.contains(catalogue::TRACKED)),
+            matches!(&why, Error::NoServices { path } if *path == catalogue::TRACKED),
             "{why}"
         );
         assert!(out.is_empty(), "the refusal drew a screen");

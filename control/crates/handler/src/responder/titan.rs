@@ -98,7 +98,7 @@ pub(super) async fn titan_connection(
     let write = say(&mut writer, &head);
     match tokio::time::timeout(TITAN_TIMEOUT, write).await {
         Ok(result) => result,
-        Err(_) => Err(Error::Failed("the titan reply timed out".to_string())),
+        Err(_) => Err(Error::TitanTimeout),
     }
 }
 
@@ -235,13 +235,10 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
                 return Ok((Upload::Full, false));
             };
             if blocks.len() != 1 {
-                return Ok((
-                    Upload::Refused("Upload one public key block".to_string()),
-                    false,
-                ));
+                return Ok((Upload::NotOneBlock, false));
             }
             if let Some(why) = kyriakon_control_core::flow::applicant::key_error(&blocks[0]) {
-                return Ok((Upload::Refused(why), false));
+                return Ok((Upload::Unusable { reason: why }, false));
             }
             // The same retain-then-push the capsule's key page uses, so a retry
             // for one mailbox replaces its key rather than adding a second.
@@ -286,7 +283,15 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
                 address,
             ))
         }
-        Upload::Refused(why) => return Ok((Reply::gemini(59, &why, String::new()), address)),
+        Upload::NotOneBlock => {
+            return Ok((
+                Reply::gemini(59, "Upload one public key block", String::new()),
+                address,
+            ))
+        }
+        Upload::Unusable { reason } => {
+            return Ok((Reply::gemini(59, &reason, String::new()), address))
+        }
     };
     let link = format!("gemini://{HOST}/status/{token}");
     Ok((
@@ -303,7 +308,12 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
 enum Upload {
     Filled(String),
     Full,
-    Refused(String),
+    /// The body held no key block, or more than one.
+    NotOneBlock,
+    /// The core key check's own words, which name the property not met.
+    Unusable {
+        reason: String,
+    },
 }
 
 /// The mailbox an upload belongs to: the first key page without a key. A draft
@@ -331,11 +341,7 @@ pub(super) async fn titan_line<R: tokio::io::AsyncRead + Unpin>(
         let mut b = [0u8; 1];
         match reader.read(&mut b).await {
             Ok(0) if bytes.is_empty() => return Ok(None),
-            Ok(0) => {
-                return Err(Error::Refused(
-                    "the titan request line was cut short".to_string(),
-                ))
-            }
+            Ok(0) => return Err(Error::Refused(Refusal::TitanLineCutShort)),
             Ok(_) => bytes.push(b[0]),
             Err(source) => {
                 return Err(Error::Io {

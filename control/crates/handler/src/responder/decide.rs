@@ -105,7 +105,10 @@ pub(super) async fn decide_file(app: &App, call: &Call<'_>) -> Reply {
             "The decision is filed. The platform carries it out on its next pass, within a minute.",
         )),
         Err(e) => respond(
-            &Error::Failed(format!("the decision could not be filed: {e}")),
+            &Error::Filed {
+                what: "the decision",
+                source: e,
+            },
             FrontEnd::Httpd,
         ),
     }
@@ -268,7 +271,13 @@ pub(super) async fn password_file(app: &App, call: &Call<'_>) -> Reply {
             "Password set",
             "The platform sets it on its next pass, within a minute. This link will not work again.",
         )),
-        Err(e) => respond(&Error::Failed(format!("the password could not be filed: {e}")), FrontEnd::Httpd),
+        Err(e) => respond(
+            &Error::Filed {
+                what: "the password",
+                source: e,
+            },
+            FrontEnd::Httpd,
+        ),
     }
 }
 

@@ -83,6 +83,7 @@ pub(crate) mod test_support;
 mod titan;
 
 pub use self::error::Error;
+use self::error::Refusal;
 use self::portal::portal_connection;
 use self::titan::titan_accept;
 
@@ -169,10 +170,9 @@ impl App {
     async fn load(cfg: config::Config) -> Result<App, Error> {
         let list = questions::shipped()?;
         if list.is_empty() {
-            return Err(Error::Startup(format!(
-                "{} has no questions",
-                questions::TRACKED
-            )));
+            return Err(Error::NoQuestions {
+                path: questions::TRACKED,
+            });
         }
         // The catalogue is read the same way and refused the same way: a responder
         // that came up with no services would render an application page that
@@ -180,10 +180,9 @@ impl App {
         // prevent.
         let services = catalogue::parse(&Store::read_text(&cfg.catalogue).await?)?;
         if services.is_empty() {
-            return Err(Error::Startup(format!(
-                "{} has no services",
-                catalogue::TRACKED
-            )));
+            return Err(Error::NoServices {
+                path: catalogue::TRACKED,
+            });
         }
         // The mirrored pages are read the same way and refused the same way: a
         // handler that came up without them would answer 51 for the pages the
@@ -194,7 +193,7 @@ impl App {
             let path = format!("{}/{}", cfg.pages.trim_end_matches('/'), file);
             let text = Store::read_text(&path).await?;
             if text.trim().is_empty() {
-                return Err(Error::Startup(format!("{path} is empty")));
+                return Err(Error::EmptyPage { path });
             }
             pages.insert((*route).to_string(), text);
         }
@@ -305,7 +304,7 @@ pub async fn serve(cfg: config::Config) -> Result<(), Error> {
             path: Some(app.cfg.titan_listener.clone().into()),
             source,
         })?;
-    crate::sandbox::restrict(&app.cfg).map_err(Error::Failed)?;
+    crate::sandbox::restrict(&app.cfg).map_err(|reason| Error::Restrict { reason })?;
     kyriakon_control_core::util::log(&format!(
         "kyriakon-control: httpd {}, gemini {}, portal {}, titan {}, store {}, {} questions",
         app.cfg.httpd_socket,
@@ -425,7 +424,7 @@ mod tests {
             panic!("the handler started on an empty page");
         };
         assert!(
-            matches!(&err, Error::Startup(message) if message.contains("privacy.gmi")),
+            matches!(&err, Error::EmptyPage { path } if path.ends_with("privacy.gmi")),
             "{err}"
         );
     }
