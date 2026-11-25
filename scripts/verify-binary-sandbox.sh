@@ -4,8 +4,12 @@
 # forbids.
 #
 # Usage:
-#   ksh scripts/verify-binary-sandbox.sh              # OpenBSD, real binaries
+#   doas ksh scripts/verify-binary-sandbox.sh              # OpenBSD VM, root
 #        ksh scripts/verify-binary-sandbox.sh --self-test  # fixture only
+#
+# On a box that already has the installed login checker, set
+# KYRIAKON_SANDBOX_SWAP_CHECKER=yes: the run saves it, replaces it with a
+# one-password stand-in for the duration, and restores it on exit or signal.
 #
 # Why this exists: unveil and pledge are OpenBSD-only, and a wrong promise kills
 # the process with SIGABRT on the first forbidden operation rather than failing a
@@ -24,8 +28,11 @@
 #   * sandbox-probe syscall: `pledge "stdio"` kills a `chmod(2)` with SIGABRT.
 #   * static: binds both sockets, starts, and survives (verify-hosting.sh makes
 #     it serve requests).
-#   * handler: starts, answers one portal status read, and exits no cleaner than
-#     a signal.
+#   * handler: starts, answers one portal status read, one capsule `/apply`
+#     request and one successful login, and exits no cleaner than a signal. The
+#     capsule and login are the two requests that take a store lock
+#     (`drafts/.lock` and `sessions/.<id>.lock`), so the handler still being
+#     alive after each is what proves its pledge carries `flock`.
 #   * tui: a plain-mode session reads its catalogue, takes its session lock, and
 #     exits on "q".
 #   * encrypt: encrypts a message through the real gpg, under the veil.
@@ -57,10 +64,16 @@ catalogue_src=$repo/openbsd/etc/onboard/catalogue.toml
 reserved_src=$repo/reserved-usernames.txt
 config_src=$repo/openbsd/etc/onboard/onboard.toml
 status_token=abcdefghjkmnpqrstvwxyz0123
+# The stand-in login checker's one password, and the proof token it prints. The
+# real checker verifies a mail password through doas and writes a proof; this run
+# only needs one request to succeed so it reaches `session::open`, which takes
+# the session lock under the handler's pledge.
+fixture_password=righthorsebattery
+proof_token=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
 usage() {
 	cat >&2 <<'USAGE'
-usage: ksh verify-binary-sandbox.sh
+usage: doas ksh verify-binary-sandbox.sh
        ksh verify-binary-sandbox.sh --self-test
 USAGE
 	exit 2
@@ -85,6 +98,28 @@ fail() {
 	die "$*"
 }
 
+# restore_system: put back the login checker and `/etc/doas.conf` this run
+# borrowed, then remove the fixture. It runs from an EXIT trap, so every branch
+# is best-effort and the status is zero.
+restore_system() {
+	if [ "${borrowed_authcheck:-no}" = yes ]; then
+		if [ -f "${authcheck_saved:-}" ]; then
+			cp -p "$authcheck_saved" "$authcheck" || true
+		else
+			rm -f "$authcheck" || true
+		fi
+	fi
+	if [ "${borrowed_doas:-no}" = yes ]; then
+		if [ -f "${doas_conf_saved:-}" ]; then
+			cp -p "$doas_conf_saved" "$doas_conf" || true
+		else
+			rm -f "$doas_conf" || true
+		fi
+	fi
+	[ -n "${work:-}" ] && rm -rf "$work"
+	return 0
+}
+
 wait_for() {
 	typeset path=$1 tries=0
 	while [ "$tries" -lt 100 ]; do
@@ -93,6 +128,18 @@ wait_for() {
 		tries=$((tries + 1))
 	done
 	return 1
+}
+
+# alive <pid>: whether the process is still running. A child that took SIGABRT
+# stays visible to kill(0) as a zombie until it is waited for, so this reads the
+# state instead: a pledge violation cannot pass as a live handler.
+alive() {
+	typeset state
+	state=$(ps -o state= -p "$1" 2>/dev/null) || return 1
+	case "$state" in
+	'' | Z*) return 1 ;;
+	esac
+	return 0
 }
 
 # make_fixture <tree>: every path the five policies name, and the store records
@@ -187,19 +234,55 @@ full_run() {
 	ulimit -c 0
 
 	work=$(mktemp -d /var/db/kyriakon-binsandbox.XXXXXX) || exit 1
-	trap 'rm -rf "$work"' EXIT
-	# The handler's policy names the installed checker path, which a bare CI VM
-	# has never run deploy-control.sh to install. A stand-in is enough for the
-	# startup unveil; an existing one (a real box) is left untouched.
+	trap restore_system EXIT
+	trap 'exit 1' HUP INT TERM
+	[ "$(id -u)" -eq 0 ] ||
+		die "the full run installs a stand-in checker and a doas rule; run it as root"
+	# The login check is `doas` plus the fixed checker. A successful login is
+	# the one request that reaches `session::open` and its store lock, so the run
+	# needs a checker that admits one fixture password and a doas rule that lets
+	# the handler's process run it. A bare CI VM has neither, so both are
+	# supplied here and put back on exit; a real box's copies are saved first.
 	authcheck=/usr/local/libexec/kyriakon-authcheck
-	made_authcheck=no
-	if [ ! -e "$authcheck" ]; then
-		mkdir -p /usr/local/libexec
-		printf '#!/bin/ksh\nexit 1\n' > "$authcheck"
-		chmod 755 "$authcheck"
-		made_authcheck=yes
-		trap 'rm -rf "$work"; [ "$made_authcheck" = yes ] && rm -f "$authcheck"' EXIT
+	doas_conf=/etc/doas.conf
+	authcheck_saved=$work/kyriakon-authcheck.saved
+	doas_conf_saved=$work/doas.conf.saved
+	borrowed_authcheck=no
+	borrowed_doas=no
+	mkdir -p /usr/local/libexec
+	if [ -e "$authcheck" ]; then
+		# Replacing an installed checker would hand a login bypass to anyone
+		# who can reach the live portal until this run restores it.
+		[ "${KYRIAKON_SANDBOX_SWAP_CHECKER:-no}" = yes ] ||
+			die "$authcheck is installed; set KYRIAKON_SANDBOX_SWAP_CHECKER=yes to replace it for this run"
+		cp -p "$authcheck" "$authcheck_saved" || die "could not save $authcheck"
 	fi
+	# From here the path may be truncated or rewritten, so the trap must put the
+	# saved copy back even if the write fails.
+	borrowed_authcheck=yes
+	cat > "$authcheck" <<EOF
+#!/bin/ksh
+# Only the fixture handler gets a proof: a stand-in left behind by a killed
+# run must not admit a live login, whose proof directory is elsewhere.
+[ "\$2" = '$work/fixture/proofs' ] || exit 1
+read -r given
+[ "\$given" = '$fixture_password' ] || exit 1
+printf '%s\n' '$proof_token'
+EOF
+	chmod 755 "$authcheck"
+	if [ -e "$doas_conf" ]; then
+		cp -p "$doas_conf" "$doas_conf_saved" || die "could not save $doas_conf"
+	fi
+	borrowed_doas=yes
+	# A leading newline keeps the rule on its own line even when an existing
+	# file does not end with one; doas ignores the blank line.
+	printf '\npermit nopass %s as root cmd %s\n' "$(id -un)" "$authcheck" \
+		>> "$doas_conf"
+	# doas refuses a group- or world-writable config; narrow rather than widen,
+	# and the saved copy restores the original mode on exit.
+	chmod go-w "$doas_conf"
+	doas -C "$doas_conf" "$authcheck" >/dev/null 2>&1 ||
+		die "the temporary doas rule does not permit the checker"
 	tree=$work/fixture
 	mkdir "$tree"
 	make_fixture "$tree" || die "could not make the fixture"
@@ -229,35 +312,36 @@ full_run() {
 	spid=$!
 	wait_for "$tree/run/static-httpd.sock" || fail "static bound no httpd socket"
 	wait_for "$tree/run/static-gemini.sock" || fail "static bound no gemini socket"
-	kill -0 "$spid" 2>/dev/null || fail "static exited after binding"
+	alive "$spid" || fail "static exited after binding"
 	kill "$spid" 2>/dev/null || true
 	status=0
 	wait "$spid" 2>/dev/null || status=$?
 	assert_signal_only "$status" "static"
 
-	# 3. handler: bind four listeners, keep its view, answer one portal read,
-	# then run one login through doas. The VM has no doas rule for the checker,
-	# so doas refuses and the login answers its ordinary failure page. What the
-	# step proves is that the handler could exec the fixed program at all: a
-	# missing `unveil(DOAS, "x")` or `exec` promise shows as "cannot run the
-	# login check", while a killed process fails the wait below.
+	# 3. handler: bind four listeners, keep its view, and answer a portal read
+	# and three FastCGI requests. The capsule's `/apply` is unauthenticated and
+	# reaches `draft::save`; the successful login reaches `session::open`. Both
+	# take a store lock, so a pledge without `flock` aborts the handler inside
+	# them. A wrong password still proves the handler could exec doas and the
+	# checker: a missing `unveil(DOAS, "x")` or `exec` promise shows as "cannot
+	# run the login check". Each request is followed by a liveness check, not
+	# just the final wait, so a killed handler cannot pass as a clean answer.
 	"$handler_bin" serve --config "$tree/handler.toml" > "$tree/logs/handler" 2>&1 &
 	hpid=$!
 	wait_for "$tree/run/portal.sock" || fail "the handler bound no portal socket"
 	wait_for "$tree/run/httpd.sock" || fail "the handler bound no httpd socket"
 	wait_for "$tree/run/gemini.sock" || fail "the handler bound no gemini socket"
-	kill -0 "$hpid" 2>/dev/null || fail "the handler exited after binding"
+	alive "$hpid" || fail "the handler exited after binding"
 	printf 'STATUS - %s\n' "$status_token" |
 		nc -U -w 2 "$tree/run/portal.sock" > "$tree/logs/portal-reply" 2>&1 ||
 		fail "the portal status read failed"
 	grep -q '^notice ' "$tree/logs/portal-reply" ||
 		fail "the portal answered no notice for an unknown token"
 
-	# One FastCGI POST to /login. The fields are the minimum the route reads,
-	# and the origin names the one the handler accepts. The request is built in
-	# Perl because the OpenBSD base has it and the wire has two length forms to
-	# encode.
-	cat > "$work/fcgi-login.pl" <<'PERL'
+	# The FastCGI requests below are built in Perl because the OpenBSD base has
+	# it and the wire has two length forms to encode. `$1` is the socket, `$2` the
+	# body, and the rest is the request's environment.
+	cat > "$work/fcgi-request.pl" <<'PERL'
 use strict;
 use warnings;
 use IO::Socket::UNIX;
@@ -290,7 +374,25 @@ while (1) {
 }
 print $reply;
 PERL
-	perl "$work/fcgi-login.pl" "$tree/run/httpd.sock" \
+	# The capsule's first page: unauthenticated, GET as gmid sends it, and it
+	# calls `draft::save`, which takes `drafts/.lock`. A handler killed there
+	# writes no draft, so both the live process and the record are checked.
+	perl "$work/fcgi-request.pl" "$tree/run/gemini.sock" '' \
+		REQUEST_METHOD=GET GATEWAY_INTERFACE=CGI/1.1 \
+		GEMINI_URL_PATH=apply QUERY_STRING= \
+		REMOTE_ADDR=203.0.113.10 SERVER_NAME=signup.kyriakon.net \
+		> "$tree/logs/capsule-reply" 2>&1 ||
+		fail "the capsule /apply request could not be sent"
+	alive "$hpid" ||
+		fail "the handler died on the unauthenticated capsule /apply request"
+	grep -q 'gemini /apply 30' "$tree/logs/handler" ||
+		fail "the handler did not answer the capsule /apply route"
+	ls "$tree/store/drafts"/*.json >/dev/null 2>&1 ||
+		fail "the capsule /apply request wrote no draft"
+
+	# A wrong password first: it must still be refused by the checker, and it
+	# must show the handler could exec doas at all.
+	perl "$work/fcgi-request.pl" "$tree/run/httpd.sock" \
 		'username=alice&password=wrong' \
 		REQUEST_METHOD=POST REQUEST_URI=/login REMOTE_ADDR=127.0.0.1 \
 		SERVER_NAME=signup.kyriakon.net \
@@ -303,6 +405,25 @@ PERL
 	if grep -q 'cannot run the login check' "$tree/logs/handler"; then
 		fail "the handler could not exec doas under its pledge"
 	fi
+
+	# The same route with the checker's password. This is the only request that
+	# reaches `session::open`, which takes `sessions/.<id>.lock`, so a pledge
+	# without `flock` aborts the handler here rather than answering with a
+	# redirect. Check the live process and the session record it must leave.
+	perl "$work/fcgi-request.pl" "$tree/run/httpd.sock" \
+		"username=alice&password=$fixture_password" \
+		REQUEST_METHOD=POST REQUEST_URI=/login REMOTE_ADDR=127.0.0.1 \
+		SERVER_NAME=signup.kyriakon.net \
+		CONTENT_TYPE=application/x-www-form-urlencoded \
+		HTTP_ORIGIN=https://signup.kyriakon.net \
+		> "$tree/logs/login-ok-reply" 2>&1 ||
+		fail "the successful login request could not be sent"
+	alive "$hpid" ||
+		fail "the handler died on the successful login"
+	grep -q 'httpd /login 303' "$tree/logs/handler" ||
+		fail "the handler did not open a session for the correct password"
+	ls "$tree/store/sessions"/*.json >/dev/null 2>&1 ||
+		fail "the successful login wrote no session record"
 
 	# 4. tui: a plain session reads its catalogue, takes its session lock, asks
 	# the handler for a status so the unix connect is exercised, and leaves. The
