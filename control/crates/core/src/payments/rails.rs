@@ -4,10 +4,10 @@
 //! The copy lives here, not in the drain, so a front end can say what a member
 //! owes without depending on a transition verb.
 
-use crate::payments::xmr;
+use super::xmr;
+use super::Error;
 use crate::store::Monero;
 use crate::util;
-use crate::Error;
 
 /// The rail's own payment instructions, one line each, in the words the
 /// approval email and both account pages carry. Monero has no subaddress until
@@ -112,10 +112,7 @@ pub fn card_link(payment_link: &str, application: &str) -> Result<Option<String>
     }
     let link = payment_link.trim_end_matches(['&', '?']);
     if link.is_empty() || link.contains("REPLACE_ME") {
-        return Err(Error::Failed(
-            "stripe_payment_link is not configured, so a card approval has no link to send"
-                .to_string(),
-        ));
+        return Err(Error::StripeLinkUnconfigured);
     }
     let joiner = if link.contains('?') { '&' } else { '?' };
     Ok(Some(format!(

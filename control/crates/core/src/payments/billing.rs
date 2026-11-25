@@ -16,8 +16,8 @@
 use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime};
 
+use super::Error;
 use crate::util;
-use crate::Error;
 
 /// The date a payment takes access to: one calendar year after the later of
 /// `received` and `before`, as `YYYY-MM-DD`. Each may be a store date or an
@@ -26,11 +26,8 @@ use crate::Error;
 pub fn extend_paid_until(received: &str, before: Option<&str>) -> Result<String, Error> {
     let received = day(received)?;
     let before = before.map(day).transpose()?;
-    let until = util::paid_until_after(received, before).ok_or_else(|| {
-        Error::Failed(format!(
-            "the year after {} has no date in the calendar",
-            util::date_string(received)
-        ))
+    let until = util::paid_until_after(received, before).ok_or_else(|| Error::YearAfterNone {
+        date: util::date_string(received),
     })?;
     Ok(util::date_string(until))
 }
@@ -44,7 +41,9 @@ fn day(stamp: &str) -> Result<Date, Error> {
                 .ok()
                 .map(|t| t.date())
         })
-        .ok_or_else(|| Error::Failed(format!("the date {stamp:?} is not YYYY-MM-DD or RFC 3339")))
+        .ok_or_else(|| Error::DateNotIsoOrRfc3339 {
+            stamp: stamp.to_string(),
+        })
 }
 
 #[cfg(test)]

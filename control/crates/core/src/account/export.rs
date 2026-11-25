@@ -386,7 +386,7 @@ async fn written(
         Some(token) => crate::payments::ledger::Ledger::open(store)
             .raw_lines_for(token)
             .await
-            .map_err(|error| Error::Ledger(Box::new(error)))?,
+            .map_err(|error| Error::Ledger(Box::new(crate::Error::from(error))))?,
         None => Vec::new(),
     };
     docs.push((
@@ -627,7 +627,7 @@ pub async fn deliver(cfg: &DrainConfig, store: &Store, username: &str) -> Result
         &answer,
     )
     .await
-    .map_err(|error| Error::Notice(Box::new(error)))?;
+    .map_err(|error| Error::Notice(Box::new(crate::Error::from(error))))?;
     Ok(format!("export/{name}/"))
 }
 
@@ -688,7 +688,7 @@ pub async fn deliver_by_mail(
     let (account, answer, docs) = written(cfg, store, username, now, true).await?;
     let armored = pgp::encrypt_to_cert(&cfg.gpg, &key, bundle_text(&docs).as_bytes())
         .await
-        .map_err(|error| Error::Encrypt(Box::new(error)))?;
+        .map_err(|error| Error::Encrypt(Box::new(crate::Error::from(error))))?;
     let filename = format!("export-{}.txt.asc", stamp(now));
     let to = account.notice_address();
     notice::send_account_notice_attachment(
@@ -703,7 +703,7 @@ pub async fn deliver_by_mail(
         &armored,
     )
     .await
-    .map_err(|error| Error::Notice(Box::new(error)))?;
+    .map_err(|error| Error::Notice(Box::new(crate::Error::from(error))))?;
     Ok(format!("mailed encrypted to the key in {}", key.display()))
 }
 

@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::pgp;
+use super::Error;
 use crate::store::KeyRecord;
-use crate::Error;
 
 /// The box keyring entry a localpart's mail key is served from: one `<localpart>.asc`
 /// per address, which is what the encrypting LMTP reads.
@@ -44,7 +44,7 @@ pub fn keyring_file(dir: &str, localpart: &str) -> PathBuf {
 pub fn openssh_public_key(value: &str) -> Result<(), Error> {
     let value = value.trim();
     if value.is_empty() {
-        return Err(Error::Failed("an upload key is needed".to_string()));
+        return Err(Error::UploadKeyMissing);
     }
     let mut parts = value.split_whitespace();
     let kind = parts.next().unwrap_or("");
@@ -63,17 +63,11 @@ pub fn openssh_public_key(value: &str) -> Result<(), Error> {
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
             });
     if !known {
-        return Err(Error::Failed(
-            "this is not an OpenSSH public key".to_string(),
-        ));
+        return Err(Error::NotOpenSshKey);
     }
-    let blob = parts
-        .next()
-        .ok_or_else(|| Error::Failed("the upload key has no key material".to_string()))?;
+    let blob = parts.next().ok_or(Error::UploadKeyNoMaterial)?;
     if pgp::base64_decode(blob).is_none_or(|b| b.is_empty()) {
-        return Err(Error::Failed(
-            "the upload key's material does not decode".to_string(),
-        ));
+        return Err(Error::UploadKeyNotDecodable);
     }
     Ok(())
 }

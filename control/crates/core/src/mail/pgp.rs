@@ -26,7 +26,7 @@ use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use crate::Error;
+use super::Error;
 
 const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
 const END: &str = "-----END PGP PUBLIC KEY BLOCK-----";
@@ -87,17 +87,17 @@ struct ScratchHome(PathBuf);
 impl ScratchHome {
     fn new() -> Result<Self, Error> {
         let home = PathBuf::from("/tmp").join(format!("kyriakon-gpg-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&home)
-            .map_err(|e| Error::context(format!("cannot create {}", home.display()), e))?;
+        std::fs::create_dir_all(&home).map_err(|source| Error::CreateScratchHome {
+            path: home.clone(),
+            source,
+        })?;
         let scratch = Self(home);
         // gpg refuses a homedir another user could read, and the scratch
         // directory is created with the process umask otherwise.
         std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700)).map_err(
-            |e| {
-                Error::context(
-                    format!("cannot set the mode on {}", scratch.path().display()),
-                    e,
-                )
+            |source| Error::SetScratchMode {
+                path: scratch.path().to_path_buf(),
+                source,
             },
         )?;
         Ok(scratch)
@@ -147,11 +147,10 @@ where
         import.arg("--import").arg(key_file);
         let out = execute(import, None, gpg).await?;
         if !out.success {
-            return Err(Error::Failed(format!(
-                "gpg could not read {}: {}",
-                key_file.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
+            return Err(Error::ImportKey {
+                path: key_file.to_path_buf(),
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            });
         }
     }
     let mut command = base_command(gpg, home.path());
@@ -169,18 +168,13 @@ async fn execute(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|e| Error::context(format!("cannot run {gpg}"), e))?;
+    let mut child = command.spawn().map_err(|source| Error::RunGpg {
+        program: gpg.to_string(),
+        source,
+    })?;
     let mut child_stdin = child.stdin.take();
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::Failed("gpg has no stdout".to_string()))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Error::Failed("gpg has no stderr".to_string()))?;
+    let mut stdout = child.stdout.take().ok_or(Error::GpgNoStdout)?;
+    let mut stderr = child.stderr.take().ok_or(Error::GpgNoStderr)?;
     let io = async move {
         let write = async move {
             if let Some(bytes) = stdin {
@@ -216,17 +210,28 @@ async fn execute(
     };
     let status = match tokio::time::timeout_at(deadline, child.wait()).await {
         Ok(Ok(status)) => status,
-        Ok(Err(e)) => return Err(Error::context(format!("cannot wait for {gpg}"), e)),
+        Ok(Err(source)) => {
+            return Err(Error::WaitGpg {
+                program: gpg.to_string(),
+                source,
+            })
+        }
         Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
             return Err(timed_out(gpg));
         }
     };
-    let stdout = out.map_err(|e| Error::context(format!("cannot read {gpg}'s output"), e))?;
-    let stderr = err.map_err(|e| Error::context(format!("cannot read {gpg}'s error"), e))?;
+    let stdout = out.map_err(|source| Error::ReadGpgOutput {
+        program: gpg.to_string(),
+        source,
+    })?;
+    let stderr = err.map_err(|source| Error::ReadGpgError {
+        program: gpg.to_string(),
+        source,
+    })?;
     if status.success() {
-        written.map_err(|e| Error::context("cannot write to gpg", e))?;
+        written.map_err(|source| Error::WriteGpg { source })?;
     }
     Ok(GpgOutput {
         success: status.success(),
@@ -236,10 +241,10 @@ async fn execute(
 }
 
 fn timed_out(gpg: &str) -> Error {
-    Error::Failed(format!(
-        "{gpg} did not finish within {} seconds and was stopped",
-        GPG_TIMEOUT.as_secs()
-    ))
+    Error::GpgTimedOut {
+        program: gpg.to_string(),
+        seconds: GPG_TIMEOUT.as_secs(),
+    }
 }
 
 /// Inspect one armoured public key block: exactly one block, exactly one
@@ -247,39 +252,26 @@ fn timed_out(gpg: &str) -> Error {
 pub fn inspect_single_cert(armour: &str) -> Result<Cert, Error> {
     let blocks = labelled_blocks(armour);
     if blocks.is_empty() {
-        return Err(Error::Failed(
-            "this is not an armoured PGP public key block".to_string(),
-        ));
+        return Err(Error::NotArmoured);
     }
     if blocks.len() > 1 {
-        return Err(Error::Failed(
-            "the material is more than one armoured key block; submit one key".to_string(),
-        ));
+        return Err(Error::MultipleArmourBlocks);
     }
     let (_, material) = &blocks[0];
     if !kyriakon_mailparse::lines(material.as_bytes())
         .any(|line| trim_bytes(line.text) == END.as_bytes())
     {
-        return Err(Error::Failed(
-            "the armoured block has no end line".to_string(),
-        ));
+        return Err(Error::ArmourNoEnd);
     }
     let body = armour_body(material)?;
-    let raw = base64_decode(&body)
-        .ok_or_else(|| Error::Failed("the key's base64 does not decode".to_string()))?;
-    let packets = packets(&raw)
-        .ok_or_else(|| Error::Failed("the key's packet structure cannot be read".to_string()))?;
+    let raw = base64_decode(&body).ok_or(Error::KeyBase64NotDecodable)?;
+    let packets = packets(&raw).ok_or(Error::PacketStructureUnreadable)?;
     let mut primaries = packets.iter().filter(|packet| packet.tag == 6);
-    let primary = primaries
-        .next()
-        .ok_or_else(|| Error::Failed("the block carries no public key packet".to_string()))?;
+    let primary = primaries.next().ok_or(Error::NoPublicKeyPacket)?;
     if primaries.next().is_some() {
-        return Err(Error::Failed(
-            "the block carries more than one primary public key; submit one key".to_string(),
-        ));
+        return Err(Error::MultiplePrimaryKeys);
     }
-    let fingerprint = fingerprint_of(primary)
-        .ok_or_else(|| Error::Failed("the key's fingerprint cannot be computed".to_string()))?;
+    let fingerprint = fingerprint_of(primary).ok_or(Error::FingerprintUncomputable)?;
     Ok(Cert {
         material: material.clone(),
         fingerprint,
@@ -496,9 +488,7 @@ fn armour_body(value: &str) -> Result<String, Error> {
         out.push_str(line);
     }
     if out.is_empty() {
-        return Err(Error::Failed(
-            "the armoured block carries no key material".to_string(),
-        ));
+        return Err(Error::ArmourNoMaterial);
     }
     Ok(out)
 }
@@ -653,8 +643,10 @@ pub async fn verify_detached(
 ) -> Result<bool, Error> {
     let out = run_gpg(gpg, Some(key_file), Some(payload), |command, home| {
         let path = home.join("signature.asc");
-        std::fs::write(&path, signature)
-            .map_err(|e| Error::context(format!("cannot write {}", path.display()), e))?;
+        std::fs::write(&path, signature).map_err(|source| Error::WriteSignature {
+            path: path.clone(),
+            source,
+        })?;
         command
             .args(["--status-fd", "2", "--verify"])
             .arg(&path)
@@ -688,24 +680,13 @@ pub async fn verify_clearsigned(
     })
     .await?;
     if !out.success || !reports_expected(&out.stderr, expected_fpr) {
-        return Err(Error::Failed(
-            "the clearsigned message's signature does not verify against the expected key, \
-             so there is no verified text to show"
-                .to_string(),
-        ));
+        return Err(Error::ClearsignedDoesNotVerify);
     }
     let fingerprint = valid_primary_fingerprints(&out.stderr)
         .into_iter()
         .next()
-        .ok_or_else(|| {
-            Error::Failed(
-                "gpg verified the clearsigned message but reported no signing fingerprint"
-                    .to_string(),
-            )
-        })?;
-    let plaintext = String::from_utf8(out.stdout).map_err(|_| {
-        Error::Failed("the clearsigned message's verified plaintext is not UTF-8".to_string())
-    })?;
+        .ok_or(Error::NoSigningFingerprint)?;
+    let plaintext = String::from_utf8(out.stdout).map_err(|_| Error::ClearsignedNotUtf8)?;
     Ok(Some(Clearsigned {
         fingerprint,
         plaintext,
@@ -733,11 +714,10 @@ pub async fn encrypt_to_cert(
     })
     .await?;
     if !out.success {
-        return Err(Error::Failed(format!(
-            "gpg refused to encrypt to {}: {}",
-            key_file.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        return Err(Error::Encrypt {
+            path: key_file.to_path_buf(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
     }
     Ok(out.stdout)
 }
@@ -755,7 +735,7 @@ pub fn outer_headers(message: &[u8]) -> Result<&[u8], Error> {
 pub fn message_headers(message: &[u8]) -> Result<&[u8], Error> {
     kyriakon_mailparse::split_message(message)
         .map(|message| message.headers)
-        .map_err(|e| Error::Failed(format!("the message's headers cannot be read: {e}")))
+        .map_err(|source| Error::HeadersUnreadable { source })
 }
 
 fn clearsigned_span(message: &[u8]) -> Result<Option<std::ops::Range<usize>>, Error> {
@@ -820,11 +800,7 @@ fn clearsigned_span(message: &[u8]) -> Result<Option<std::ops::Range<usize>>, Er
                 .windows(begin.len())
                 .any(|window| window == begin)
             {
-                return Err(Error::Failed(
-                    "the clearsigned marker is inside a header line; it must be a line of \
-                     its own after the blank line"
-                        .to_string(),
-                ));
+                return Err(Error::MarkerInsideHeader);
             }
             return extract_signed(&lines, first, begin, end).map(Some);
         }
@@ -878,29 +854,24 @@ fn extract_signed(
     for (index, line) in lines.iter().enumerate().skip(start) {
         let text = trim_bytes(line.text);
         if index > start && text == begin {
-            return Err(Error::Failed(
-                "the clearsigned block carries a second marker before its end".to_string(),
-            ));
+            return Err(Error::SecondSignedMarker);
         }
         if text == end {
             return Ok(offset..line.next);
         }
     }
-    Err(Error::Failed(
-        "the clearsigned block has no end line".to_string(),
-    ))
+    Err(Error::SignedBlockNoEnd)
 }
 
 fn unsigned_text(index: usize, line: &kyriakon_mailparse::Line<'_>) -> Error {
-    Error::Failed(format!(
-        "the message has unsigned text before the clearsigned block, at line {}: {:?}",
-        index + 1,
-        std::str::from_utf8(line.text)
+    Error::UnsignedText {
+        line: index + 1,
+        text: std::str::from_utf8(line.text)
             .unwrap_or("")
             .chars()
             .take(80)
-            .collect::<String>()
-    ))
+            .collect::<String>(),
+    }
 }
 
 fn trim_bytes(mut bytes: &[u8]) -> &[u8] {
@@ -942,18 +913,14 @@ pub fn header_from(block: &[u8]) -> Result<Option<String>, Error> {
         return Ok(None);
     };
     if values.len() > 1 {
-        return Err(Error::Failed(
-            "the message has more than one From: header".to_string(),
-        ));
+        return Err(Error::MultipleFromHeaders);
     }
     let address = match (value.rfind('<'), value.rfind('>')) {
         (Some(open), Some(close)) if open < close => &value[open + 1..close],
         _ => value.as_str(),
     };
     if address.trim().is_empty() {
-        return Err(Error::Failed(
-            "the message's From: header holds no address".to_string(),
-        ));
+        return Err(Error::FromHeaderNoAddress);
     }
     Ok(Some(address.trim().to_string()))
 }
@@ -1057,22 +1024,19 @@ mod tests {
     fn framing_and_base64_are_refused_with_a_reason() {
         assert!(matches!(
             public_key("hello").unwrap_err(),
-            Error::Failed(message) if message.contains("armoured")
+            Error::NotArmoured
         ));
         let bad = armoured("not base64 !!!");
         assert!(matches!(
             public_key(&bad).unwrap_err(),
-            Error::Failed(message) if message.contains("base64")
+            Error::KeyBase64NotDecodable
         ));
     }
 
     #[test]
     fn a_block_with_no_public_key_packet_is_refused() {
         let e = public_key(&armoured(NO_KEY)).unwrap_err();
-        assert!(
-            matches!(&e, Error::Failed(message) if message.contains("public key packet")),
-            "{e}"
-        );
+        assert!(matches!(&e, Error::NoPublicKeyPacket), "{e}");
     }
 
     #[test]
@@ -1168,9 +1132,8 @@ mod tests {
         );
         let err = clearsigned_block(message.as_bytes()).unwrap_err();
         assert!(
-            matches!(&err, Error::Failed(message)
-                if message.contains("unsigned text before the clearsigned block")
-                    && message.contains("please delete my account")),
+            matches!(&err, Error::UnsignedText { text, .. }
+                if text.contains("please delete my account")),
             "{err}"
         );
     }
@@ -1185,9 +1148,8 @@ mod tests {
         );
         let err = clearsigned_block(message.as_bytes()).unwrap_err();
         assert!(
-            matches!(&err, Error::Failed(message)
-                if message.contains("unsigned text before the clearsigned block")
-                    && message.contains("please delete my account")),
+            matches!(&err, Error::UnsignedText { text, .. }
+                if text.contains("please delete my account")),
             "{err}"
         );
     }
@@ -1208,9 +1170,8 @@ mod tests {
         let message = format!("{forged}{SIGNED}");
         let err = clearsigned_block(message.as_bytes()).unwrap_err();
         assert!(
-            matches!(&err, Error::Failed(message)
-                if message.contains("unsigned text before the clearsigned block")
-                    && message.contains("Please erase my account immediately!")),
+            matches!(&err, Error::UnsignedText { text, .. }
+                if text.contains("Please erase my account immediately!")),
             "{err}"
         );
     }
@@ -1233,11 +1194,7 @@ mod tests {
         assert_eq!(block, SIGNED.as_bytes());
         let nested = format!("{SIGNED_BEGIN}\nHash: SHA512\n\n{SIGNED}");
         let err = clearsigned_block(nested.as_bytes()).unwrap_err();
-        assert!(
-            matches!(&err, Error::Failed(message)
-                if message.contains("second marker")),
-            "{err}"
-        );
+        assert!(matches!(&err, Error::SecondSignedMarker), "{err}");
     }
 
     /// Two exported certs decoded and concatenated into one armour block, so
@@ -1457,10 +1414,7 @@ mod tests {
         let second = home.key("sign");
         let block = two_primary_block(&first.public, &second.public);
         let err = inspect_single_cert(&block).unwrap_err();
-        assert!(
-            matches!(&err, Error::Failed(message) if message.contains("more than one primary")),
-            "{err}"
-        );
+        assert!(matches!(&err, Error::MultiplePrimaryKeys), "{err}");
         assert_eq!(fingerprint(&block), None);
         assert!(public_key(&block).is_err());
     }
@@ -1563,9 +1517,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, Error::Failed(message)
-                if message.contains("unsigned text before the clearsigned block")
-                    && message.contains("Please erase my account immediately!")),
+            matches!(&err, Error::UnsignedText { text, .. }
+                if text.contains("Please erase my account immediately!")),
             "{err}"
         );
 
@@ -1575,10 +1528,7 @@ mod tests {
         let err = verify_clearsigned("gpg", &cert, &signer.fingerprint, &other_signed)
             .await
             .unwrap_err();
-        assert!(
-            matches!(&err, Error::Failed(message) if message.contains("does not verify")),
-            "{err}"
-        );
+        assert!(matches!(&err, Error::ClearsignedDoesNotVerify), "{err}");
     }
 
     #[test]

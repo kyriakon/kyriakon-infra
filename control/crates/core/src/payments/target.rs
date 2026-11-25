@@ -10,11 +10,12 @@
 //! The ledger is unchanged and still keyed by the payment token (ADR 0009);
 //! this type never names a username in a ledger line.
 
+use super::Error;
 use crate::account::state::{Standing, WindowState};
 use crate::store::{
     Account, ApplicationRef, GroupRecord, Monero, Payment, Store, StripeBilling, Window,
 };
-use crate::{util, Error};
+use crate::util;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
@@ -226,26 +227,21 @@ impl<'a> PaymentTarget<'a> {
                 .and_then(|payment| payment.window.as_mut()),
             PaymentTarget::Group(group) => group.payment.window.as_mut(),
         }
-        .ok_or_else(|| Error::Failed("the payment has no window to extend".to_string()))?;
+        .ok_or(Error::NoWindow)?;
         if paid_until.is_some() || window.state != WindowState::Open {
-            return Err(Error::Failed(
-                "the payment window is not open, so it has nothing to extend".to_string(),
-            ));
+            return Err(Error::WindowNotOpen);
         }
         if window.extensions >= 1 {
-            return Err(Error::Failed(
-                "the payment window has already been extended once; a second extension is refused"
-                    .to_string(),
-            ));
+            return Err(Error::AlreadyExtended);
         }
         let closes = OffsetDateTime::parse(&window.closes_at, &Rfc3339)
-            .map_err(|_| Error::Failed("the window's close date cannot be read".to_string()))?;
+            .map_err(|_| Error::WindowCloseUnreadable)?;
         let moved = closes + Duration::days(days);
         window.closes_at = moved
             .replace_nanosecond(0)
             .unwrap_or(moved)
             .format(&Rfc3339)
-            .map_err(|_| Error::Failed("the window's close date cannot be written".to_string()))?;
+            .map_err(|_| Error::WindowCloseUnwritable)?;
         window.extensions += 1;
         Ok(window.closes_at.clone())
     }
@@ -255,10 +251,7 @@ impl<'a> PaymentTarget<'a> {
     pub fn set_paid_until(&mut self, date: String) -> Result<(), Error> {
         match self {
             PaymentTarget::Account(account) => {
-                let payment = account
-                    .payment
-                    .as_mut()
-                    .ok_or_else(|| Error::Failed("the account has no payment block".to_string()))?;
+                let payment = account.payment.as_mut().ok_or(Error::NoPaymentBlock)?;
                 payment.paid_until = Some(date);
                 if let Some(window) = payment.window.as_mut() {
                     window.state = WindowState::Paid;
@@ -280,13 +273,11 @@ impl<'a> PaymentTarget<'a> {
         let PaymentTarget::Account(account) = self else {
             return Ok(None);
         };
-        let payment = account
-            .payment
-            .as_mut()
-            .ok_or_else(|| Error::Failed("the account has no payment block".to_string()))?;
+        let payment = account.payment.as_mut().ok_or(Error::NoPaymentBlock)?;
         let balance = match payment.balance_gbp.as_deref() {
-            Some(text) => util::pence(text)
-                .map_err(|e| Error::Failed(format!("the account's balance cannot be read: {e}")))?,
+            Some(text) => {
+                util::pence(text).map_err(|source| Error::BalanceUnreadable { source })?
+            }
             None => 0,
         };
         let left = (balance - amount).max(0);
@@ -304,10 +295,7 @@ impl<'a> PaymentTarget<'a> {
     /// has no closing state; ending a body is `group remove`.
     pub fn enter_closing(&mut self, until: String, refund_closed: bool) -> Result<(), Error> {
         let PaymentTarget::Account(account) = self else {
-            return Err(Error::Failed(
-                "a group has no closing state, so --close cannot cancel one; end the group with `kyriakon-admin group remove <domain>`"
-                    .to_string(),
-            ));
+            return Err(Error::GroupCannotClose);
         };
         let prior = match account.lifecycle() {
             crate::account::state::AccountState::Closing { prior_state, .. } => prior_state,
@@ -377,7 +365,7 @@ impl<'a> PaymentTarget<'a> {
             PaymentTarget::Account(account) => account
                 .payment
                 .as_mut()
-                .ok_or_else(|| Error::Failed("the account has no payment block".to_string()))?
+                .ok_or(Error::NoPaymentBlock)?
                 .monero
                 .get_or_insert_with(Default::default),
             PaymentTarget::Group(group) => {
@@ -386,9 +374,9 @@ impl<'a> PaymentTarget<'a> {
         };
         match block.address.as_deref() {
             Some(existing) if existing == address => Ok(false),
-            Some(existing) => Err(Error::Failed(format!(
-                "the Monero subaddress is already {existing}; a subaddress is never rotated or reused"
-            ))),
+            Some(existing) => Err(Error::AddressAlready {
+                existing: existing.to_string(),
+            }),
             None => {
                 block.address = Some(address.to_string());
                 Ok(true)

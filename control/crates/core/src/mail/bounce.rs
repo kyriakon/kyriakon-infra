@@ -21,10 +21,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::mail::notice::{LIFECYCLE, MESSAGE_ID_DOMAIN};
+use super::notice::{LIFECYCLE, MESSAGE_ID_DOMAIN};
+use super::Error;
 use crate::store::{is_permanent_status, Delivery, Notice, Store};
 use crate::util;
-use crate::Error;
 
 /// One permanent delivery failure, as a DSN reported it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,8 +158,12 @@ async fn mark(store: &Store, username: &str, bounce: &Bounce) -> Result<bool, Er
     let mut lines = log.raw_lines().await?;
     let mut found = None;
     for (index, line) in lines.iter().enumerate() {
-        let notice: Notice = serde_json::from_str(line)
-            .map_err(|e| Error::context(format!("{path} line {} is not a notice", index + 1), e))?;
+        let notice: Notice =
+            serde_json::from_str(line).map_err(|source| Error::NoticeLineNotParsed {
+                username: username.to_string(),
+                line: index + 1,
+                source,
+            })?;
         if !notice.id.is_empty()
             && notice.id == bounce.id
             && notice.to.eq_ignore_ascii_case(&bounce.recipient)
@@ -175,7 +179,7 @@ async fn mark(store: &Store, username: &str, bounce: &Bounce) -> Result<bool, Er
         at: util::filed_at(),
     });
     lines[index] =
-        serde_json::to_string(&notice).map_err(|e| Error::context("cannot encode a notice", e))?;
+        serde_json::to_string(&notice).map_err(|source| Error::EncodeNotice { source })?;
     let mut bytes = lines.join("\n");
     if !bytes.is_empty() {
         bytes.push('\n');

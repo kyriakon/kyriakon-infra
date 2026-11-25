@@ -28,9 +28,40 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use kyriakon_control_core::fastcgi::{self, Answer, Http, Reply, Request};
 use kyriakon_control_core::util::{self, percent_decode};
-use kyriakon_control_core::Error;
 use kyriakon_control_static::{open, sandbox, Refusal, Served};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
+
+/// The process's own error: the core's typed failures, and the two startup
+/// refusals whose only fact is the words the operator reads.
+#[derive(Debug)]
+enum Error {
+    Core(kyriakon_control_core::Error),
+    Message(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Core(error) => error.fmt(f),
+            Error::Message(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Core(error) => Some(error),
+            Error::Message(_) => None,
+        }
+    }
+}
+
+impl From<kyriakon_control_core::Error> for Error {
+    fn from(error: kyriakon_control_core::Error) -> Self {
+        Error::Core(error)
+    }
+}
 
 /// The web tree's index. A directory request serves this and never a listing,
 /// which would publish names the member did not link.
@@ -103,13 +134,15 @@ enum Alias {
 
 impl Config {
     fn load(path: &Path) -> Result<Config, Error> {
-        let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
-            what: "read the configuration",
-            path: Some(path.into()),
-            source,
-        })?;
-        toml::from_str(&text)
-            .map_err(|source| Error::Failed(format!("{} does not parse: {source}", path.display())))
+        let text =
+            std::fs::read_to_string(path).map_err(|source| kyriakon_control_core::Error::Io {
+                what: "read the configuration",
+                path: Some(path.into()),
+                source,
+            })?;
+        toml::from_str(&text).map_err(|source| {
+            Error::Message(format!("{} does not parse: {source}", path.display()))
+        })
     }
 
     /// The tree a request for `host` is served from, or `None` when the name is
@@ -228,11 +261,11 @@ async fn run() -> Result<(), Error> {
             "--config" => {
                 cfg_path = PathBuf::from(
                     args.next()
-                        .ok_or_else(|| Error::Failed("--config needs a path".to_string()))?,
+                        .ok_or_else(|| Error::Message("--config needs a path".to_string()))?,
                 );
             }
             other => {
-                return Err(Error::Failed(format!(
+                return Err(Error::Message(format!(
                     "unknown argument {other:?}; usage: kyriakon-control-static [--config PATH]"
                 )))
             }
@@ -244,18 +277,22 @@ async fn run() -> Result<(), Error> {
     // a previous run left at the path and creates the new socket, and neither
     // operation is one this process needs again.
     let httpd_listener =
-        kyriakon_control_core::socket::bind(&cfg.httpd_socket).map_err(|source| Error::Io {
-            what: "listen on",
-            path: Some(cfg.httpd_socket.clone()),
-            source,
+        kyriakon_control_core::socket::bind(&cfg.httpd_socket).map_err(|source| {
+            kyriakon_control_core::Error::Io {
+                what: "listen on",
+                path: Some(cfg.httpd_socket.clone()),
+                source,
+            }
         })?;
     let gemini_listener =
-        kyriakon_control_core::socket::bind(&cfg.gemini_socket).map_err(|source| Error::Io {
-            what: "listen on",
-            path: Some(cfg.gemini_socket.clone()),
-            source,
+        kyriakon_control_core::socket::bind(&cfg.gemini_socket).map_err(|source| {
+            kyriakon_control_core::Error::Io {
+                what: "listen on",
+                path: Some(cfg.gemini_socket.clone()),
+                source,
+            }
         })?;
-    sandbox::restrict(&cfg.root, &cfg.hosts).map_err(Error::Failed)?;
+    sandbox::restrict(&cfg.root, &cfg.hosts).map_err(Error::Message)?;
     util::log(&format!(
         "kyriakon-control-static: httpd {}, gemini {}, root {}",
         cfg.httpd_socket.display(),
@@ -286,7 +323,7 @@ async fn run() -> Result<(), Error> {
     let httpd = async {
         fastcgi::serve_listener(httpd_listener, limits, MAX_BODY, listen(FrontEnd::Httpd))
             .await
-            .map_err(|source| Error::Io {
+            .map_err(|source| kyriakon_control_core::Error::Io {
                 what: "serve",
                 path: Some(cfg.httpd_socket.clone()),
                 source,
@@ -295,13 +332,15 @@ async fn run() -> Result<(), Error> {
     let gemini = async {
         fastcgi::serve_listener(gemini_listener, limits, MAX_BODY, listen(FrontEnd::Gemini))
             .await
-            .map_err(|source| Error::Io {
+            .map_err(|source| kyriakon_control_core::Error::Io {
                 what: "serve",
                 path: Some(cfg.gemini_socket.clone()),
                 source,
             })
     };
-    tokio::try_join!(httpd, gemini).map(|_| ())
+    tokio::try_join!(httpd, gemini)
+        .map(|_| ())
+        .map_err(Error::from)
 }
 
 /// One request's reply, and the path the log line names. The path is the decoded

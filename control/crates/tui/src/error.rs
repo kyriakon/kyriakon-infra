@@ -99,3 +99,13 @@ impl From<kyriakon_control_core::util::Error> for Error {
         Error::Core(CoreError::Util(error))
     }
 }
+impl From<kyriakon_control_core::mail::Error> for Error {
+    fn from(error: kyriakon_control_core::mail::Error) -> Self {
+        Error::Core(CoreError::Mail(error))
+    }
+}
+impl From<kyriakon_control_core::payments::Error> for Error {
+    fn from(error: kyriakon_control_core::payments::Error) -> Self {
+        Error::Core(CoreError::Payments(error))
+    }
+}

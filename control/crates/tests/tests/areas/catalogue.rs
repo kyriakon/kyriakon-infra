@@ -51,21 +51,16 @@ fn renderings(list: &[Service], member: Option<&str>) -> Vec<(&'static str, Vec<
 /// The check the spec asks for, on the file's own text: every entry the file
 /// carries appears in every rendering that exists, compared as rows, and no
 /// rendering shows one the file does not.
-fn check(text: &str, member: Option<&str>) -> Result<(), kyriakon_control_core::Error> {
-    let list = parse(text)?;
+fn check(text: &str, member: Option<&str>) -> Result<(), String> {
+    let list = parse(text).map_err(|error| error.to_string())?;
     if list.is_empty() {
-        return Err(kyriakon_control_core::Error::Failed(format!(
-            "{TRACKED} has no services"
-        )));
+        return Err(format!("{TRACKED} has no services"));
     }
     compare(&list, &renderings(&list, member))
 }
 
 /// Compare what each front-end shows against the file it was rendered from.
-fn compare(
-    list: &[Service],
-    rendered: &[(&str, Vec<Row>)],
-) -> Result<(), kyriakon_control_core::Error> {
+fn compare(list: &[Service], rendered: &[(&str, Vec<Row>)]) -> Result<(), String> {
     for (front_end, rows) in rendered {
         if rows.len() != list.len() {
             let missing: Vec<&str> = list
@@ -78,28 +73,28 @@ fn compare(
                 .filter(|r| !list.iter().any(|s| s.id == r.id))
                 .map(|r| r.id.as_str())
                 .collect();
-            return Err(kyriakon_control_core::Error::Failed(format!(
+            return Err(format!(
                 "{front_end} shows {} entries where {TRACKED} carries {}: missing {missing:?}, invented {invented:?}",
                 rows.len(),
                 list.len()
-            )));
+            ));
         }
         for (s, r) in list.iter().zip(rows) {
             if r.id != s.id {
-                return Err(kyriakon_control_core::Error::Failed(format!(
+                return Err(format!(
                     "{front_end} shows {:?} where {TRACKED} has {:?}: the file's order is the display order",
                     r.id, s.id
-                )));
+                ));
             }
             if r.name != s.name
                 || r.summary != s.summary
                 || r.state != s.state.word()
                 || r.action != s.action.word()
             {
-                return Err(kyriakon_control_core::Error::Failed(format!(
+                return Err(format!(
                     "{front_end} shows {:?} other than as {TRACKED} has it, so the rendering is not the file",
                     s.id
-                )));
+                ));
             }
         }
     }
@@ -120,10 +115,7 @@ fn a_renderer_that_drops_an_entry_is_caught() {
     let mut rows = renderings(&list, None);
     rows[1].1.retain(|r| r.id != "shop");
     let e = compare(&list, &rows).unwrap_err();
-    assert!(
-        matches!(&e, kyriakon_control_core::Error::Failed(message) if message.contains("the account page") && message.contains("shop")),
-        "{e}"
-    );
+    assert!(e.contains("the account page") && e.contains("shop"), "{e}");
 }
 
 /// A renderer that invents an entry is caught the same way.
@@ -135,10 +127,7 @@ fn a_renderer_that_invents_an_entry_is_caught() {
     invented.id = "newsletter".to_string();
     rows[2].1.push(invented);
     let e = compare(&list, &rows).unwrap_err();
-    assert!(
-        matches!(&e, kyriakon_control_core::Error::Failed(message) if message.contains("the capsule") && message.contains("newsletter")),
-        "{e}"
-    );
+    assert!(e.contains("the capsule") && e.contains("newsletter"), "{e}");
 }
 
 /// Every renderer rendered from a fixture follows the fixture, and a
@@ -162,22 +151,16 @@ fn every_renderer_follows_a_fixture_rather_than_a_list_of_its_own() {
     // fails even though it shows the shipped file faithfully.
     let ignoring = renderings(&shipped, None);
     let e = compare(&fixture, &ignoring).unwrap_err();
-    assert!(
-        matches!(&e, kyriakon_control_core::Error::Failed(message) if message.contains("orchard")),
-        "{e}"
-    );
+    assert!(e.contains("orchard"), "{e}");
 
     // And a value the crate has no word for fails the check on the text,
     // before any rendering is built.
     let soon = FIXTURE.replace("state = \"planned\"", "state = \"soon\"");
-    let e = check(&soon, None).unwrap_err();
+    let e = parse(&soon).unwrap_err();
     assert!(
         matches!(
             &e,
-            kyriakon_control_core::Error::Flow(kyriakon_control_core::flow::Error::Service {
-                source,
-                ..
-            }) if matches!(
+            kyriakon_control_core::flow::Error::Service { source, .. } if matches!(
                 source.as_ref(),
                 kyriakon_control_core::flow::Error::UnknownState { value } if value == "soon"
             )

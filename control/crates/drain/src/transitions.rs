@@ -136,6 +136,16 @@ impl From<kyriakon_control_core::util::Error> for Error {
         Error::Core(kyriakon_control_core::Error::Util(error))
     }
 }
+impl From<kyriakon_control_core::mail::Error> for Error {
+    fn from(error: kyriakon_control_core::mail::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Mail(error))
+    }
+}
+impl From<kyriakon_control_core::payments::Error> for Error {
+    fn from(error: kyriakon_control_core::payments::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Payments(error))
+    }
+}
 
 /// Append one journal line. The caller writes this before the transition, which
 /// is the whole point of the journal, and again on completion so an approval that
