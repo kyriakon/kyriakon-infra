@@ -4,10 +4,69 @@
 //! This module holds data only. `verify`, `apply` and `settle` live in the drain,
 //! which is the only half that runs as root.
 
+use std::fmt;
+
 use serde_json::Value;
 
-use crate::store::{ApplicationRef, GroupAddressIntent, GroupIntent, GroupRemoveIntent, Store};
-use crate::Error;
+use crate::store::{
+    self, ApplicationRef, GroupAddressIntent, GroupIntent, GroupRemoveIntent, Store,
+};
+
+/// The intent contract's error: a kind this build cannot file, a payload that
+/// does not parse, and the two fields an export intent must name.
+#[derive(Debug)]
+pub enum Error {
+    /// The intent names a kind this build does not implement.
+    UnknownKind { kind: String },
+    /// The intent value is not a JSON object.
+    NotObject,
+    /// The intent envelope could not be encoded.
+    Encode { source: serde_json::Error },
+    /// A typed intent did not parse. `what` is the intent's noun, e.g. "the
+    /// close intent".
+    Parse {
+        what: &'static str,
+        source: serde_json::Error,
+    },
+    /// The export intent names no account.
+    ExportMissingAccount,
+    /// The export intent names no session.
+    ExportMissingSession,
+    /// The store failed while filing the intent.
+    Store(store::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::UnknownKind { kind } => {
+                write!(f, "this build does not implement the kind {kind:?}")
+            }
+            Error::NotObject => f.write_str("the intent is not an object"),
+            Error::Encode { source } => write!(f, "cannot encode the intent: {source}"),
+            Error::Parse { what, source } => write!(f, "{what} does not parse: {source}"),
+            Error::ExportMissingAccount => f.write_str("the export intent names no account"),
+            Error::ExportMissingSession => f.write_str("the export intent names no session"),
+            Error::Store(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Encode { source } | Error::Parse { source, .. } => Some(source),
+            Error::Store(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<store::Error> for Error {
+    fn from(error: store::Error) -> Self {
+        Error::Store(error)
+    }
+}
 
 /// The rails an application may name. `no_charge` is the fourth, and it is a
 /// rail rather than a flag because it is one of the four buttons on the form.
@@ -633,20 +692,14 @@ impl Intent {
         let id = ulid::Ulid::new().to_string();
         let kind = self.kind().to_string();
         if matches!(self, Intent::Unknown { .. }) {
-            return Err(Error::Failed(format!(
-                "this build does not implement the kind {kind:?}"
-            )));
+            return Err(Error::UnknownKind { kind });
         }
-        let mut value = serde_json::to_value(self)
-            .map_err(|e| Error::context("cannot encode the intent", e))?;
-        let object = value
-            .as_object_mut()
-            .ok_or_else(|| Error::Failed("the intent is not an object".to_string()))?;
+        let mut value = serde_json::to_value(self).map_err(|source| Error::Encode { source })?;
+        let object = value.as_object_mut().ok_or(Error::NotObject)?;
         object.insert("id".to_string(), id.clone().into());
         object.insert("kind".to_string(), kind.into());
         object.insert("filed_at".to_string(), crate::util::filed_at().into());
-        let bytes = serde_json::to_vec_pretty(&value)
-            .map_err(|e| Error::context("cannot encode the intent", e))?;
+        let bytes = serde_json::to_vec_pretty(&value).map_err(|source| Error::Encode { source })?;
         store
             .write_record("intents", &format!("{id}.json"), &bytes)
             .await?;
@@ -654,9 +707,8 @@ impl Intent {
     }
 }
 
-fn parsed<T: serde::de::DeserializeOwned>(value: &Value, what: &str) -> Result<T, Error> {
-    serde_json::from_value(value.clone())
-        .map_err(|e| Error::context(format!("{what} does not parse"), e))
+fn parsed<T: serde::de::DeserializeOwned>(value: &Value, what: &'static str) -> Result<T, Error> {
+    serde_json::from_value(value.clone()).map_err(|source| Error::Parse { what, source })
 }
 
 /// The export intent, read with the words its transition always used: the
@@ -678,12 +730,12 @@ fn export_from(value: &Value) -> Result<ExportIntent, Error> {
         username: value
             .get("username")
             .and_then(Value::as_str)
-            .ok_or_else(|| Error::Failed("the export intent names no account".to_string()))?
+            .ok_or(Error::ExportMissingAccount)?
             .to_string(),
         session: value
             .get("session")
             .and_then(Value::as_str)
-            .ok_or_else(|| Error::Failed("the export intent names no session".to_string()))?
+            .ok_or(Error::ExportMissingSession)?
             .to_string(),
     })
 }

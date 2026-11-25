@@ -172,10 +172,18 @@ fn every_renderer_follows_a_fixture_rather_than_a_list_of_its_own() {
     let soon = FIXTURE.replace("state = \"planned\"", "state = \"soon\"");
     let e = check(&soon, None).unwrap_err();
     assert!(
-        matches!(&e, kyriakon_control_core::Error::Context { .. }),
+        matches!(
+            &e,
+            kyriakon_control_core::Error::Flow(kyriakon_control_core::flow::Error::Service {
+                source,
+                ..
+            }) if matches!(
+                source.as_ref(),
+                kyriakon_control_core::flow::Error::UnknownState { value } if value == "soon"
+            )
+        ),
         "{e}"
     );
-    assert!(e.to_string().contains("soon"), "{e}");
 }
 
 /// The terminal's menu is one of the renderings the check compares. That the

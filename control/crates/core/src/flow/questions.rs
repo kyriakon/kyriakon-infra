@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::Error;
+use super::Error;
 use serde::Deserialize;
 
 /// The tracked file this module parses, named in the refusals so a failure says
@@ -74,7 +74,11 @@ impl Kind {
             "addresses" => Kind::Addresses,
             "key" => Kind::Key,
             "acceptance" => Kind::Acceptance,
-            other => return Err(Error::Failed(format!("unknown answer type {other:?}"))),
+            other => {
+                return Err(Error::UnknownAnswerType {
+                    value: other.to_string(),
+                })
+            }
         })
     }
 }
@@ -98,7 +102,11 @@ impl Branch {
             "person" => Branch::Person,
             "body" => Branch::Body,
             "monastic" => Branch::Monastic,
-            other => return Err(Error::Failed(format!("unknown branch {other:?}"))),
+            other => {
+                return Err(Error::UnknownBranch {
+                    value: other.to_string(),
+                })
+            }
         })
     }
 }
@@ -144,11 +152,14 @@ impl Rule {
             "upload-key" => Rule::UploadKey,
             "single-line" => Rule::SingleLine,
             other => match other.strip_prefix("maxlen:") {
-                Some(n) => Rule::MaxLen(
-                    n.parse()
-                        .map_err(|_| Error::Failed(format!("maxlen needs a number, got {n:?}")))?,
-                ),
-                None => return Err(Error::Failed(format!("unknown validation {other:?}"))),
+                Some(n) => Rule::MaxLen(n.parse().map_err(|_| Error::MaxLenNotNumber {
+                    value: n.to_string(),
+                })?),
+                None => {
+                    return Err(Error::UnknownValidation {
+                        value: other.to_string(),
+                    })
+                }
             },
         })
     }
@@ -197,15 +208,19 @@ pub struct Question {
 /// its vocabulary, is refused by name rather than skipped: a question that
 /// disappears silently is a question no front-end asks.
 pub fn parse(text: &str) -> Result<Vec<Question>, Error> {
-    let file: File = toml::from_str(text).map_err(|e| Error::context("the question list", e))?;
+    let file: File = toml::from_str(text).map_err(|source| Error::QuestionList { source })?;
 
     let mut out = Vec::with_capacity(file.question.len());
     for e in file.question {
         let id = e.id;
-        let kind = Kind::parse(&e.kind)
-            .map_err(|why| Error::context(format!("the question {id:?}"), why))?;
-        let branch = Branch::parse(&e.branch)
-            .map_err(|why| Error::context(format!("the question {id:?}"), why))?;
+        let kind = Kind::parse(&e.kind).map_err(|source| Error::Question {
+            id: id.clone(),
+            source: Box::new(source),
+        })?;
+        let branch = Branch::parse(&e.branch).map_err(|source| Error::Question {
+            id: id.clone(),
+            source: Box::new(source),
+        })?;
         let rule = rule(&id, kind, e.choices, e.validation)?;
         out.push(Question {
             id,
@@ -230,34 +245,29 @@ fn rule(
 ) -> Result<Rule, Error> {
     if kind == Kind::Choice {
         if choices.is_empty() {
-            return Err(Error::Failed(format!(
-                "the question {id:?} is a choice with no choices"
-            )));
+            return Err(Error::ChoiceWithoutChoices { id: id.to_string() });
         }
         if validation.is_some() {
-            return Err(Error::Failed(format!(
-                "the question {id:?} is a choice, so its validation is its choices"
-            )));
+            return Err(Error::ChoiceWithValidation { id: id.to_string() });
         }
         for c in &choices {
             if c.value.is_empty() || c.label.is_empty() {
-                return Err(Error::Failed(format!(
-                    "the question {id:?} has a choice with an empty value or label"
-                )));
+                return Err(Error::EmptyChoice { id: id.to_string() });
             }
         }
         return Ok(Rule::Choice(choices));
     }
     if !choices.is_empty() {
-        return Err(Error::Failed(format!(
-            "the question {id:?} is a {} carrying choices",
-            kind.token()
-        )));
+        return Err(Error::ChoicesOnOther {
+            id: id.to_string(),
+            kind: kind.token(),
+        });
     }
     match validation {
-        Some(v) => {
-            Rule::parse(&v).map_err(|why| Error::context(format!("the question {id:?}"), why))
-        }
+        Some(v) => Rule::parse(&v).map_err(|source| Error::Question {
+            id: id.to_string(),
+            source: Box::new(source),
+        }),
         None => Ok(Rule::None),
     }
 }
@@ -298,9 +308,9 @@ pub fn account_names(answers: &BTreeMap<String, String>) -> Result<Vec<String>, 
         .filter(|l| !l.is_empty())
     {
         if !seen.insert(line) {
-            return Err(Error::Failed(format!(
-                "the account name {line:?} is given twice"
-            )));
+            return Err(Error::DuplicateAccountName {
+                name: line.to_string(),
+            });
         }
         names.push(line.to_string());
     }
@@ -374,21 +384,39 @@ required = true
         // A token outside its vocabulary names the question it came from.
         let unknown_type = SAMPLE.replace("type = \"text\"", "type = \"widget\"");
         let e = parse(&unknown_type).unwrap_err();
-        assert!(matches!(&e, Error::Context { .. }), "{e}");
-        assert!(e.to_string().contains("username"), "{e}");
-        assert!(e.to_string().contains("unknown answer type"), "{e}");
+        assert!(
+            matches!(
+                &e,
+                Error::Question { id, source }
+                    if id == "username"
+                        && matches!(source.as_ref(), Error::UnknownAnswerType { value } if value == "widget")
+            ),
+            "{e}"
+        );
 
         let unknown_branch = SAMPLE.replace("branch = \"body\"", "branch = \"everyone\"");
         let e = parse(&unknown_branch).unwrap_err();
-        assert!(matches!(&e, Error::Context { .. }), "{e}");
-        assert!(e.to_string().contains("body_name"), "{e}");
-        assert!(e.to_string().contains("unknown branch"), "{e}");
+        assert!(
+            matches!(
+                &e,
+                Error::Question { id, source }
+                    if id == "body_name"
+                        && matches!(source.as_ref(), Error::UnknownBranch { value } if value == "everyone")
+            ),
+            "{e}"
+        );
 
         let unknown_rule = SAMPLE.replace("validation = \"mail-key\"", "validation = \"exists\"");
         let e = parse(&unknown_rule).unwrap_err();
-        assert!(matches!(&e, Error::Context { .. }), "{e}");
-        assert!(e.to_string().contains("mail_key"), "{e}");
-        assert!(e.to_string().contains("exists"), "{e}");
+        assert!(
+            matches!(
+                &e,
+                Error::Question { id, source }
+                    if id == "mail_key"
+                        && matches!(source.as_ref(), Error::UnknownValidation { value } if value == "exists")
+            ),
+            "{e}"
+        );
 
         // A column of the wrong type is a build error rather than a skipped
         // question: `required` is a real boolean, which is one of the reasons
@@ -472,17 +500,20 @@ choices = [
             "",
         );
         let e = parse(&bare).unwrap_err();
-        assert!(matches!(&e, Error::Failed(_)), "{e}");
-        assert!(e.to_string().contains("whose"), "{e}");
-        assert!(e.to_string().contains("no choices"), "{e}");
+        assert!(
+            matches!(&e, Error::ChoiceWithoutChoices { id } if id == "whose"),
+            "{e}"
+        );
 
         let empty = SAMPLE.replace(
             "{ value = \"person\", label = \"Just me\" },",
             "{ value = \"\", label = \"Just me\" },",
         );
         let e = parse(&empty).unwrap_err();
-        assert!(matches!(&e, Error::Failed(_)), "{e}");
-        assert!(e.to_string().contains("empty value or label"), "{e}");
+        assert!(
+            matches!(&e, Error::EmptyChoice { id } if id == "whose"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -492,9 +523,10 @@ choices = [
             "prompt = \"Username\"\nchoices = [\n\t{ value = \"a\", label = \"A\" },\n]",
         );
         let e = parse(&on_a_text).unwrap_err();
-        assert!(matches!(&e, Error::Failed(_)), "{e}");
-        assert!(e.to_string().contains("username"), "{e}");
-        assert!(e.to_string().contains("carrying choices"), "{e}");
+        assert!(
+            matches!(&e, Error::ChoicesOnOther { id, kind } if id == "username" && *kind == "text"),
+            "{e}"
+        );
 
         // A choice's rule is its choices, so a validation string beside them is
         // a question that says two things about the same answer.
@@ -503,8 +535,10 @@ choices = [
             "{ value = \"body\", label = \"A body\" },\n]\nvalidation = \"domain\"",
         );
         let e = parse(&both).unwrap_err();
-        assert!(matches!(&e, Error::Failed(_)), "{e}");
-        assert!(e.to_string().contains("its choices"), "{e}");
+        assert!(
+            matches!(&e, Error::ChoiceWithValidation { id } if id == "whose"),
+            "{e}"
+        );
     }
 
     #[test]

@@ -1,28 +1,43 @@
 //! The core's shared error for the account, mail, flow, payment and IPC
 //! modules. Each area owns its own enum and `Display`; this one wraps the areas
-//! that have moved and keeps `Refused`/`Failed` only until #1011 and #1012
-//! replace them. `store` and `config` keep their own enums because every other
-//! module converts through them.
+//! that have moved and keeps `Refused`/`Failed` only until #1012 replaces the
+//! mail and payment sites. `store` and `config` keep their own enums because
+//! every other module converts through them.
 
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use crate::account;
 use crate::config;
+use crate::flow;
+use crate::intent;
+use crate::ipc;
 use crate::store;
+use crate::util;
 
 #[derive(Debug)]
 pub enum Error {
     /// A request or record the core refuses, in the words the caller shows.
-    /// Temporary: #1011 and #1012 replace this with the area's own variant.
+    /// Temporary: #1012 replaces this with the area's own variant.
     Refused(String),
     /// A failure with no more specific case yet.
-    /// Temporary: #1011 and #1012 replace this with the area's own variant.
+    /// Temporary: #1012 replaces this with the area's own variant.
     Failed(String),
     /// The store failed.
     Store(store::Error),
     /// The configuration failed.
     Config(config::Error),
+    /// An account action failed.
+    Account(account::Error),
+    /// An application-flow vocabulary file failed.
+    Flow(flow::Error),
+    /// An intent file failed.
+    Intent(intent::Error),
+    /// The handler protocol failed.
+    Ipc(ipc::Error),
+    /// A utility parse failed.
+    Util(util::Error),
     /// A file or socket operation failed.
     Io {
         what: &'static str,
@@ -54,6 +69,11 @@ impl fmt::Display for Error {
             Error::Refused(message) | Error::Failed(message) => f.write_str(message),
             Error::Store(error) => error.fmt(f),
             Error::Config(error) => error.fmt(f),
+            Error::Account(error) => error.fmt(f),
+            Error::Flow(error) => error.fmt(f),
+            Error::Intent(error) => error.fmt(f),
+            Error::Ipc(error) => error.fmt(f),
+            Error::Util(error) => error.fmt(f),
             Error::Io {
                 what,
                 path: Some(path),
@@ -83,6 +103,11 @@ impl std::error::Error for Error {
             Error::Refused(_) | Error::Failed(_) => None,
             Error::Store(error) => Some(error),
             Error::Config(error) => Some(error),
+            Error::Account(error) => Some(error),
+            Error::Flow(error) => Some(error),
+            Error::Intent(error) => Some(error),
+            Error::Ipc(error) => Some(error),
+            Error::Util(error) => Some(error),
             Error::Io { source, .. } => Some(source),
             Error::Json { source, .. } => Some(source),
             Error::ParseLine { source, .. } => Some(source),
@@ -239,6 +264,31 @@ impl From<store::Error> for Source {
         Source::Core(Box::new(Error::Store(e)))
     }
 }
+impl From<account::Error> for Source {
+    fn from(e: account::Error) -> Self {
+        Source::Core(Box::new(Error::Account(e)))
+    }
+}
+impl From<flow::Error> for Source {
+    fn from(e: flow::Error) -> Self {
+        Source::Core(Box::new(Error::Flow(e)))
+    }
+}
+impl From<intent::Error> for Source {
+    fn from(e: intent::Error) -> Self {
+        Source::Core(Box::new(Error::Intent(e)))
+    }
+}
+impl From<ipc::Error> for Source {
+    fn from(e: ipc::Error) -> Self {
+        Source::Core(Box::new(Error::Ipc(e)))
+    }
+}
+impl From<util::Error> for Source {
+    fn from(e: util::Error) -> Self {
+        Source::Core(Box::new(Error::Util(e)))
+    }
+}
 impl From<config::Error> for Source {
     fn from(e: config::Error) -> Self {
         Source::Core(Box::new(Error::Config(e)))
@@ -248,6 +298,36 @@ impl From<config::Error> for Source {
 impl From<store::Error> for Error {
     fn from(error: store::Error) -> Self {
         Error::Store(error)
+    }
+}
+
+impl From<account::Error> for Error {
+    fn from(error: account::Error) -> Self {
+        Error::Account(error)
+    }
+}
+
+impl From<flow::Error> for Error {
+    fn from(error: flow::Error) -> Self {
+        Error::Flow(error)
+    }
+}
+
+impl From<intent::Error> for Error {
+    fn from(error: intent::Error) -> Self {
+        Error::Intent(error)
+    }
+}
+
+impl From<ipc::Error> for Error {
+    fn from(error: ipc::Error) -> Self {
+        Error::Ipc(error)
+    }
+}
+
+impl From<util::Error> for Error {
+    fn from(error: util::Error) -> Self {
+        Error::Util(error)
     }
 }
 

@@ -12,7 +12,7 @@
 //! between this file and every front-end's renderer rather than something this
 //! module owns.
 
-use crate::Error;
+use super::Error;
 use serde::Deserialize;
 
 /// The tracked file, named in the refusals so a failing check says which file to
@@ -35,7 +35,9 @@ impl State {
             "live" => Ok(State::Live),
             "by_request" => Ok(State::ByRequest),
             "planned" => Ok(State::Planned),
-            other => Err(Error::Failed(format!("unknown state {other:?}"))),
+            other => Err(Error::UnknownState {
+                value: other.to_string(),
+            }),
         }
     }
 
@@ -67,7 +69,9 @@ impl Action {
             "apply" => Ok(Action::Apply),
             "account" => Ok(Action::Account),
             "pay" => Ok(Action::Pay),
-            other => Err(Error::Failed(format!("unknown action {other:?}"))),
+            other => Err(Error::UnknownAction {
+                value: other.to_string(),
+            }),
         }
     }
 
@@ -211,20 +215,22 @@ struct Entry {
 /// entry that disappears silently is a service no front-end mentions, and a
 /// value with no word is one a front-end would render blank.
 pub fn parse(text: &str) -> Result<Vec<Service>, Error> {
-    let file: File = toml::from_str(text).map_err(|e| Error::context("the catalogue", e))?;
+    let file: File = toml::from_str(text).map_err(|source| Error::Catalogue { source })?;
 
     let mut out = Vec::with_capacity(file.service.len());
     for e in file.service {
         let id = e.id;
         if id.is_empty() || e.name.is_empty() || e.summary.is_empty() || e.host.is_empty() {
-            return Err(Error::Failed(format!(
-                "the service {id:?} has an empty id, name, summary or host"
-            )));
+            return Err(Error::EmptyService { id });
         }
-        let state = State::parse(&e.state)
-            .map_err(|why| Error::context(format!("the service {id:?}"), why))?;
-        let action = Action::parse(&e.action)
-            .map_err(|why| Error::context(format!("the service {id:?}"), why))?;
+        let state = State::parse(&e.state).map_err(|source| Error::Service {
+            id: id.clone(),
+            source: Box::new(source),
+        })?;
+        let action = Action::parse(&e.action).map_err(|source| Error::Service {
+            id: id.clone(),
+            source: Box::new(source),
+        })?;
         out.push(Service {
             id,
             name: e.name,
@@ -331,15 +337,27 @@ mod tests {
     fn a_value_outside_the_vocabulary_is_refused_by_name() {
         let unknown_state = SHIPPED.replace("state = \"live\"", "state = \"retired\"");
         let e = parse(&unknown_state).unwrap_err();
-        assert!(matches!(&e, Error::Context { .. }), "{e}");
-        assert!(e.to_string().contains("mail"), "{e}");
-        assert!(e.to_string().contains("retired"), "{e}");
+        assert!(
+            matches!(
+                &e,
+                Error::Service { id, source }
+                    if id == "mail"
+                        && matches!(source.as_ref(), Error::UnknownState { value } if value == "retired")
+            ),
+            "{e}"
+        );
 
         let unknown_action = SHIPPED.replace("action = \"read\"", "action = \"download\"");
         let e = parse(&unknown_action).unwrap_err();
-        assert!(matches!(&e, Error::Context { .. }), "{e}");
-        assert!(e.to_string().contains("mail"), "{e}");
-        assert!(e.to_string().contains("download"), "{e}");
+        assert!(
+            matches!(
+                &e,
+                Error::Service { id, source }
+                    if id == "mail"
+                        && matches!(source.as_ref(), Error::UnknownAction { value } if value == "download")
+            ),
+            "{e}"
+        );
 
         // A column of the wrong type, a column that is not one, and an entry
         // with nothing in a column are all build errors rather than a blank card.

@@ -13,13 +13,104 @@
 //! took from `SSH_CONNECTION`, which the handler uses as the counter key and logs
 //! as the front-ends' own log line already does.
 
-use crate::Error;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fmt;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// The portal's side of the handler protocol: the reply it could not read, the
+/// refusal the handler sent, and the socket operation that failed.
+#[derive(Debug)]
+pub enum Error {
+    /// A status reply line carries no answer.
+    NoAnswer { line: String },
+    /// A file reply line is neither `OK` nor `ERR`.
+    NoFileAnswer { line: String },
+    /// The handler refused the application in its own words.
+    HandlerRefusal { why: String },
+    /// The socket could not be reached.
+    Connect {
+        what: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+    /// The socket's read or write timeout could not be set.
+    SetTimeout {
+        what: &'static str,
+        source: io::Error,
+    },
+    /// The reply line could not be read.
+    ReadAnswer {
+        what: &'static str,
+        source: io::Error,
+    },
+    /// The handler closed before finishing its reply line.
+    ClosedBeforeAnswer { what: &'static str },
+    /// The status request could not be written.
+    Ask { source: io::Error },
+    /// The application could not be encoded.
+    EncodeApplication { source: serde_json::Error },
+    /// The application body is over the protocol's bound.
+    ApplicationTooLarge { length: usize, max: usize },
+    /// The file request could not be written.
+    FileApplication { source: io::Error },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::NoAnswer { line } => {
+                write!(f, "the status service sent no answer: {line:?}")
+            }
+            Error::NoFileAnswer { line } => {
+                write!(f, "the file service sent no answer: {line:?}")
+            }
+            Error::HandlerRefusal { why } => f.write_str(why),
+            Error::Connect { what, path, source } => {
+                write!(f, "cannot reach the {what} at {}: {source}", path.display())
+            }
+            Error::SetTimeout { what, source } => {
+                write!(f, "cannot set the {what}'s timeout: {source}")
+            }
+            Error::ReadAnswer { what, source } => {
+                write!(f, "cannot read the {what}'s answer: {source}")
+            }
+            Error::ClosedBeforeAnswer { what } => {
+                write!(f, "the {what} closed the connection before answering")
+            }
+            Error::Ask { source } => {
+                write!(f, "cannot ask the status service: {source}")
+            }
+            Error::EncodeApplication { source } => {
+                write!(f, "cannot encode the application: {source}")
+            }
+            Error::ApplicationTooLarge { length, max } => write!(
+                f,
+                "the application is too large to send ({length} bytes, the limit is {max}); shorten an answer"
+            ),
+            Error::FileApplication { source } => {
+                write!(f, "cannot file the application: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Connect { source, .. }
+            | Error::SetTimeout { source, .. }
+            | Error::ReadAnswer { source, .. }
+            | Error::Ask { source }
+            | Error::FileApplication { source } => Some(source),
+            Error::EncodeApplication { source } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// The longest request or reply line. The token is 26 characters, an address is
 /// at most 45, and the stage is a sentence the handler writes; anything past this
@@ -58,15 +149,15 @@ impl Answer {
 
     pub fn parse(line: &str) -> Result<Answer, Error> {
         let line = line.trim_end_matches(['\r', '\n']);
-        let (word, text) = line
-            .split_once(' ')
-            .ok_or_else(|| Error::Failed(format!("the status service sent no answer: {line:?}")))?;
+        let (word, text) = line.split_once(' ').ok_or_else(|| Error::NoAnswer {
+            line: line.to_string(),
+        })?;
         match word {
             "stage" => Ok(Answer::Stage(text.to_string())),
             "notice" => Ok(Answer::Notice(text.to_string())),
-            _ => Err(Error::Failed(format!(
-                "the status service sent no answer: {line:?}"
-            ))),
+            _ => Err(Error::NoAnswer {
+                line: line.to_string(),
+            }),
         }
     }
 }
@@ -116,32 +207,33 @@ pub fn parse_file_answer(line: &str) -> Result<String, Error> {
     if let Some(token) = line.strip_prefix("OK ") {
         Ok(token.to_string())
     } else if let Some(why) = line.strip_prefix("ERR ") {
-        Err(Error::Failed(why.to_string()))
+        Err(Error::HandlerRefusal {
+            why: why.to_string(),
+        })
     } else {
-        Err(Error::Failed(format!(
-            "the file service sent no answer: {line:?}"
-        )))
+        Err(Error::NoFileAnswer {
+            line: line.to_string(),
+        })
     }
 }
 
 /// Connect to the handler, with the timeouts every request here uses.
-fn connect(socket: &Path, what: &str) -> Result<UnixStream, Error> {
+fn connect(socket: &Path, what: &'static str) -> Result<UnixStream, Error> {
     connect_with(socket, what, TIMEOUT)
 }
 
 /// Connect with an explicit timeout, for a test that cannot wait the service's
 /// five seconds.
-fn connect_with(socket: &Path, what: &str, timeout: Duration) -> Result<UnixStream, Error> {
-    let stream = connect_timeout(socket, timeout).map_err(|e| {
-        Error::context(
-            format!("cannot reach the {what} at {}", socket.display()),
-            e,
-        )
+fn connect_with(socket: &Path, what: &'static str, timeout: Duration) -> Result<UnixStream, Error> {
+    let stream = connect_timeout(socket, timeout).map_err(|source| Error::Connect {
+        what,
+        path: socket.to_path_buf(),
+        source,
     })?;
     stream
         .set_read_timeout(Some(timeout))
         .and_then(|()| stream.set_write_timeout(Some(timeout)))
-        .map_err(|e| Error::context(format!("cannot set the {what}'s timeout"), e))?;
+        .map_err(|source| Error::SetTimeout { what, source })?;
     Ok(stream)
 }
 
@@ -305,17 +397,15 @@ fn connect_timeout(socket: &Path, timeout: Duration) -> std::io::Result<UnixStre
 }
 
 /// Read one bounded reply line, or say the handler closed first.
-fn reply(stream: UnixStream, what: &str) -> Result<String, Error> {
+fn reply(stream: UnixStream, what: &'static str) -> Result<String, Error> {
     let mut line = String::new();
     // The cap is on the wire, before the buffer grows: a reply past it is a
     // handler that is not speaking this protocol.
     BufReader::new(stream.take(MAX_LINE as u64))
         .read_line(&mut line)
-        .map_err(|e| Error::context(format!("cannot read the {what}'s answer"), e))?;
+        .map_err(|source| Error::ReadAnswer { what, source })?;
     if !line.ends_with('\n') {
-        return Err(Error::Failed(format!(
-            "the {what} closed the connection before answering"
-        )));
+        return Err(Error::ClosedBeforeAnswer { what });
     }
     Ok(line)
 }
@@ -335,7 +425,7 @@ fn ask_with(
     (&stream)
         .write_all(request_line(address, token).as_bytes())
         .and_then(|()| (&stream).flush())
-        .map_err(|e| Error::context("cannot ask the status service", e))?;
+        .map_err(|source| Error::Ask { source })?;
     Answer::parse(&reply(stream, "status service")?)
 }
 
@@ -345,15 +435,14 @@ pub fn file(
     address: Option<&str>,
     form: &BTreeMap<String, String>,
 ) -> Result<String, Error> {
-    let body = serde_json::to_string(form)
-        .map_err(|e| Error::context("cannot encode the application", e))?;
+    let body = serde_json::to_string(form).map_err(|source| Error::EncodeApplication { source })?;
     // The handler reads one line and rejects it past this bound, so refuse here
     // where the reader can be told, rather than after a whole session's answers.
     if body.len() >= MAX_BODY {
-        return Err(Error::Failed(format!(
-            "the application is too large to send ({} bytes, the limit is {MAX_BODY}); shorten an answer",
-            body.len()
-        )));
+        return Err(Error::ApplicationTooLarge {
+            length: body.len(),
+            max: MAX_BODY,
+        });
     }
     let stream = connect(socket, "file service")?;
     let mut request = file_request(address);
@@ -362,7 +451,7 @@ pub fn file(
     (&stream)
         .write_all(request.as_bytes())
         .and_then(|()| (&stream).flush())
-        .map_err(|e| Error::context("cannot file the application", e))?;
+        .map_err(|source| Error::FileApplication { source })?;
     parse_file_answer(&reply(stream, "file service")?)
 }
 
@@ -412,7 +501,7 @@ mod tests {
         let form = BTreeMap::from([("anything_else".to_string(), "x".repeat(MAX_BODY))]);
         let why = file(Path::new("/nonexistent/portal.sock"), None, &form).unwrap_err();
         assert!(
-            matches!(&why, Error::Failed(message) if message.contains("too large")),
+            matches!(&why, Error::ApplicationTooLarge { length, max } if *length >= MAX_BODY && *max == MAX_BODY),
             "{why}"
         );
     }

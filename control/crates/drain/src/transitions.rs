@@ -111,6 +111,32 @@ impl From<kyriakon_control_core::Error> for Error {
     }
 }
 
+impl From<kyriakon_control_core::account::Error> for Error {
+    fn from(error: kyriakon_control_core::account::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Account(error))
+    }
+}
+impl From<kyriakon_control_core::flow::Error> for Error {
+    fn from(error: kyriakon_control_core::flow::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Flow(error))
+    }
+}
+impl From<kyriakon_control_core::intent::Error> for Error {
+    fn from(error: kyriakon_control_core::intent::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Intent(error))
+    }
+}
+impl From<kyriakon_control_core::ipc::Error> for Error {
+    fn from(error: kyriakon_control_core::ipc::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Ipc(error))
+    }
+}
+impl From<kyriakon_control_core::util::Error> for Error {
+    fn from(error: kyriakon_control_core::util::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Util(error))
+    }
+}
+
 /// Append one journal line. The caller writes this before the transition, which
 /// is the whole point of the journal, and again on completion so an approval that
 /// finished and one that died midway do not read alike. The index takes the line

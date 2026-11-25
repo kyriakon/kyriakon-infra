@@ -2,9 +2,42 @@
 //! when its status link stops answering. One module, so the timestamp crate can
 //! move without touching anything else.
 
-use crate::Error;
+use std::fmt;
+
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Duration, OffsetDateTime};
+
+/// The utils' own error, so a caller reads the value that failed rather than a
+/// sentence about it.
+#[derive(Debug)]
+pub enum Error {
+    /// A value is not a pounds amount: the shape is wrong, or the digits did
+    /// not fit the integer.
+    NotPounds {
+        input: String,
+        source: Option<std::num::ParseIntError>,
+    },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::NotPounds { input, .. } => {
+                write!(f, "{input:?} is not an amount in pounds")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::NotPounds { source, .. } => source
+                .as_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
+        }
+    }
+}
 
 /// The status link's window after a decision: seven days, after which the page
 /// stops answering. The record itself follows ADR 0005's ninety days.
@@ -282,17 +315,24 @@ pub fn pence(s: &str) -> Result<i64, Error> {
         || fraction.len() > 2
         || !fraction.bytes().all(|b| b.is_ascii_digit())
     {
-        return Err(Error::Failed(format!("{s:?} is not an amount in pounds")));
+        return Err(Error::NotPounds {
+            input: s.to_string(),
+            source: None,
+        });
     }
-    let whole: i64 = pounds
-        .parse()
-        .map_err(|source| Error::context(format!("{s:?} is not an amount in pounds"), source))?;
+    let whole: i64 = pounds.parse().map_err(|source| Error::NotPounds {
+        input: s.to_string(),
+        source: Some(source),
+    })?;
     let pennies: i64 = if fraction.is_empty() {
         0
     } else {
         format!("{fraction:0<2}")
             .parse()
-            .map_err(|source| Error::context(format!("{s:?} is not an amount in pounds"), source))?
+            .map_err(|source| Error::NotPounds {
+                input: s.to_string(),
+                source: Some(source),
+            })?
     };
     Ok(whole * 100 + pennies)
 }

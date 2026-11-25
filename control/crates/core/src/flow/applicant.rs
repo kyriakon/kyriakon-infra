@@ -6,11 +6,11 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use super::Error;
 use crate::flow::questions::{self, Branch, Kind, Question, Rule};
 use crate::flow::validate;
 use crate::mail::pgp;
 use crate::store::draft;
-use crate::Error;
 
 /// One page of the applicant's path. A mail key is one page per mailbox, with
 /// the mailbox in the prompt: a body's key page would otherwise ask for every
@@ -201,7 +201,9 @@ pub fn label(form: &BTreeMap<String, String>) -> Result<&'static str, Error> {
         None | Some("web") => Ok("web"),
         Some("tui") => Ok("tui"),
         Some("capsule") => Ok("capsule"),
-        Some(other) => Err(Error::Failed(format!("unknown front_end {other:?}"))),
+        Some(other) => Err(Error::UnknownFrontEnd {
+            value: other.to_string(),
+        }),
     }
 }
 

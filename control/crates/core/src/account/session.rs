@@ -22,9 +22,9 @@ use time::{Duration, OffsetDateTime};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use super::Error;
 use crate::account::sign;
 use crate::store::Store;
-use crate::Error;
 
 /// The cookie's name. The `__Host-` prefix is enforced by the browser: only a
 /// host-only cookie with `Secure` and `Path=/` and no `Domain` may carry it, so
@@ -94,9 +94,8 @@ impl Authenticator {
         {
             Ok(child) => child,
             Err(source) => {
-                Error::Io {
-                    what: "run the login check",
-                    path: Some(self.program.clone()),
+                Error::RunLoginCheck {
+                    path: self.program.clone(),
                     source,
                 }
                 .report("the login check");
@@ -177,25 +176,19 @@ pub async fn verify_proof(
     now: OffsetDateTime,
 ) -> Result<(), Error> {
     if !is_proof_token(token) {
-        return Err(Error::Failed(
-            "the session carries no proof this box minted".to_string(),
-        ));
+        return Err(Error::ProofNotMinted);
     }
     let Some(proof) = read_proof(dir, token).await else {
-        return Err(Error::Failed(
-            "the session's proof is not one this box minted".to_string(),
-        ));
+        return Err(Error::ProofNotOurs);
     };
     if proof.username != username {
-        return Err(Error::Failed(format!(
-            "the session belongs to {:?}, not {username:?}",
-            proof.username
-        )));
+        return Err(Error::ProofBelongsTo {
+            found: proof.username,
+            username: username.to_string(),
+        });
     }
     if now.unix_timestamp() >= proof.expires {
-        return Err(Error::Failed(
-            "the session named by the intent has expired".to_string(),
-        ));
+        return Err(Error::ProofExpired);
     }
     Ok(())
 }
@@ -290,15 +283,15 @@ pub async fn open(
             .replace_nanosecond(0)
             .unwrap_or(now)
             .format(&Rfc3339)
-            .map_err(|e| Error::context("cannot stamp the session", e))?,
+            .map_err(|source| Error::StampSession { source })?,
         expires_at: expires
             .format(&Rfc3339)
-            .map_err(|e| Error::context("cannot stamp the session", e))?,
+            .map_err(|source| Error::StampSession { source })?,
         secret: secret.clone(),
         proof: proof.to_string(),
     };
-    let bytes = serde_json::to_vec_pretty(&record)
-        .map_err(|e| Error::context("cannot encode the session", e))?;
+    let bytes =
+        serde_json::to_vec_pretty(&record).map_err(|source| Error::EncodeSession { source })?;
     store.ensure_dir("sessions").await?;
     store
         .write_record("sessions", &format!("{id}.json"), &bytes)
@@ -631,7 +624,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, Error::Failed(message) if message.contains("belongs to")),
+            matches!(&err, Error::ProofBelongsTo { found, username } if found == "alice" && username == "bob"),
             "{err}"
         );
         // The file's own expiry.
@@ -639,10 +632,7 @@ mod tests {
         let err = verify_proof(&proofs(&store), &stale, "alice", now())
             .await
             .unwrap_err();
-        assert!(
-            matches!(&err, Error::Failed(message) if message.contains("expired")),
-            "{err}"
-        );
+        assert!(matches!(&err, Error::ProofExpired), "{err}");
     }
 
     #[tokio::test]

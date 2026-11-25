@@ -2230,8 +2230,10 @@ pub async fn close_account(
         id: Some(&intent.id),
     };
     if let Err(e) = kyriakon_control_core::account::requests::record(store, request).await {
-        if !matches!(&e, kyriakon_control_core::Error::Failed(message) if message.contains("already recorded"))
-        {
+        if !matches!(
+            &e,
+            kyriakon_control_core::account::Error::AlreadyRecorded { .. }
+        ) {
             return Err(Error::from(e));
         }
     }
@@ -2330,11 +2332,7 @@ pub async fn cancel_close(store: &Store, intent: CancelCloseIntent) -> Result<Se
     let prior = match account.cancel_close() {
         Ok(prior) => prior,
         Err(e) => {
-            let reason = match &e {
-                kyriakon_control_core::Error::Failed(message) => message.clone(),
-                _ => e.to_string(),
-            };
-            return Ok(Settlement::refused(reason));
+            return Ok(Settlement::refused(e.to_string()));
         }
     };
     // The closure took the mailbox out of its group's list, so a cancellation

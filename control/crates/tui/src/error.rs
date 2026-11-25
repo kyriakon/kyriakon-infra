@@ -73,3 +73,29 @@ impl From<CoreError> for Error {
         Error::Core(error)
     }
 }
+
+impl From<kyriakon_control_core::account::Error> for Error {
+    fn from(error: kyriakon_control_core::account::Error) -> Self {
+        Error::Core(CoreError::Account(error))
+    }
+}
+impl From<kyriakon_control_core::flow::Error> for Error {
+    fn from(error: kyriakon_control_core::flow::Error) -> Self {
+        Error::Core(CoreError::Flow(error))
+    }
+}
+impl From<kyriakon_control_core::intent::Error> for Error {
+    fn from(error: kyriakon_control_core::intent::Error) -> Self {
+        Error::Core(CoreError::Intent(error))
+    }
+}
+impl From<kyriakon_control_core::ipc::Error> for Error {
+    fn from(error: kyriakon_control_core::ipc::Error) -> Self {
+        Error::Core(CoreError::Ipc(error))
+    }
+}
+impl From<kyriakon_control_core::util::Error> for Error {
+    fn from(error: kyriakon_control_core::util::Error) -> Self {
+        Error::Core(CoreError::Util(error))
+    }
+}
