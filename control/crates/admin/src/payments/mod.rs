@@ -21,40 +21,53 @@ pub(crate) async fn payment_block(
     username: &str,
 ) -> Result<(String, store::Payment), Error> {
     if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+        return Err(Error::InvalidUsername {
+            username: username.to_string(),
+            why,
+        });
     }
     let account = store
         .account(username)
         .await?
-        .ok_or_else(|| Error::Failed(format!("no account for {username}")))?;
+        .ok_or_else(|| Error::NoAccount {
+            username: username.to_string(),
+        })?;
     // An individual approved without charge and a free group's mailbox both hold
     // no payment at all, and are refused in the same words.
     if account.no_charge {
-        return Err(Error::Failed(format!(
-            "{username} was approved without charge, so there is no payment token"
-        )));
+        return Err(Error::NoChargeToken {
+            username: username.to_string(),
+        });
     }
     if let Some(mut payment) = account.payment_state() {
         let token = payment
             .token_ref
             .clone()
-            .ok_or_else(|| Error::Failed(format!("{username} has no payment token")))?;
+            .ok_or_else(|| Error::NoPaymentToken {
+                username: username.to_string(),
+            })?;
         // The record's own rail is what the last credit arrived on; a legacy
         // block carries none, and the account's approval rail is what it was.
         payment.rail.get_or_insert(account.rail.clone());
         return Ok((token, payment));
     }
     let Some(domain) = account.group.as_deref() else {
-        return Err(Error::Failed(format!("{username} has no payment token")));
+        return Err(Error::NoPaymentToken {
+            username: username.to_string(),
+        });
     };
     let group = transitions::groups::group_record(store, domain)
         .await?
-        .ok_or_else(|| Error::Failed(format!("no group record for {domain}")))?;
+        .ok_or_else(|| Error::NoGroup {
+            domain: domain.to_string(),
+        })?;
     let token = group
         .payment
         .token_ref
         .clone()
-        .ok_or_else(|| Error::Failed(format!("the group {domain} has no payment token")))?;
+        .ok_or_else(|| Error::GroupNoPaymentToken {
+            domain: domain.to_string(),
+        })?;
     Ok((token, group.payment.as_payment()))
 }
 
@@ -67,17 +80,15 @@ pub(crate) async fn payment_token(
     match (flags.get("token"), flags.get("username")) {
         (Some(token), None) => {
             if !store::is_payment_token(token) {
-                return Err(Error::Failed(format!(
-                    "the token {token:?} is not a payment token"
-                )));
+                return Err(Error::NotPaymentToken {
+                    token: token.to_string(),
+                });
             }
             Ok(token.clone())
         }
         (None, Some(username)) => payment_block(store, username).await.map(|(token, _)| token),
-        (Some(_), Some(_)) => Err(Error::Failed(
-            "give either --token or --username, not both".to_string(),
-        )),
-        (None, None) => Err(Error::Failed("give --token or --username".to_string())),
+        (Some(_), Some(_)) => Err(Error::TokenAndUsername),
+        (None, None) => Err(Error::TokenOrUsernameMissing),
     }
 }
 

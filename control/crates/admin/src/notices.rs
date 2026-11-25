@@ -17,11 +17,11 @@ pub(crate) async fn notices(
 ) -> Result<(), Error> {
     let (verb, rest) = match args {
         [verb, rest @ ..] => (verb.as_str(), rest),
-        _ => return Err(Error::Failed(usage())),
+        _ => return Err(Error::Usage),
     };
     let (username, rest) = match rest {
         [username, rest @ ..] => (username.as_str(), rest),
-        _ => return Err(Error::Failed(usage())),
+        _ => return Err(Error::Usage),
     };
     match verb {
         "stop" => {
@@ -49,6 +49,6 @@ pub(crate) async fn notices(
             );
             Ok(())
         }
-        _ => Err(Error::Failed(usage())),
+        _ => Err(Error::Usage),
     }
 }

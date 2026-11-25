@@ -38,54 +38,60 @@ pub(crate) fn address_args(args: &[String]) -> Result<AddressArgs, Error> {
     )?;
     let domain = need(&flags, "domain")?;
     if let Some(why) = validate::domain(domain) {
-        return Err(Error::Failed(format!("the domain {domain:?}: {why}")));
+        return Err(Error::InvalidDomain {
+            domain: domain.to_string(),
+            why,
+        });
     }
     let action = need(&flags, "action")?;
     if !intent::ADDRESS_ACTIONS.contains(&action) {
-        return Err(Error::Failed(format!(
-            "--action {action:?} is not one of {:?}\n{}",
-            intent::ADDRESS_ACTIONS,
-            usage()
-        )));
+        return Err(Error::UnknownAction {
+            action: action.to_string(),
+        });
     }
     let mailbox = need(&flags, "mailbox")?;
     if let Some(why) = validate::username_shape(mailbox) {
-        return Err(Error::Failed(format!("the mailbox {mailbox:?}: {why}")));
+        return Err(Error::InvalidMailbox {
+            mailbox: mailbox.to_string(),
+            why,
+        });
     }
     let address = flags.get("address").map(String::as_str).unwrap_or("");
     if action == "remove" {
         if !address.is_empty() {
-            return Err(Error::Failed(format!(
-                "--address cannot be given with --action remove: the removal closes the mailbox \
-                 {mailbox}@{domain}, not the address {address}@{domain}, which would be ignored"
-            )));
+            return Err(Error::AddressOnRemoval {
+                address: address.to_string(),
+                mailbox: mailbox.to_string(),
+                domain: domain.to_string(),
+            });
         }
         if !confirm_remove {
-            return Err(Error::Failed(format!(
-                "removing {mailbox}@{domain} deletes its account, home and Maildir, quota \
-                 record, git repositories, published tree and store record; give \
-                 --confirm-remove to file it"
-            )));
+            return Err(Error::ConfirmRequired {
+                mailbox: mailbox.to_string(),
+                domain: domain.to_string(),
+            });
         }
     } else {
         if confirm_remove {
-            return Err(Error::Failed(
-                "--confirm-remove is only for --action remove".to_string(),
-            ));
+            return Err(Error::ConfirmOnlyForRemove);
         }
         if address.is_empty() {
-            return Err(Error::Failed(
-                "--address is needed for this change".to_string(),
-            ));
+            return Err(Error::AddressMissing);
         }
         if let Some(why) = validate::address_localpart_shape(address) {
-            return Err(Error::Failed(format!("the address {address:?}: {why}")));
+            return Err(Error::InvalidAddress {
+                address: address.to_string(),
+                why,
+            });
         }
     }
     let site_owner = flags.get("site-owner").cloned();
     if let Some(owner) = &site_owner {
         if let Some(why) = validate::username_shape(owner) {
-            return Err(Error::Failed(format!("the site owner {owner:?}: {why}")));
+            return Err(Error::InvalidSiteOwner {
+                owner: owner.clone(),
+                why,
+            });
         }
     }
     Ok(AddressArgs {
@@ -117,37 +123,39 @@ pub(crate) async fn address(
     let site_owner = parsed.site_owner.as_deref();
     let mail_key = match parsed.key_file {
         Some(path) => {
-            let material = std::fs::read_to_string(&path)
-                .map_err(|e| Error::context(format!("cannot read the mail key {path}"), e))?;
+            let material =
+                std::fs::read_to_string(&path).map_err(|source| Error::MailKeyUnreadable {
+                    path: path.clone().into(),
+                    source,
+                })?;
             if material.trim().is_empty() {
-                return Err(Error::Failed(format!("the mail key {path} is empty")));
+                return Err(Error::MailKeyEmpty { path: path.into() });
             }
             // The same check the responder and the portal run, so a console
             // submission cannot file a mailbox the pages would have refused:
             // the refusal and the verdict are the check's, never "unchecked"
             // for something that is not a key.
-            let checked = pgp::public_key(&material)
-                .map_err(|why| Error::Failed(format!("the mail key {path}: {why}")))?;
+            let checked = pgp::public_key(&material).map_err(|source| Error::MailKeyInvalid {
+                path: path.clone().into(),
+                source,
+            })?;
             if let Some(why) = checked.refusal() {
-                return Err(Error::Failed(format!(
-                    "the mail key for {mailbox} cannot be used: {why}"
-                )));
+                return Err(Error::MailKeyRefused {
+                    mailbox: mailbox.to_string(),
+                    why: why.to_string(),
+                });
             }
             let address = format!("{mailbox}@kyriakon.net");
             let record = keycheck::mail_key(mailbox.to_string(), &address, &material);
             if record.fingerprint.is_empty() {
-                return Err(Error::Failed(format!(
-                    "the mail key {path}: it carries no key packet"
-                )));
+                return Err(Error::MailKeyNoPacket { path: path.into() });
             }
             Some(record)
         }
         None => None,
     };
     if matches!(action, "add-mailbox" | "upgrade") && mail_key.is_none() {
-        return Err(Error::Failed(
-            "--key-file is needed for a new mailbox".to_string(),
-        ));
+        return Err(Error::MailKeyMissing);
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(

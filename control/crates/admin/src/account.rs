@@ -19,13 +19,16 @@ pub(crate) async fn password(
 ) -> Result<(), Error> {
     let (username, action) = match args {
         [action, username] => (username.as_str(), action.as_str()),
-        _ => return Err(Error::Failed(usage())),
+        _ => return Err(Error::Usage),
     };
     if action != "reset" {
-        return Err(Error::Failed(usage()));
+        return Err(Error::Usage);
     }
     if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+        return Err(Error::InvalidUsername {
+            username: username.to_string(),
+            why,
+        });
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let link = transitions::lifecycle::issue_password_link(cfg, store, username, &key).await?;
@@ -34,7 +37,9 @@ pub(crate) async fn password(
     let account = store
         .account(username)
         .await?
-        .ok_or_else(|| Error::Failed(format!("no account for {username}")))?;
+        .ok_or_else(|| Error::NoAccount {
+            username: username.to_string(),
+        })?;
     let until = account
         .password_link
         .as_ref()
@@ -96,7 +101,11 @@ pub(crate) async fn show(store: &Store, username: &str) -> Result<(), Error> {
         None if account.is_some() => {
             println!("application {username} purged (ADR 0005's 90-day window)");
         }
-        None => return Err(Error::Failed(format!("no application for {username}"))),
+        None => {
+            return Err(Error::NoApplication {
+                username: username.to_string(),
+            })
+        }
     }
     match account {
         Some(account) => {
@@ -154,10 +163,13 @@ pub(crate) async fn suspend(
 ) -> Result<(), Error> {
     let (username, args) = match rest {
         [username, args @ ..] => (username.as_str(), args),
-        _ => return Err(Error::Failed(usage())),
+        _ => return Err(Error::Usage),
     };
     if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+        return Err(Error::InvalidUsername {
+            username: username.to_string(),
+            why,
+        });
     }
     let flags = flags(args, &["reason"])?;
     let reason = need(&flags, "reason")?;
@@ -182,10 +194,9 @@ pub(crate) async fn resume(cfg: &DrainConfig, store: &Store, rest: &[String]) ->
             println!("resumed {username}");
             Ok(())
         }
-        transitions::lifecycle::Resume::LeftLapsed => Err(Error::Failed(format!(
-            "{username} is no longer suspended but stays lapsed: the payment window is closed, so no \
-             access was restored. A payment or `kyriakon-admin window extend` is what brings it back"
-        ))),
+        transitions::lifecycle::Resume::LeftLapsed => Err(Error::ResumeLeftLapsed {
+            username: username.to_string(),
+        }),
     }
 }
 
@@ -213,7 +224,9 @@ pub(crate) async fn delete(cfg: &DrainConfig, store: &Store, rest: &[String]) ->
                 .is_some_and(|id| owns_delete(id, username))
         });
     if !recorded && !interrupted {
-        return Err(Error::Failed(format!("no account for {username}")));
+        return Err(Error::NoAccount {
+            username: username.to_string(),
+        });
     }
     let journal = Journal::load(store).await?;
     transitions::lifecycle::delete_account(cfg, store, &journal, username).await?;
@@ -237,7 +250,7 @@ pub(crate) fn owns_delete(id: &str, username: &str) -> bool {
 /// drift; a group mailbox is not counted, because the group holds the payment.
 pub(crate) async fn free(store: &Store, rest: &[String]) -> Result<(), Error> {
     if !rest.is_empty() {
-        return Err(Error::Failed(usage()));
+        return Err(Error::Usage);
     }
     match free_account_count(store).await? {
         1 => println!("1 account without charge"),

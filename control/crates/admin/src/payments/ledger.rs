@@ -15,13 +15,15 @@ use crate::*;
 pub(crate) async fn ledger(store: &Store, args: &[String]) -> Result<(), Error> {
     let rest = match args {
         [verb, rest @ ..] if verb == "export" => rest,
-        _ => return Err(Error::Failed(usage())),
+        _ => return Err(Error::Usage),
     };
     let flags = flags(rest, &["tax-year", "format"])?;
     let (start, end) = tax_year(need(&flags, "tax-year")?)?;
     let format = need(&flags, "format")?;
     if format != "csv" {
-        return Err(Error::Failed(format!("--format {format:?} is not csv")));
+        return Err(Error::FormatNotCsv {
+            format: format.to_string(),
+        });
     }
     let columns = payment_columns();
     println!(
@@ -143,10 +145,8 @@ pub(crate) fn in_tax_year(received_on: Option<&str>, start: time::Date, end: tim
 /// following 5 April inclusive. The second year is not accepted on trust: a
 /// mistyped pair would quietly export a different year's money.
 pub(crate) fn tax_year(s: &str) -> Result<(time::Date, time::Date), Error> {
-    let refuse = || {
-        Error::Failed(format!(
-            "--tax-year {s:?} is not YYYY-YY or YYYY-YYYY, or its years are not consecutive"
-        ))
+    let refuse = || Error::TaxYearInvalid {
+        value: s.to_string(),
     };
     let (first, second) = s.split_once('-').ok_or_else(refuse)?;
     if first.len() != 4 || !first.bytes().all(|b| b.is_ascii_digit()) {
