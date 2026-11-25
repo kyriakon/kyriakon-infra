@@ -20,10 +20,65 @@
 //! The rate cache file is lazy (the first run creates it), so its directory is
 //! probed instead.
 
-use crate::transitions::Error;
+use std::fmt;
+
+use crate::transitions::Error as Transitions;
 use kyriakon_control_core::config::DrainConfig;
 #[cfg(target_os = "openbsd")]
 use kyriakon_control_core::sandbox;
+
+/// A sandbox policy the pass could not install.
+///
+/// The kernel's own text is the reason on the syscall variants: it names the
+/// path and the errno, which is what an operator needs to fix the policy.
+#[derive(Debug)]
+pub enum Error {
+    /// `unveil(2)` refused a path.
+    Unveil {
+        source: kyriakon_control_core::sandbox::Error,
+    },
+    /// `unveil(2)` refused to lock the list.
+    Lock {
+        source: kyriakon_control_core::sandbox::Error,
+    },
+    /// `access(2)` refused a path the pass reads.
+    Probe {
+        source: kyriakon_control_core::sandbox::Error,
+    },
+    /// `pledge(2)` refused the syscall set.
+    Pledge {
+        source: kyriakon_control_core::sandbox::Error,
+    },
+    /// A configured path has no directory to unveil.
+    NoParent { path: String },
+    /// The temp directory is not UTF-8.
+    TempDirNotUtf8,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Unveil { source }
+            | Error::Lock { source }
+            | Error::Probe { source }
+            | Error::Pledge { source } => source.fmt(f),
+            Error::NoParent { path } => write!(f, "{path} has no directory to unveil"),
+            Error::TempDirNotUtf8 => f.write_str("the temp directory is not UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Unveil { source }
+            | Error::Lock { source }
+            | Error::Probe { source }
+            | Error::Pledge { source } => Some(source),
+            Error::NoParent { .. } | Error::TempDirNotUtf8 => None,
+        }
+    }
+}
 
 /// The promises a full pass needs, one per operation the pass performs:
 ///
@@ -62,7 +117,7 @@ const PROMISES: &str = "stdio rpath wpath cpath fattr chown flock proc exec";
 /// with half a list would fail later with an unexplained `ENOENT`, so the
 /// error names the path (or `pledge`) and its errno text instead.
 #[cfg(target_os = "openbsd")]
-pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
+pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
     // The store root, read/written/created/removed: `Store::try_lock` in the
     // binary, `Journal::load` in `run`, and every transition record under it.
     unveil(&cfg.store_root, "rwc")?;
@@ -135,7 +190,7 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     // Lock the list: after this, no later unveil can widen the view and a path
     // not named above is invisible. Strongly recommended by unveil(2), and the
     // only state a pass cannot undo.
-    sandbox::lock().map_err(Error::Failed)?;
+    sandbox::lock().map_err(|source| Error::Lock { source })?;
 
     // With the list locked, a read path named above is reachable and one that
     // is not fails with `ENOENT`. Probe every path the pass reads here, before
@@ -146,47 +201,50 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Error> {
     // The exec promise set is NULL on purpose: the scripts and helpers are
     // themselves OpenBSD programs with their own pledge or none, and forcing
     // this pass's file view on a `/root/bin` script would fail its own reads.
-    sandbox::pledge(PROMISES).map_err(Error::Failed)?;
+    sandbox::pledge(PROMISES).map_err(|source| Error::Pledge { source })?;
     Ok(())
 }
 
 /// The no-op for a workstation: the acceptance suite runs the real binaries on
 /// Linux and macOS, where neither system call exists.
 #[cfg(not(target_os = "openbsd"))]
-pub fn restrict(_cfg: &DrainConfig) -> Result<(), Error> {
+pub fn restrict(_cfg: &DrainConfig) -> Result<(), Transitions> {
     Ok(())
 }
 
-/// The policy's spelling of the shared wrapper: the drain's error is
-/// `Failed`, so one mapping turns a refused call into the pass's own failure.
+/// The policy's spelling of the shared wrapper: one local variant per refused
+/// call, so the pass reads which call failed without parsing the kernel's text.
 #[cfg(target_os = "openbsd")]
-fn unveil(path: &str, permissions: &str) -> Result<(), Error> {
-    sandbox::unveil(path, permissions).map_err(Error::Failed)
+fn unveil(path: &str, permissions: &str) -> Result<(), Transitions> {
+    sandbox::unveil(path, permissions).map_err(|source| Transitions::from(Error::Unveil { source }))
 }
 
 /// The directory an atomic rewrite creates its temp file and lock in.
 #[cfg(target_os = "openbsd")]
-fn parent_of(path: &str) -> Result<&str, Error> {
-    std::path::Path::new(path)
+fn parent_of(path: &str) -> Result<&str, Transitions> {
+    let parent = std::path::Path::new(path)
         .parent()
         .and_then(|parent| parent.to_str())
         .filter(|parent| !parent.is_empty())
-        .ok_or_else(|| Error::Failed(format!("{path} has no directory to unveil")))
+        .ok_or_else(|| Error::NoParent {
+            path: path.to_string(),
+        })?;
+    Ok(parent)
 }
 
 #[cfg(target_os = "openbsd")]
-fn temp_dir() -> Result<String, Error> {
-    std::env::temp_dir()
+fn temp_dir() -> Result<String, Transitions> {
+    Ok(std::env::temp_dir()
         .to_str()
         .map(str::to_string)
-        .ok_or_else(|| Error::Failed("the temp directory is not UTF-8".to_string()))
+        .ok_or(Error::TempDirNotUtf8)?)
 }
 
 /// Every read path the pass opens after `restrict` returns, checked once the
 /// list is locked. Kept separate from the unveil calls on purpose: a path listed
 /// here but not unveiled is exactly the omission this catches.
 #[cfg(target_os = "openbsd")]
-fn probe_pass_paths(cfg: &DrainConfig) -> Result<(), Error> {
+fn probe_pass_paths(cfg: &DrainConfig) -> Result<(), Transitions> {
     for path in [
         cfg.store_root.as_str(),
         cfg.reserved.as_str(),
@@ -228,6 +286,6 @@ fn probe_pass_paths(cfg: &DrainConfig) -> Result<(), Error> {
 
 /// The policy's spelling of the shared probe.
 #[cfg(target_os = "openbsd")]
-fn probe(path: &str) -> Result<(), Error> {
-    sandbox::probe(path).map_err(Error::Failed)
+fn probe(path: &str) -> Result<(), Transitions> {
+    sandbox::probe(path).map_err(|source| Transitions::from(Error::Probe { source }))
 }

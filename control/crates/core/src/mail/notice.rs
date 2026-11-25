@@ -16,10 +16,10 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use super::Error;
 use crate::config::DrainConfig;
 use crate::store::{Notice, Store};
 use crate::util;
-use crate::Error;
 
 /// The RFC 5322 message: the headers the enqueuer reads and a plain-text body.
 ///
@@ -98,23 +98,35 @@ async fn enqueue_raw(cfg: &DrainConfig, raw: &str) -> Result<(), Error> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| Error::context(format!("cannot start {}", cfg.sendmail), e))?;
+        .map_err(|source| Error::StartEnqueuer {
+            program: cfg.sendmail.clone(),
+            source,
+        })?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(raw.as_bytes())
             .await
-            .map_err(|e| Error::context(format!("cannot write to {}", cfg.sendmail), e))?;
+            .map_err(|source| Error::WriteEnqueuer {
+                program: cfg.sendmail.clone(),
+                source,
+            })?;
         stdin
             .shutdown()
             .await
-            .map_err(|e| Error::context(format!("cannot close {}", cfg.sendmail), e))?;
+            .map_err(|source| Error::CloseEnqueuer {
+                program: cfg.sendmail.clone(),
+                source,
+            })?;
     }
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| Error::context(format!("cannot wait for {}", cfg.sendmail), e))?;
+    let status = child.wait().await.map_err(|source| Error::WaitEnqueuer {
+        program: cfg.sendmail.clone(),
+        source,
+    })?;
     if !status.success() {
-        return Err(Error::Failed(format!("{} exited {status}", cfg.sendmail)));
+        return Err(Error::EnqueuerExited {
+            program: cfg.sendmail.clone(),
+            status,
+        });
     }
     Ok(())
 }
@@ -321,8 +333,7 @@ async fn record(
         to: to.to_string(),
         delivery: None,
     };
-    let encoded =
-        serde_json::to_string(&line).map_err(|e| Error::context("cannot encode a notice", e))?;
+    let encoded = serde_json::to_string(&line).map_err(|source| Error::EncodeNotice { source })?;
     store
         .log(&format!("accounts/{username}/notices.jsonl"))
         .append_mode(encoded.as_bytes(), store.dir_owner("accounts"), 0o640)

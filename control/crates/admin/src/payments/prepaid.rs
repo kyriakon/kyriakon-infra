@@ -9,26 +9,24 @@ use crate::*;
 pub(crate) async fn prepaid(store: &Store, args: &[String]) -> Result<(), Error> {
     let (verb, rest) = match args {
         [verb, rest @ ..] => (verb.as_str(), rest),
-        _ => return Err(Error::Failed(usage())),
+        _ => return Err(Error::Usage),
     };
     if verb != "list" {
-        return Err(Error::Failed(usage()));
+        return Err(Error::Usage);
     }
     let flags = flags(rest, &["window", "expiring"])?;
     let window = need(&flags, "window")?;
     if window != "open" {
-        return Err(Error::Failed(format!(
-            "--window {window:?} is not open; only the open windows are listed"
-        )));
+        return Err(Error::WindowNotOpen {
+            window: window.to_string(),
+        });
     }
     let expiring = match flags.get("expiring") {
         Some(text) => Some(
             text.parse::<i64>()
                 .ok()
                 .filter(|days| *days >= 0)
-                .ok_or_else(|| {
-                    Error::Failed(format!("--expiring {text:?} is not a whole number of days"))
-                })?,
+                .ok_or_else(|| Error::ExpiringInvalid { text: text.clone() })?,
         ),
         None => None,
     };
@@ -61,7 +59,7 @@ pub(crate) async fn reconcile(
         [verb] if verb == "list" => reconcile_list(store).await,
         [verb, rest @ ..] if verb == "attribute" => reconcile_attribute(cfg, store, rest).await,
         [verb, rest @ ..] if verb == "return" => reconcile_return(cfg, store, rest).await,
-        _ => Err(Error::Failed(usage())),
+        _ => Err(Error::Usage),
     }
 }
 
@@ -102,12 +100,12 @@ pub(crate) async fn reconcile_attribute(
 ) -> Result<(), Error> {
     let (item, rest) = match args {
         [item, rest @ ..] if !item.starts_with("--") => (item.as_str(), rest),
-        _ => return Err(Error::Failed(usage())),
+        _ => return Err(Error::Usage),
     };
     if !store::is_unattributed_id(item) {
-        return Err(Error::Failed(format!(
-            "the held item {item:?} is not an unattributed payment id"
-        )));
+        return Err(Error::NotUnattributedId {
+            item: item.to_string(),
+        });
     }
     // `--confirm-double` is a bare switch, which the pair reader does not take.
     let confirm_double = rest.iter().any(|a| a == "--confirm-double");
@@ -119,9 +117,9 @@ pub(crate) async fn reconcile_attribute(
     let flags = flags(&paired, &["token", "override"])?;
     let token = need(&flags, "token")?;
     if !store::is_payment_token(token) {
-        return Err(Error::Failed(format!(
-            "the token {token:?} is not a payment token"
-        )));
+        return Err(Error::NotPaymentToken {
+            token: token.to_string(),
+        });
     }
     let override_reason = flags.get("override").map(String::as_str);
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
@@ -152,19 +150,17 @@ pub(crate) async fn reconcile_return(
 ) -> Result<(), Error> {
     let (item, rest) = match args {
         [item, rest @ ..] if !item.starts_with("--") => (item.as_str(), rest),
-        _ => return Err(Error::Failed(usage())),
+        _ => return Err(Error::Usage),
     };
     if !store::is_unattributed_id(item) {
-        return Err(Error::Failed(format!(
-            "the held item {item:?} is not an unattributed payment id"
-        )));
+        return Err(Error::NotUnattributedId {
+            item: item.to_string(),
+        });
     }
     let flags = flags(rest, &["note"])?;
     let note = need(&flags, "note")?;
     if note.trim().is_empty() {
-        return Err(Error::Failed(
-            "--note is empty; name the evidence the return was made on".to_string(),
-        ));
+        return Err(Error::ReturnNoteEmpty);
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
     let sig = sign::sign(&key, &sign::reconcile_return_payload(item, note))?;

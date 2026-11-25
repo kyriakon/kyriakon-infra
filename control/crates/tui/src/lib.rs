@@ -33,7 +33,7 @@
 pub mod error;
 pub mod sandbox;
 
-pub use error::Error;
+pub use error::{Error, Refusal};
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -147,11 +147,10 @@ impl Sessions {
     /// session with no address to key on: a manual run rather than an sshd
     /// session, which always carries `SSH_CONNECTION`.
     pub fn open(dir: &Path, address: Option<IpAddr>) -> Result<Admission, Error> {
-        fs::create_dir_all(dir).map_err(|e| {
-            Error::context(
-                format!("cannot open the session directory {}", dir.display()),
-                e,
-            )
+        fs::create_dir_all(dir).map_err(|source| Error::Io {
+            what: "create",
+            path: Some(dir.into()),
+            source,
         })?;
         // One directory-wide lock, so the prune, the counts and the create are one
         // critical section across every address. It is the only permanent file
@@ -168,7 +167,11 @@ impl Sessions {
             .truncate(false)
             .write(true)
             .open(&count_path)
-            .map_err(|e| Error::context(format!("cannot open {}", count_path.display()), e))?;
+            .map_err(|source| Error::Io {
+                what: "open",
+                path: Some(count_path.clone()),
+                source,
+            })?;
         lock_exclusive(count_lock.as_raw_fd(), &count_path)?;
         prune(dir)?;
 
@@ -182,11 +185,16 @@ impl Sessions {
         let prefix = session_prefix(address);
         let mut held = 0;
         let mut total = 0;
-        for entry in fs::read_dir(dir)
-            .map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?
-        {
-            let entry =
-                entry.map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?;
+        for entry in fs::read_dir(dir).map_err(|source| Error::Io {
+            what: "read",
+            path: Some(dir.into()),
+            source,
+        })? {
+            let entry = entry.map_err(|source| Error::Io {
+                what: "read",
+                path: Some(dir.into()),
+                source,
+            })?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if !name.contains('@') {
@@ -217,7 +225,11 @@ impl Sessions {
             .create_new(true)
             .write(true)
             .open(&path)
-            .map_err(|e| Error::context(format!("cannot write {}", path.display()), e))?;
+            .map_err(|source| Error::Io {
+                what: "write",
+                path: Some(path.clone()),
+                source,
+            })?;
         lock_exclusive(file.as_raw_fd(), &path)?;
         Ok(Admission::Open(Sessions {
             path: Some(path),
@@ -264,11 +276,11 @@ fn lock_exclusive(fd: i32, path: &Path) -> Result<(), Error> {
     if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
         Ok(())
     } else {
-        Err(Error::Failed(format!(
-            "cannot lock {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        )))
+        Err(Error::Io {
+            what: "lock",
+            path: Some(path.to_path_buf()),
+            source: std::io::Error::last_os_error(),
+        })
     }
 }
 
@@ -278,11 +290,16 @@ fn lock_exclusive(fd: i32, path: &Path) -> Result<(), Error> {
 /// open is left alone: the directory is the portal's, but a name it did not write
 /// is not evidence of a session.
 fn prune(dir: &Path) -> Result<(), Error> {
-    for entry in fs::read_dir(dir)
-        .map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?
-    {
-        let entry =
-            entry.map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?;
+    for entry in fs::read_dir(dir).map_err(|source| Error::Io {
+        what: "read",
+        path: Some(dir.into()),
+        source,
+    })? {
+        let entry = entry.map_err(|source| Error::Io {
+            what: "read",
+            path: Some(dir.into()),
+            source,
+        })?;
         let name = entry.file_name();
         if !name.to_string_lossy().contains('@') {
             continue;
@@ -435,15 +452,11 @@ impl Watch {
             let now = Instant::now();
             let lifetime_end = self.started + self.lifetime;
             if now >= lifetime_end {
-                return Err(Error::Failed(
-                    "the session has reached its maximum length".to_string(),
-                ));
+                return Err(Error::SessionTooLong);
             }
             let idle_end = self.last_activity + self.idle;
             if now >= idle_end {
-                return Err(Error::Failed(
-                    "the session was idle for too long".to_string(),
-                ));
+                return Err(Error::SessionIdle);
             }
             let wait = (idle_end - now).min(lifetime_end - now);
             let mut ready = libc::pollfd {
@@ -463,7 +476,11 @@ impl Watch {
                 if error.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                return Err(Error::context("cannot wait for the session's input", error));
+                return Err(Error::Io {
+                    what: "wait for the session's input",
+                    path: None,
+                    source: error,
+                });
             }
             // The wait ran out; the loop says which deadline it was.
         }
@@ -541,18 +558,22 @@ impl<R: Read> Reader<R> {
                     if error.kind() == std::io::ErrorKind::Interrupted {
                         continue;
                     }
-                    return Err(Error::Failed(format!(
-                        "cannot read the session's input: {error}"
-                    )));
+                    return Err(Error::Io {
+                        what: "read the session's input",
+                        path: None,
+                        source: error,
+                    });
                 },
                 None => match self.inner.read(&mut self.held) {
                     Ok(0) => return Ok(false),
                     Ok(n) => n,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        return Err(Error::Failed(format!(
-                            "cannot read the session's input: {e}"
-                        )))
+                        return Err(Error::Io {
+                            what: "read the session's input",
+                            path: None,
+                            source: e,
+                        })
                     }
                 },
             };
@@ -617,7 +638,7 @@ impl<R: Read> Reader<R> {
         }
         String::from_utf8(line)
             .map(|line| Some(Word::Line(line)))
-            .map_err(|_| Error::Failed("the session's input is not text".to_string()))
+            .map_err(|_| Error::InputNotText)
     }
 }
 
@@ -649,10 +670,9 @@ pub fn run(
     out: &mut dyn Output,
 ) -> Result<Departure, Error> {
     if rows.is_empty() {
-        return Err(Error::Failed(format!(
-            "{} names no services, so there is nothing to show",
-            catalogue::TRACKED
-        )));
+        return Err(Error::NoServices {
+            path: catalogue::TRACKED,
+        });
     }
 
     put(out, OPENING)?;
@@ -1438,7 +1458,11 @@ pub trait Output: Write {
     fn put(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.write_all(bytes)
             .and_then(|()| self.flush())
-            .map_err(|e| Error::context("cannot write to the session", e))
+            .map_err(|source| Error::Io {
+                what: "write to the session",
+                path: None,
+                source,
+            })
     }
 }
 
@@ -1488,7 +1512,11 @@ impl<W: Write> Output for SessionOut<W> {
         self.inner
             .write_all(bytes)
             .and_then(|()| self.inner.flush())
-            .map_err(|e| Error::context("cannot write to the session", e))
+            .map_err(|source| Error::Io {
+                what: "write to the session",
+                path: None,
+                source,
+            })
     }
 }
 
@@ -1599,7 +1627,7 @@ mod tests {
         fn read(&mut self, _token: &str) -> Result<StatusAnswer, Error> {
             self.answers
                 .pop_front()
-                .unwrap_or_else(|| Err(Error::Failed("no status was scripted".to_string())))
+                .unwrap_or_else(|| Err(Error::NoStatusScripted))
         }
     }
 
@@ -1608,7 +1636,7 @@ mod tests {
 
     impl StatusSource for NoStatus {
         fn read(&mut self, _token: &str) -> Result<StatusAnswer, Error> {
-            Err(Error::Failed("this session asks no status".to_string()))
+            Err(Error::StatusNotAsked)
         }
     }
 
@@ -1631,7 +1659,7 @@ mod tests {
 
     impl Filing for NoFiles {
         fn file(&mut self, _form: &BTreeMap<String, String>) -> Result<String, Error> {
-            Err(Error::Failed("this session files nothing".to_string()))
+            Err(Error::FilesNothing)
         }
     }
 
@@ -1896,7 +1924,11 @@ mod tests {
     fn a_status_read_that_fails_leaves_the_session_open() {
         let rows = rows(None);
         let mut statuses = Statuses {
-            answers: VecDeque::from([Err(Error::Failed("connection refused".to_string()))]),
+            answers: VecDeque::from([Err(Error::Io {
+                what: "read the status",
+                path: None,
+                source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            })]),
         };
         let mut script = Script::lines(&["status", "abcdefghjkmnpqrstvwxyz0123", "", "quit"]);
         let (left, seen) =
@@ -2955,7 +2987,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(&why, Error::Failed(message) if message.contains(catalogue::TRACKED)),
+            matches!(&why, Error::NoServices { path } if *path == catalogue::TRACKED),
             "{why}"
         );
         assert!(out.is_empty(), "the refusal drew a screen");

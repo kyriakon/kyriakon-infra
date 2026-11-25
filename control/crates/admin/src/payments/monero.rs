@@ -16,18 +16,26 @@ use kyriakon_control_core::payments::target::PaymentTarget;
 pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> {
     let (username, address) = match args {
         [verb, username, address] if verb == "address" => (username.as_str(), address.as_str()),
-        _ => return Err(Error::Failed(usage())),
+        _ => return Err(Error::Usage),
     };
-    if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+    if let Some(source) = validate::username_shape(username) {
+        return Err(Error::InvalidUsername {
+            username: username.to_string(),
+            source,
+        });
     }
-    if let Some(why) = monero_address_shape(address) {
-        return Err(Error::Failed(format!("the address {address:?} {why}")));
+    if let Some(problem) = monero_address_shape(address) {
+        return Err(Error::InvalidMoneroAddress {
+            address: address.to_string(),
+            problem,
+        });
     }
     let account = store
         .account(username)
         .await?
-        .ok_or_else(|| Error::Failed(format!("no account for {username}")))?;
+        .ok_or_else(|| Error::NoAccount {
+            username: username.to_string(),
+        })?;
     // A person's block is on the account; a group mailbox's is on the group,
     // which holds the one payment for every mailbox in it. Recording the
     // subaddress on the account would give a charged group mailbox a block of
@@ -37,18 +45,20 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> 
         let written = store
             .update_group(&domain, move |current| {
                 let Some(group) = current.as_mut() else {
-                    return Err(Error::Failed(format!("no group record for {inside}")));
+                    return Err(Error::NoGroup {
+                        domain: inside.clone(),
+                    });
                 };
                 if group.payment.no_charge {
-                    return Err(Error::Failed(format!(
-                        "the group {inside} was approved without charge, so it has no Monero rail"
-                    )));
+                    return Err(Error::GroupNoCharge {
+                        domain: inside.clone(),
+                    });
                 }
                 if group.payment.rail != "monero" {
-                    return Err(Error::Failed(format!(
-                        "the group {inside} chose the {} rail, so it has no Monero subaddress to record",
-                        group.payment.rail
-                    )));
+                    return Err(Error::GroupRailNotMonero {
+                        domain: inside.clone(),
+                        rail: group.payment.rail.clone(),
+                    });
                 }
                 PaymentTarget::group(group)
                     .set_monero_address(address)
@@ -82,15 +92,15 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> 
         return Ok(());
     }
     if account.payment_state().is_none() {
-        return Err(Error::Failed(format!(
-            "{username} was approved without charge, so it has no Monero rail"
-        )));
+        return Err(Error::NoChargeMonero {
+            username: username.to_string(),
+        });
     }
     if account.rail != "monero" {
-        return Err(Error::Failed(format!(
-            "{username} chose the {} rail, so it has no Monero subaddress to record",
-            account.rail
-        )));
+        return Err(Error::RailNotMonero {
+            username: username.to_string(),
+            rail: account.rail.clone(),
+        });
     }
     // The read and the write are one step under the account's own lock: the
     // drain writes the same record from another process, and an interleaved
@@ -98,7 +108,9 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> 
     let payment = store
         .update_account(username, |current| {
             let Some(account) = current.as_mut() else {
-                return Err(Error::Failed(format!("no account for {username}")));
+                return Err(Error::NoAccount {
+                    username: username.to_string(),
+                });
             };
             let written = PaymentTarget::account(account)
                 .set_monero_address(address)

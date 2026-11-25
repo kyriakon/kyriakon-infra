@@ -8,7 +8,7 @@ use super::groups::group_record;
 use super::lifecycle::{dns_contact, report_record};
 use super::payments::{restore_group_mailboxes, token_join};
 use super::report_failure;
-use super::Error;
+use super::Error as Transitions;
 use kyriakon_control_core::account::sign;
 use kyriakon_control_core::account::state::Standing;
 use kyriakon_control_core::config::DrainConfig;
@@ -24,6 +24,9 @@ use serde_json::Value;
 use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime};
+
+mod error;
+pub use self::error::Error;
 
 /// How far a webhook's timestamp may be from this box's clock at the moment
 /// the handler accepted the delivery. Stripe's own libraries default to five
@@ -58,7 +61,7 @@ pub async fn stripe_webhooks(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     // A box whose card rail is not configured yet has no secret, and a pass
     // with nothing to verify must not fail every minute. The first delivery
     // makes the missing secret loud.
@@ -81,7 +84,7 @@ pub async fn stripe_webhooks(
                 journal,
                 "stripe-secret",
                 "config",
-                &Error::from(e),
+                &Transitions::from(e),
             )
             .await;
             return Ok(());
@@ -106,7 +109,7 @@ pub async fn stripe_webhooks(
                     // An unreadable body or signature is transient (EMFILE,
                     // EIO, EACCES). The delivery stays for the next pass: it is
                     // money, and a genuine pair is not ours to delete.
-                    Error::from(e).report(&format!("webhook {id}"));
+                    Transitions::from(e).report(&format!("webhook {id}"));
                     continue;
                 }
             };
@@ -119,7 +122,7 @@ pub async fn stripe_webhooks(
             let event: Value = match serde_json::from_slice(&body) {
                 Ok(event) => event,
                 Err(e) => {
-                    Error::Json {
+                    Transitions::Json {
                         context: "parse the webhook",
                         source: e,
                     }
@@ -134,8 +137,7 @@ pub async fn stripe_webhooks(
             // before it is joined into one. Stripe's ids are `evt_` and
             // alphanumerics; anything else is not an event this rail settles.
             if !event_id_shape(event_id) || kind.is_empty() {
-                Error::Failed("names no event id or type".to_string())
-                    .report(&format!("webhook {id}"));
+                Transitions::Stripe(Error::NoEventIdOrType).report(&format!("webhook {id}"));
                 store.remove_webhook(id).await?;
                 continue;
             }
@@ -147,7 +149,7 @@ pub async fn stripe_webhooks(
                 Err(e) => {
                     // A record that cannot be read is not proof, and dropping
                     // the pair could lose the payment it carries.
-                    Error::from(e).report(&format!("webhook {id}"));
+                    Transitions::from(e).report(&format!("webhook {id}"));
                     continue;
                 }
             };
@@ -197,7 +199,7 @@ pub async fn stripe_webhooks(
                     "type": kind,
                     "object": object_id,
                 });
-                let bytes = serde_json::to_vec(&line).map_err(|source| Error::Json {
+                let bytes = serde_json::to_vec(&line).map_err(|source| Transitions::Json {
                     context: "encode the verified event",
                     source,
                 })?;
@@ -229,7 +231,7 @@ pub async fn stripe_webhooks(
                         "type": kind,
                         "object": object_id,
                     });
-                    let bytes = serde_json::to_vec(&line).map_err(|source| Error::Json {
+                    let bytes = serde_json::to_vec(&line).map_err(|source| Transitions::Json {
                         context: "encode the processed event",
                         source,
                     })?;
@@ -276,12 +278,18 @@ pub async fn stripe_webhooks(
 /// The recency check is a replay guard, so it is first-sight only and `now` is
 /// the delivery's arrival, not the pass's clock. A delivery whose id `verified/`
 /// already records was proven once; the clock is not applied to it again.
-pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], arrived: i64) -> Result<(), Error> {
+pub fn verify_webhook(
+    secret: &[u8],
+    header: &str,
+    body: &[u8],
+    arrived: i64,
+) -> Result<(), Transitions> {
     let (timestamp, payload, signatures) = signature_parts(header, body)?;
     if (arrived - timestamp).abs() > WEBHOOK_TOLERANCE {
-        return Err(Error::Failed(format!(
-            "the timestamp {timestamp} is more than five minutes from its arrival {arrived}"
-        )));
+        return Err(Transitions::Stripe(Error::TimestampOutOfWindow {
+            timestamp,
+            arrived,
+        }));
     }
     check_signatures(secret, &payload, &signatures)
 }
@@ -289,7 +297,7 @@ pub fn verify_webhook(secret: &[u8], header: &str, body: &[u8], arrived: i64) ->
 /// The HMAC alone, with no clock: a delivery already recorded under `verified/`
 /// is verified against the secret again but not judged for recency, because a
 /// deferred event is not late.
-pub fn verify_signature(secret: &[u8], header: &str, body: &[u8]) -> Result<(), Error> {
+pub fn verify_signature(secret: &[u8], header: &str, body: &[u8]) -> Result<(), Transitions> {
     let (_, payload, signatures) = signature_parts(header, body)?;
     check_signatures(secret, &payload, &signatures)
 }
@@ -298,7 +306,7 @@ pub fn verify_signature(secret: &[u8], header: &str, body: &[u8]) -> Result<(), 
 fn signature_parts<'a>(
     header: &'a str,
     body: &[u8],
-) -> Result<(i64, Vec<u8>, Vec<&'a str>), Error> {
+) -> Result<(i64, Vec<u8>, Vec<&'a str>), Transitions> {
     let mut timestamp: Option<i64> = None;
     let mut signatures: Vec<&str> = Vec::new();
     for part in header.split(',') {
@@ -307,26 +315,26 @@ fn signature_parts<'a>(
             continue;
         }
         let (name, value) = part.split_once('=').ok_or_else(|| {
-            Error::Failed(format!(
-                "the signature header carries {part:?} without a value"
-            ))
+            Transitions::Stripe(Error::SignaturePartWithoutValue {
+                part: part.to_string(),
+            })
         })?;
         match name {
             "t" => {
                 timestamp = Some(value.parse::<i64>().map_err(|source| {
-                    Error::context(format!("the timestamp {value:?} is not a number"), source)
+                    Transitions::Stripe(Error::TimestampNotNumber {
+                        value: value.to_string(),
+                        source,
+                    })
                 })?);
             }
             "v1" => signatures.push(value),
             _ => {}
         }
     }
-    let timestamp =
-        timestamp.ok_or_else(|| Error::Failed("the signature header carries no t=".to_string()))?;
+    let timestamp = timestamp.ok_or_else(|| Transitions::Stripe(Error::NoSignatureTimestamp))?;
     if signatures.is_empty() {
-        return Err(Error::Failed(
-            "the signature header carries no v1 signature".to_string(),
-        ));
+        return Err(Transitions::Stripe(Error::NoSignature));
     }
     let mut payload = timestamp.to_string().into_bytes();
     payload.push(b'.');
@@ -334,16 +342,14 @@ fn signature_parts<'a>(
     Ok((timestamp, payload, signatures))
 }
 
-fn check_signatures(secret: &[u8], payload: &[u8], signatures: &[&str]) -> Result<(), Error> {
+fn check_signatures(secret: &[u8], payload: &[u8], signatures: &[&str]) -> Result<(), Transitions> {
     if signatures
         .iter()
         .any(|sig| sign::verify_bytes(secret, payload, sig))
     {
         Ok(())
     } else {
-        Err(Error::Failed(
-            "no v1 signature matches the body".to_string(),
-        ))
+        Err(Transitions::Stripe(Error::NoMatchingSignature))
     }
 }
 
@@ -363,7 +369,7 @@ pub fn event_id_shape(id: &str) -> bool {
 /// uses this to defer one account rather than every account when a payment
 /// event for it may still be waiting. An arrival that cannot be read is
 /// treated as recent, which holds the deletion rather than guessing it old.
-pub async fn queued_on_or_after(store: &Store, day: Date) -> Result<bool, Error> {
+pub async fn queued_on_or_after(store: &Store, day: Date) -> Result<bool, Transitions> {
     for name in store.list("webhooks").await? {
         let Some(id) = name.strip_suffix(".body") else {
             continue;
@@ -391,11 +397,11 @@ pub async fn queued_on_or_after(store: &Store, day: Date) -> Result<bool, Error>
 
 /// Drop the first-sight record once the event has settled, so `verified/` does
 /// not grow with every payment. A deferred event keeps it for the retry.
-async fn forget_verified(store: &Store, event_id: &str) -> Result<(), Error> {
+async fn forget_verified(store: &Store, event_id: &str) -> Result<(), Transitions> {
     store
         .remove("verified", &format!("{event_id}.json"))
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// The one pair key the dedup uses: an invoice is one payment, so a second
@@ -408,7 +414,7 @@ fn invoice_pair(kind: &str, object: &str) -> Option<String> {
 
 /// The event ids and `(type, object)` pairs already settled. One append-only
 /// record, so a resend sees what an earlier pass did.
-async fn processed_events(store: &Store) -> Result<HashSet<String>, Error> {
+async fn processed_events(store: &Store) -> Result<HashSet<String>, Transitions> {
     let mut seen = HashSet::new();
     for value in store
         .log("verified/processed.jsonl")
@@ -499,7 +505,7 @@ impl BillingTarget {
         cfg: &DrainConfig,
         store: &Store,
         date: String,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Transitions> {
         match self {
             BillingTarget::Account(a) => {
                 // A payment after a lapse restores access from the day it is
@@ -530,16 +536,16 @@ impl BillingTarget {
     /// paid date restores a lapsed account, and then under its own lock too,
     /// because a console suspension can land between the read and the write.
     /// Every other event records its facts and leaves the standing alone.
-    async fn save(&mut self, store: &Store, restore: bool) -> Result<(), Error> {
+    async fn save(&mut self, store: &Store, restore: bool) -> Result<(), Transitions> {
         match self {
             BillingTarget::Account(a) => PaymentTarget::account(a)
                 .save(store, restore)
                 .await
-                .map_err(Error::from),
+                .map_err(Transitions::from),
             BillingTarget::Group(g) => PaymentTarget::group(g)
                 .save(store, false)
                 .await
-                .map_err(Error::from),
+                .map_err(Transitions::from),
         }
     }
 
@@ -575,7 +581,10 @@ enum TargetRef {
     Group(String),
 }
 
-async fn load_target(store: &Store, target: &TargetRef) -> Result<Option<BillingTarget>, Error> {
+async fn load_target(
+    store: &Store,
+    target: &TargetRef,
+) -> Result<Option<BillingTarget>, Transitions> {
     match target {
         TargetRef::Account(username) => {
             let Some(account) = store.account(username).await? else {
@@ -607,7 +616,7 @@ async fn target_for_subscription(
     store: &Store,
     journal: &Journal,
     subscription: &str,
-) -> Result<Option<TargetRef>, Error> {
+) -> Result<Option<TargetRef>, Transitions> {
     for username in store.list("accounts").await? {
         let account = match store.account(&username).await {
             Ok(account) => account,
@@ -615,7 +624,7 @@ async fn target_for_subscription(
                 // A corrupt account could own the subscription, so the scan
                 // cannot skip it. Report the record and fail this event; the
                 // delivery stays queued for the pass after the record is fixed.
-                let error = Error::Store(e);
+                let error = Transitions::Store(e);
                 report_record(cfg, store, journal, "account", &username, &error).await;
                 return Err(error);
             }
@@ -665,10 +674,10 @@ async fn settle_event(
     journal: &Journal,
     kind: &str,
     event: &Value,
-) -> Result<Settled, Error> {
+) -> Result<Settled, Transitions> {
     let object = event
         .pointer("/data/object")
-        .ok_or_else(|| Error::Failed("the event carries no data.object".to_string()))?;
+        .ok_or_else(|| Transitions::Stripe(Error::NoEventObject))?;
     match kind {
         "checkout.session.completed" => checkout_completed(store, object).await,
         "invoice.paid" => invoice_paid(cfg, store, journal, object).await,
@@ -724,7 +733,7 @@ async fn charge_notice(
     kind: &str,
     object: &Value,
     todo: &str,
-) -> Result<Settled, Error> {
+) -> Result<Settled, Transitions> {
     let text = |name: &str| object.get(name).and_then(Value::as_str);
     let found = if kind == "charge.dispute.created" {
         format!(
@@ -752,7 +761,7 @@ async fn charge_notice(
 async fn account_for_payment_reference(
     store: &Store,
     reference: &str,
-) -> Result<Option<Account>, Error> {
+) -> Result<Option<Account>, Transitions> {
     if !store::is_payment_token(reference) {
         return Ok(None);
     }
@@ -787,7 +796,7 @@ async fn account_for_payment_reference(
 async fn target_for_payment_reference(
     store: &Store,
     reference: &str,
-) -> Result<Option<TargetRef>, Error> {
+) -> Result<Option<TargetRef>, Transitions> {
     if let Some(account) = account_for_payment_reference(store, reference).await? {
         return Ok(Some(TargetRef::Account(account.username)));
     }
@@ -826,7 +835,7 @@ async fn target_for_payment_reference(
 async fn target_for_application(
     store: &Store,
     application: &str,
-) -> Result<Option<TargetRef>, Error> {
+) -> Result<Option<TargetRef>, Transitions> {
     // Transition: approvals mailed before the link carried the application's
     // identifier put the `KYR-` payment token here instead. Those links are in
     // inboxes and Stripe will charge them, so a token of that shape still
@@ -888,7 +897,7 @@ async fn attach_subscription(
     billing: &mut BillingTarget,
     subscription: &str,
     customer: Option<&str>,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let stripe = billing.stripe_mut();
     stripe.subscription = Some(subscription.to_string());
     stripe.customer = customer.map(str::to_string);
@@ -900,7 +909,7 @@ async fn attach_subscription(
 /// attached to what its record's token indexes. Nothing else happens:
 /// `invoice.paid` owns the date, so a first payment extends exactly one year and
 /// never two.
-async fn checkout_completed(store: &Store, object: &Value) -> Result<Settled, Error> {
+async fn checkout_completed(store: &Store, object: &Value) -> Result<Settled, Transitions> {
     let Some(reference) = object
         .get("client_reference_id")
         .and_then(Value::as_str)
@@ -932,7 +941,7 @@ async fn invoice_paid(
     store: &Store,
     journal: &Journal,
     object: &Value,
-) -> Result<Settled, Error> {
+) -> Result<Settled, Transitions> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
@@ -1071,17 +1080,15 @@ fn invoice_covers(
     cfg: &DrainConfig,
     object: &Value,
     billing: &BillingTarget,
-) -> Result<bool, Error> {
+) -> Result<bool, Transitions> {
     if object.get("currency").and_then(Value::as_str) != Some("gbp") {
         return Ok(false);
     }
     let (field, price) = billing.price(cfg);
     let price = util::pence(price)
-        .map_err(|e| Error::context(format!("the drain's configured {field}"), e))?;
+        .map_err(|source| Transitions::Stripe(Error::ConfigPrice { field, source }))?;
     if price <= 0 {
-        return Err(Error::Failed(format!(
-            "the drain's configured {field} must be more than zero"
-        )));
+        return Err(Transitions::Stripe(Error::PriceNotPositive { field }));
     }
     let paid = object
         .get("amount_paid")
@@ -1097,11 +1104,12 @@ fn invoice_applied(
     cfg: &DrainConfig,
     billing: &BillingTarget,
     amount_gbp: &str,
-) -> Result<String, Error> {
+) -> Result<String, Transitions> {
     let (field, price) = billing.price(cfg);
     let price = util::pence(price)
-        .map_err(|e| Error::context(format!("the drain's configured {field}"), e))?;
-    let amount = util::pence(amount_gbp).map_err(|e| Error::context("the invoice's amount", e))?;
+        .map_err(|source| Transitions::Stripe(Error::ConfigPrice { field, source }))?;
+    let amount = util::pence(amount_gbp)
+        .map_err(|source| Transitions::Stripe(Error::InvoiceAmount { source }))?;
     Ok(util::gbp(amount.min(price)))
 }
 
@@ -1111,18 +1119,18 @@ fn invoice_applied(
 /// an event applied after the tax-year boundary would otherwise be recorded
 /// wrong. A missing amount or timestamp is an error, which leaves the event for
 /// the next pass rather than writing a guess.
-fn invoice_money(object: &Value) -> Result<(String, String), Error> {
+fn invoice_money(object: &Value) -> Result<(String, String), Transitions> {
     let amount = object
         .get("amount_paid")
         .and_then(Value::as_i64)
-        .ok_or_else(|| Error::Failed("the paid invoice carries no amount_paid".to_string()))?;
+        .ok_or_else(|| Transitions::Stripe(Error::InvoiceNoAmount))?;
     let paid = object
         .pointer("/status_transitions/paid_at")
         .and_then(Value::as_i64)
         .or_else(|| object.get("created").and_then(Value::as_i64))
-        .ok_or_else(|| Error::Failed("the paid invoice carries no paid timestamp".to_string()))?;
+        .ok_or_else(|| Transitions::Stripe(Error::InvoiceNoPaidTimestamp))?;
     let when = OffsetDateTime::from_unix_timestamp(paid)
-        .map_err(|e| Error::context("the invoice's paid timestamp cannot be read", e))?;
+        .map_err(|e| Transitions::context("the invoice's paid timestamp cannot be read", e))?;
     Ok((util::gbp(amount), util::date_string(when.date())))
 }
 
@@ -1141,7 +1149,7 @@ async fn append_invoice_ledger(
     amount_gbp: &str,
     applied_gbp: &str,
     received_on: &str,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let Some(token) = token else {
         return Ok(());
     };
@@ -1160,14 +1168,17 @@ async fn append_invoice_ledger(
 
 /// The current subscription from the Stripe API, through the one script that
 /// holds the key. Read-only: the webhook path makes no Stripe writes.
-async fn retrieve_subscription(cfg: &DrainConfig, subscription: &str) -> Result<Value, Error> {
+async fn retrieve_subscription(
+    cfg: &DrainConfig,
+    subscription: &str,
+) -> Result<Value, Transitions> {
     if !subscription
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_')
     {
-        return Err(Error::Failed(format!(
-            "the subscription id {subscription:?} is not an id"
-        )));
+        return Err(Transitions::Stripe(Error::SubscriptionIdShape {
+            subscription: subscription.to_string(),
+        }));
     }
     let out = spawn_script(
         cfg,
@@ -1176,26 +1187,23 @@ async fn retrieve_subscription(cfg: &DrainConfig, subscription: &str) -> Result<
     )
     .await?;
     if !out.status.success() {
-        return Err(Error::from(script_error(cfg, "stripe-api.sh", &out)));
+        return Err(Transitions::from(script_error(cfg, "stripe-api.sh", &out)));
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| {
-        Error::Failed(format!(
-            "stripe-api.sh did not answer with a subscription: {e}"
-        ))
-    })
+    serde_json::from_slice(&out.stdout)
+        .map_err(|source| Transitions::Stripe(Error::SubscriptionUnreadable { source }))
 }
 
 /// The Checkout Session a subscription came from, read through the same script.
 /// The list is filtered by the subscription and bounded to one; an empty list or
 /// an unreachable API is an error, so the event stays for the next pass.
-async fn retrieve_session(cfg: &DrainConfig, subscription: &str) -> Result<Value, Error> {
+async fn retrieve_session(cfg: &DrainConfig, subscription: &str) -> Result<Value, Transitions> {
     if !subscription
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_')
     {
-        return Err(Error::Failed(format!(
-            "the subscription id {subscription:?} is not an id"
-        )));
+        return Err(Transitions::Stripe(Error::SubscriptionIdShape {
+            subscription: subscription.to_string(),
+        }));
     }
     let out = spawn_script(
         cfg,
@@ -1204,13 +1212,10 @@ async fn retrieve_session(cfg: &DrainConfig, subscription: &str) -> Result<Value
     )
     .await?;
     if !out.status.success() {
-        return Err(Error::from(script_error(cfg, "stripe-api.sh", &out)));
+        return Err(Transitions::from(script_error(cfg, "stripe-api.sh", &out)));
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| {
-        Error::Failed(format!(
-            "stripe-api.sh did not answer with a checkout session: {e}"
-        ))
-    })
+    serde_json::from_slice(&out.stdout)
+        .map_err(|source| Transitions::Stripe(Error::SessionUnreadable { source }))
 }
 
 /// The account reference a repaired payment carries: the session's own
@@ -1237,7 +1242,7 @@ async fn invoice_payment_failed(
     store: &Store,
     journal: &Journal,
     object: &Value,
-) -> Result<Settled, Error> {
+) -> Result<Settled, Transitions> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
@@ -1269,7 +1274,7 @@ async fn invoice_payment_action_required(
     store: &Store,
     journal: &Journal,
     object: &Value,
-) -> Result<Settled, Error> {
+) -> Result<Settled, Transitions> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
@@ -1334,7 +1339,7 @@ async fn subscription_changed(
     journal: &Journal,
     object: &Value,
     deleted: bool,
-) -> Result<Settled, Error> {
+) -> Result<Settled, Transitions> {
     let Some(subscription) = object.get("id").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };
@@ -1375,7 +1380,7 @@ async fn invoice_upcoming(
     store: &Store,
     journal: &Journal,
     object: &Value,
-) -> Result<Settled, Error> {
+) -> Result<Settled, Transitions> {
     let Some(subscription) = object.get("subscription").and_then(Value::as_str) else {
         return Ok(Settled::Ignored);
     };

@@ -22,7 +22,7 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::Error;
+use super::Error;
 
 /// Which table a path is, from its file name. The five are the only files this
 /// module writes; the shapes below differ enough that guessing would be worse
@@ -48,9 +48,9 @@ impl Kind {
             "mail_from" => Ok(Kind::MailFrom),
             "dkim_domains" => Ok(Kind::DkimDomains),
             "spamd.alloweddomains" => Ok(Kind::SpamdAllowedDomains),
-            other => Err(Error::Failed(format!(
-                "{other:?} is not one of the mail tables this writer owns"
-            ))),
+            other => Err(Error::UnknownTable {
+                name: other.to_string(),
+            }),
         }
     }
 }
@@ -73,9 +73,9 @@ impl DropMode {
             "prefix" => Ok(DropMode::Prefix),
             "suffix" => Ok(DropMode::Suffix),
             "value-suffix" => Ok(DropMode::ValueSuffix),
-            other => Err(Error::Failed(format!(
-                "{other:?} is not exact, prefix, suffix or value-suffix"
-            ))),
+            other => Err(Error::UnknownDropMode {
+                mode: other.to_string(),
+            }),
         }
     }
 }
@@ -141,20 +141,18 @@ impl Table {
                         return Ok(Change::none())
                     }
                     (Some(have), Some(want)) => {
-                        return Err(Error::Failed(format!(
-                            "{} already maps {} to {}, not {}",
-                            self.path.display(),
-                            entry.key,
-                            have,
-                            want
-                        )))
+                        return Err(Error::AlreadyMapped {
+                            path: self.path.clone(),
+                            key: entry.key.clone(),
+                            have: have.clone(),
+                            want: want.clone(),
+                        })
                     }
                     _ => {
-                        return Err(Error::Failed(format!(
-                            "{} has {} in the other shape already",
-                            self.path.display(),
-                            entry.key
-                        )))
+                        return Err(Error::OtherShape {
+                            path: self.path.clone(),
+                            key: entry.key.clone(),
+                        })
                     }
                 }
             }
@@ -199,7 +197,7 @@ impl Table {
     pub fn drop(&self, how: DropMode, text: &str) -> Result<Change, Error> {
         let text = text.trim();
         if text.is_empty() {
-            return Err(Error::Failed("the drop text is empty".to_string()));
+            return Err(Error::EmptyDropText);
         }
         let text = lower(text);
         self.mutate(|doc| {
@@ -414,15 +412,20 @@ impl Table {
         virtuals: &Path,
         platform_domain: &str,
     ) -> Result<Change, Error> {
-        if let Some(why) = crate::flow::validate::domain(platform_domain) {
-            return Err(Error::Failed(format!("the platform domain: {why}")));
+        if let Some(source) = crate::flow::validate::domain(platform_domain) {
+            return Err(Error::PlatformDomain { source });
         }
         let domain = lower(platform_domain);
         let _lock = self.lock()?;
-        let passwd_text = std::fs::read_to_string(passwd)
-            .map_err(|e| Error::context(format!("cannot read {}", passwd.display()), e))?;
-        let virtuals_text = std::fs::read_to_string(virtuals)
-            .map_err(|e| Error::context(format!("cannot read {}", virtuals.display()), e))?;
+        let passwd_text = std::fs::read_to_string(passwd).map_err(|source| Error::ReadPasswd {
+            path: passwd.to_path_buf(),
+            source,
+        })?;
+        let virtuals_text =
+            std::fs::read_to_string(virtuals).map_err(|source| Error::ReadVirtuals {
+                path: virtuals.to_path_buf(),
+                source,
+            })?;
         let source = Table {
             path: virtuals.to_path_buf(),
             kind: Kind::Virtuals,
@@ -527,14 +530,9 @@ impl Table {
     }
 
     fn read(&self) -> Result<String, Error> {
-        std::fs::read_to_string(&self.path).map_err(|e| {
-            Error::context(
-                format!(
-                    "cannot read {}; run scripts/deploy-mail.sh first",
-                    self.path.display()
-                ),
-                e,
-            )
+        std::fs::read_to_string(&self.path).map_err(|source| Error::ReadTable {
+            path: self.path.clone(),
+            source,
         })
     }
 
@@ -594,17 +592,21 @@ impl Table {
             .write(true)
             .mode(0o600)
             .open(&path)
-            .map_err(|e| Error::context(format!("cannot open {}", path.display()), e))?;
-        file.lock()
-            .map_err(|e| Error::context(format!("cannot lock {}", path.display()), e))?;
+            .map_err(|source| Error::OpenLock {
+                path: path.clone(),
+                source,
+            })?;
+        file.lock().map_err(|source| Error::LockTable {
+            path: path.clone(),
+            source,
+        })?;
         Ok(file)
     }
 
     fn write(&self, bytes: &[u8]) -> Result<(), Error> {
-        let dir = self
-            .path
-            .parent()
-            .ok_or_else(|| Error::Failed(format!("{} has no directory", self.path.display())))?;
+        let dir = self.path.parent().ok_or_else(|| Error::TableNoDirectory {
+            path: self.path.clone(),
+        })?;
         let candidate = dir.join(format!(
             ".{}.onboard.{}.{}",
             self.path
@@ -623,17 +625,30 @@ impl Table {
                 .write(true)
                 .mode(0o644)
                 .open(&candidate)
-                .map_err(|e| Error::context(format!("cannot create {}", candidate.display()), e))?;
+                .map_err(|source| Error::CreateCandidate {
+                    path: candidate.clone(),
+                    source,
+                })?;
             file.write_all(bytes)
-                .map_err(|e| Error::context(format!("cannot write {}", candidate.display()), e))?;
+                .map_err(|source| Error::WriteCandidate {
+                    path: candidate.clone(),
+                    source,
+                })?;
             // `.mode` at creation is masked by the process umask; the tables are
             // read by smtpd and its filters, so the mode is set, not inherited.
-            std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644))
-                .map_err(|e| Error::context(format!("cannot mode {}", candidate.display()), e))?;
-            file.sync_all()
-                .map_err(|e| Error::context(format!("cannot sync {}", candidate.display()), e))?;
-            std::fs::rename(&candidate, &self.path).map_err(|e| {
-                Error::context(format!("cannot replace {}", self.path.display()), e)
+            std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644)).map_err(
+                |source| Error::ModeCandidate {
+                    path: candidate.clone(),
+                    source,
+                },
+            )?;
+            file.sync_all().map_err(|source| Error::SyncCandidate {
+                path: candidate.clone(),
+                source,
+            })?;
+            std::fs::rename(&candidate, &self.path).map_err(|source| Error::ReplaceTable {
+                path: self.path.clone(),
+                source,
             })?;
             // The rename is durable only after the directory is synced.
             if let Ok(dir) = File::open(dir) {
@@ -669,20 +684,28 @@ impl Table {
                 .chars()
                 .any(|c| c.is_whitespace() || c.is_control() || c == ':')
         {
-            return Err(Error::Failed(format!("{key:?} is not a table key")));
+            return Err(Error::NotTableKey {
+                key: key.to_string(),
+            });
         }
         match self.kind {
-            Kind::MailFrom if key.contains('@') => Err(Error::Failed(format!(
-                "{key:?} is an address; a sender line's key is an account"
-            ))),
+            Kind::MailFrom if key.contains('@') => Err(Error::AddressAsSenderKey {
+                key: key.to_string(),
+            }),
             Kind::MailDomains | Kind::DkimDomains if key.contains('@') => {
-                Err(Error::Failed(format!("{key:?} is not a bare domain")))
+                Err(Error::NotBareDomain {
+                    key: key.to_string(),
+                })
             }
-            Kind::SpamdAllowedDomains if !key.starts_with('@') || key.len() == 1 => Err(
-                Error::Failed(format!("{key:?} is not an @domain allow-list entry")),
-            ),
+            Kind::SpamdAllowedDomains if !key.starts_with('@') || key.len() == 1 => {
+                Err(Error::NotAllowListEntry {
+                    key: key.to_string(),
+                })
+            }
             Kind::SpamdAllowedDomains if key.contains('@') && key[1..].contains('@') => {
-                Err(Error::Failed(format!("{key:?} is not an @domain")))
+                Err(Error::NotOneDomain {
+                    key: key.to_string(),
+                })
             }
             _ => Ok(lower(key)),
         }
@@ -693,24 +716,28 @@ impl Table {
     fn canonical_value(&self, value: &str) -> Result<String, Error> {
         let value = value.trim();
         if value.is_empty() {
-            return Err(Error::Failed("an empty table value".to_string()));
+            return Err(Error::EmptyTableValue);
         }
         match self.kind {
-            Kind::Virtuals if value.contains('@') => Err(Error::Failed(format!(
-                "{value:?} is not a delivery account"
-            ))),
+            Kind::Virtuals if value.contains('@') => Err(Error::NotDeliveryAccount {
+                value: value.to_string(),
+            }),
             Kind::Virtuals if value.chars().any(|c| c.is_whitespace() || c.is_control()) => {
-                Err(Error::Failed(format!("{value:?} carries whitespace")))
+                Err(Error::ValueWhitespace {
+                    value: value.to_string(),
+                })
             }
             Kind::MailFrom => {
                 let values = split_values(value);
                 if values.is_empty() {
-                    return Err(Error::Failed("an empty sender list".to_string()));
+                    return Err(Error::EmptySenderList);
                 }
                 if let Some(not_address) = values.iter().find(|v| {
                     !v.contains('@') || v.chars().any(|c| c.is_whitespace() || c.is_control())
                 }) {
-                    return Err(Error::Failed(format!("{not_address:?} is not an address")));
+                    return Err(Error::NotAddress {
+                        value: not_address.clone(),
+                    });
                 }
                 Ok(values
                     .iter()
@@ -719,7 +746,9 @@ impl Table {
                     .join(","))
             }
             _ if value.chars().any(|c| c.is_whitespace() || c.is_control()) => {
-                Err(Error::Failed(format!("{value:?} carries whitespace")))
+                Err(Error::ValueWhitespace {
+                    value: value.to_string(),
+                })
             }
             _ if value.contains('@') => Ok(lower(value)),
             _ => Ok(value.to_string()),
@@ -917,7 +946,11 @@ mod tests {
         let err = table
             .ensure("alice@kyriakon.net", Some("somebody-else"))
             .unwrap_err();
-        assert!(format!("{err}").contains("already maps"));
+        assert!(matches!(
+            err,
+            Error::AlreadyMapped { key, have, want, .. }
+                if key == "alice@kyriakon.net" && have == "alice" && want == "somebody-else"
+        ));
     }
 
     #[test]
@@ -1245,12 +1278,12 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_table_names_the_deploy() {
+    fn a_missing_table_is_reported_as_unreadable() {
         let fix = Fixture::new("missing");
         let table = Table::at(&fix.path("virtuals")).unwrap();
         let err = table
             .ensure("alice@kyriakon.net", Some("alice"))
             .unwrap_err();
-        assert!(format!("{err}").contains("deploy-mail.sh"));
+        assert!(matches!(err, Error::ReadTable { .. }));
     }
 }

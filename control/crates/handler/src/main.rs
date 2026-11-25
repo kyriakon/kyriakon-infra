@@ -25,28 +25,22 @@ async fn run() -> Result<(), responder::Error> {
     match args.next().as_deref() {
         Some("serve") => {}
         Some(other) => {
-            return Err(responder::Error::Startup(format!(
-                "unknown command {other:?}; usage: kyriakon-control serve [--config PATH]"
-            )))
+            return Err(responder::Error::UnknownCommand {
+                command: other.to_string(),
+            })
         }
-        None => {
-            return Err(responder::Error::Startup(
-                "usage: kyriakon-control serve [--config PATH]".to_string(),
-            ))
-        }
+        None => return Err(responder::Error::NoCommand),
     }
     let mut cfg_path = PathBuf::from("/etc/onboard/onboard.toml");
     while let Some(a) = args.next() {
         match a.as_str() {
             "--config" => {
-                cfg_path = PathBuf::from(args.next().ok_or_else(|| {
-                    responder::Error::Failed("--config needs a path".to_string())
-                })?);
+                cfg_path = PathBuf::from(args.next().ok_or(responder::Error::MissingConfigPath)?);
             }
             other => {
-                return Err(responder::Error::Startup(format!(
-                    "unknown argument {other:?}"
-                )))
+                return Err(responder::Error::UnknownArgument {
+                    argument: other.to_string(),
+                })
             }
         }
     }

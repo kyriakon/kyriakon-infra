@@ -16,7 +16,7 @@ pub(crate) async fn request(
         Some("extend") => request_extend(store, &args[1..]).await,
         Some("close") => request_close(store, &args[1..]).await,
         Some("list") => request_list(store).await,
-        _ => Err(Error::Failed(usage())),
+        _ => Err(Error::Usage),
     }
 }
 
@@ -70,40 +70,53 @@ pub(crate) async fn request_verify(
 ) -> Result<(), Error> {
     let flags = flags(args, &["username", "message", "signature"])?;
     let username = need(&flags, "username")?;
-    if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+    if let Some(source) = validate::username_shape(username) {
+        return Err(Error::InvalidUsername {
+            username: username.to_string(),
+            source,
+        });
     }
     let account = store
         .account(username)
         .await?
-        .ok_or_else(|| Error::Failed(format!("no account for {username}")))?;
+        .ok_or_else(|| Error::NoAccount {
+            username: username.to_string(),
+        })?;
     let own = account.platform_address();
 
     let message_path = std::path::Path::new(need(&flags, "message")?);
-    let message = std::fs::read(message_path)
-        .map_err(|e| Error::context(format!("cannot read {}", message_path.display()), e))?;
+    let message = std::fs::read(message_path).map_err(|source| Error::ReadMessage {
+        path: message_path.to_path_buf(),
+        source,
+    })?;
     let signature = match flags.get("signature") {
-        Some(path) => Some(
-            std::fs::read(path).map_err(|e| Error::context(format!("cannot read {path}"), e))?,
-        ),
+        Some(path) => Some(std::fs::read(path).map_err(|source| Error::ReadSignature {
+            path: path.into(),
+            source,
+        })?),
         None => None,
     };
 
     let key_file = keycheck::keyring_file(&cfg.keyring_dir, username);
     if !key_file.is_file() {
-        return Err(Error::Failed(format!(
-            "the box holds no key for {username} at {}",
-            key_file.display()
-        )));
+        return Err(Error::NoKeyringKey {
+            username: username.to_string(),
+            path: key_file,
+        });
     }
     // The keyring entry the box delivers with is the expected signer, read from
     // the exact material installed rather than from the record beside it. A
     // block carrying a second primary key is refused here, so the hidden key
     // cannot sign a request as though it were the visible one (#918).
-    let material = std::fs::read_to_string(&key_file)
-        .map_err(|e| Error::context(format!("cannot read {}", key_file.display()), e))?;
+    let material = std::fs::read_to_string(&key_file).map_err(|source| Error::ReadKeyring {
+        path: key_file.clone(),
+        source,
+    })?;
     let expected = pgp::inspect_single_cert(&material)
-        .map_err(|e| Error::context(format!("the keyring entry for {username}"), e))?
+        .map_err(|source| Error::KeyringUnusable {
+            username: username.to_string(),
+            source,
+        })?
         .fingerprint;
     // A clearsigned file is verified over its armour alone, and the text shown
     // is GnuPG's own plaintext for that verification. Slicing the text out of
@@ -112,12 +125,11 @@ pub(crate) async fn request_verify(
     let (fingerprint, from, text) = match &signature {
         Some(detached) => {
             if !pgp::verify_detached(&cfg.gpg, &key_file, &expected, &message, detached).await? {
-                return Err(Error::Failed(format!(
-                    "the signature does not verify against {username}'s keyring entry"
-                )));
+                return Err(Error::SignatureMismatch {
+                    username: username.to_string(),
+                });
             }
-            let from = pgp::header_from(pgp::message_headers(&message)?)?
-                .ok_or_else(|| Error::Failed("the message has no From: header".to_string()))?;
+            let from = pgp::header_from(pgp::message_headers(&message)?)?.ok_or(Error::NoFrom)?;
             (
                 expected,
                 from,
@@ -127,14 +139,7 @@ pub(crate) async fn request_verify(
         None => {
             let verified = pgp::verify_clearsigned(&cfg.gpg, &key_file, &expected, &message)
                 .await?
-                .ok_or_else(|| {
-                    Error::Failed(
-                        "the message is not clearsigned; pass --signature with its \
-                             detached signature or export the message clearsigned from the \
-                             client"
-                            .to_string(),
-                    )
-                })?;
+                .ok_or(Error::NotClearsigned)?;
             let armour_from = pgp::header_from(verified.plaintext.as_bytes())?;
             let outer = pgp::header_from(pgp::outer_headers(&message)?)?;
             let from = signed_from(outer, armour_from)?;
@@ -146,15 +151,14 @@ pub(crate) async fn request_verify(
             .outside_address
             .as_deref()
             .is_some_and(|address| address.eq_ignore_ascii_case(&from));
-        return Err(Error::Failed(if outside {
-            format!(
-                "the message is from {from}, the account's outside contact address; \
-                 ask for a message from {own} signed with the mail key, or for the \
-                 password route on the account page"
-            )
+        return Err(if outside {
+            Error::SenderOutside {
+                from,
+                own: own.clone(),
+            }
         } else {
-            format!("the message is from {from}, not the account's own address {own}")
-        }));
+            Error::SenderOther { from, own }
+        });
     }
     println!("verified {fingerprint}; From: {}", safe(&from));
     // What was signed is what the operator records, so it is printed rather
@@ -172,19 +176,19 @@ pub(crate) async fn request_verify(
 /// not contradict it.
 pub(crate) fn signed_from(outer: Option<String>, armour: Option<String>) -> Result<String, Error> {
     match (outer, armour) {
-        (Some(outer), Some(armour)) if !outer.eq_ignore_ascii_case(&armour) => Err(Error::Failed(
-            format!("the message's own From: is {outer} but the clearsigned one is {armour}"),
-        )),
+        (Some(outer), Some(armour)) if !outer.eq_ignore_ascii_case(&armour) => {
+            Err(Error::FromMismatch { outer, armour })
+        }
         (Some(outer), _) => Ok(outer),
         (None, Some(armour)) => Ok(armour),
-        (None, None) => Err(Error::Failed("the message has no From: header".to_string())),
+        (None, None) => Err(Error::NoFrom),
     }
 }
 
 pub(crate) async fn request_extend(store: &Store, args: &[String]) -> Result<(), Error> {
     let (id, rest) = match args {
         [id, rest @ ..] if !id.starts_with("--") => (id.as_str(), rest),
-        _ => return Err(Error::Failed(usage())),
+        _ => return Err(Error::Usage),
     };
     let flags = flags(rest, &["reason", "extended-on"])?;
     let line = account_requests::extend(
@@ -206,7 +210,7 @@ pub(crate) async fn request_extend(store: &Store, args: &[String]) -> Result<(),
 pub(crate) async fn request_close(store: &Store, args: &[String]) -> Result<(), Error> {
     let (id, rest) = match args {
         [id, rest @ ..] if !id.starts_with("--") => (id.as_str(), rest),
-        _ => return Err(Error::Failed(usage())),
+        _ => return Err(Error::Usage),
     };
     let flags = flags(rest, &["done", "note"])?;
     let line =
@@ -232,8 +236,10 @@ pub(crate) async fn request_list(store: &Store) -> Result<(), Error> {
     for line in open {
         let state = match line
             .state(today)
-            .map_err(|e| Error::context(format!("request {}", safe(&line.id)), e))?
-        {
+            .map_err(|source| Error::RequestStateUnreadable {
+                id: safe(&line.id),
+                source,
+            })? {
             account_requests::DueState::Overdue => {
                 overdue += 1;
                 "OVERDUE"

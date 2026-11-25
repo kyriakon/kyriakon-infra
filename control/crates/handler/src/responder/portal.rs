@@ -69,11 +69,7 @@ pub(super) async fn portal_connection(stream: UnixStream, app: &App) -> Result<(
         let address = address.to_string();
         let body = match portal_line(&mut reader, ipc::MAX_BODY).await {
             Ok(Some(body)) => body,
-            Ok(None) => {
-                return Err(Error::Refused(
-                    "the portal closed before sending the application".to_string(),
-                ))
-            }
+            Ok(None) => return Err(Error::Refused(Refusal::PortalClosedBeforeApplication)),
             // Answer rather than just closing: the portal can tell the reader
             // what happened at the end of a long session.
             Err(e) => {
@@ -92,9 +88,7 @@ pub(super) async fn portal_connection(stream: UnixStream, app: &App) -> Result<(
         return say(&mut writer, reply.as_bytes()).await;
     }
     let Some((address, token)) = ipc::parse_request(&line) else {
-        return Err(Error::Refused(
-            "the portal sent no status request".to_string(),
-        ));
+        return Err(Error::Refused(Refusal::PortalNoStatusRequest));
     };
     let answer = portal_answer(app, address, token).await;
     // The route carries the token and the address, which is the log line every

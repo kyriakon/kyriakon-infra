@@ -21,12 +21,12 @@ use std::path::{Path, PathBuf};
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Duration, OffsetDateTime};
 
+use super::Error;
 use crate::config::DrainConfig;
 use crate::mail::notice;
 use crate::mail::{keycheck, pgp};
 use crate::store::{Account, JournalLine, Store};
 use crate::util;
-use crate::Error;
 
 /// The window ADR 0005 gives the application answers: ninety days from the day
 /// they were filed, after which the purge deletes them. The drain's sweep and
@@ -253,28 +253,30 @@ fn own_journal(
 /// to the account that owns it, so a member who is not in the file is a
 /// refusal rather than a root-owned directory they can no longer read.
 fn member_owner(passwd: &str, username: &str) -> Result<(u32, u32), Error> {
-    let text = std::fs::read_to_string(passwd).map_err(|source| {
-        Error::context(format!("cannot read the account list {passwd}"), source)
+    let text = std::fs::read_to_string(passwd).map_err(|source| Error::ReadPasswd {
+        path: PathBuf::from(passwd),
+        source,
     })?;
     for line in text.lines() {
         let fields: Vec<&str> = line.split(':').collect();
         if fields.len() >= 4 && fields[0] == username {
-            let uid = fields[2].parse().map_err(|_| {
-                Error::Failed(format!(
-                    "the uid for {username} in {passwd} is not a number"
-                ))
+            let uid = fields[2].parse().map_err(|_| Error::MemberFieldNotNumber {
+                username: username.to_string(),
+                field: "uid",
+                path: PathBuf::from(passwd),
             })?;
-            let gid = fields[3].parse().map_err(|_| {
-                Error::Failed(format!(
-                    "the gid for {username} in {passwd} is not a number"
-                ))
+            let gid = fields[3].parse().map_err(|_| Error::MemberFieldNotNumber {
+                username: username.to_string(),
+                field: "gid",
+                path: PathBuf::from(passwd),
             })?;
             return Ok((uid, gid));
         }
     }
-    Err(Error::Failed(format!(
-        "{username} is not in {passwd}, so the export has no owner to hand the bundle to"
-    )))
+    Err(Error::MemberMissing {
+        username: username.to_string(),
+        path: PathBuf::from(passwd),
+    })
 }
 
 fn join_lines(lines: Vec<String>) -> Vec<u8> {
@@ -296,14 +298,15 @@ async fn written(
     mailed: bool,
 ) -> Result<(Account, String, Vec<(String, Vec<u8>)>), Error> {
     let Some(account_text) = store.account_text(username).await? else {
-        return Err(Error::Failed(format!("no account for {username}")));
+        return Err(Error::NoAccount {
+            username: username.to_string(),
+        });
     };
-    let account: Account = serde_json::from_str(&account_text).map_err(|source| {
-        Error::context(
-            format!("accounts/{username}/account.json does not parse"),
+    let account: Account =
+        serde_json::from_str(&account_text).map_err(|source| Error::AccountRecordParse {
+            username: username.to_string(),
             source,
-        )
-    })?;
+        })?;
 
     let mut docs: Vec<(String, Vec<u8>)> = Vec::new();
     docs.push(("account.json".to_string(), account_text.into_bytes()));
@@ -369,12 +372,10 @@ async fn written(
     ));
 
     let key_path = keycheck::keyring_file(&cfg.keyring_dir, username);
-    let key = std::fs::read(&key_path).map_err(|e| {
-        Error::context_with_suffix(
-            format!("no mail key for {username} at {}", key_path.display()),
-            e,
-            "; the account's own key belongs in the export",
-        )
+    let key = std::fs::read(&key_path).map_err(|source| Error::ReadMailKey {
+        username: username.to_string(),
+        path: key_path.clone(),
+        source,
     })?;
     docs.push((format!("keys/{username}.asc"), key));
 
@@ -382,11 +383,10 @@ async fn written(
         .payment_state()
         .and_then(|payment| payment.token_ref);
     let ledger = match token.as_deref() {
-        Some(token) => {
-            crate::payments::ledger::Ledger::open(store)
-                .raw_lines_for(token)
-                .await?
-        }
+        Some(token) => crate::payments::ledger::Ledger::open(store)
+            .raw_lines_for(token)
+            .await
+            .map_err(|source| Error::Ledger(Box::new(source)))?,
         None => Vec::new(),
     };
     docs.push((
@@ -410,20 +410,21 @@ async fn written(
 /// caller is root and `export/` is root-owned 0755, so the member can read
 /// their bundles and cannot place anything where root will write.
 fn check_export_dir(path: &Path, owner: u32) -> Result<(), Error> {
-    let md = std::fs::symlink_metadata(path)
-        .map_err(|source| Error::context(format!("cannot read {}", path.display()), source))?;
+    let md = std::fs::symlink_metadata(path).map_err(|source| Error::ReadPath {
+        path: path.to_path_buf(),
+        source,
+    })?;
     if !md.file_type().is_dir() {
-        return Err(Error::Failed(format!(
-            "{} is not a directory, but a symlink or a file planted in the member's tree;              refusing to write the export",
-            path.display()
-        )));
+        return Err(Error::NotDirectory {
+            path: path.to_path_buf(),
+        });
     }
     if md.uid() != owner {
-        return Err(Error::Failed(format!(
-            "{} is owned by uid {}, not uid {owner}, the process writing the export; refusing",
-            path.display(),
-            md.uid()
-        )));
+        return Err(Error::WrongOwner {
+            path: path.to_path_buf(),
+            found: md.uid(),
+            expected: owner,
+        });
     }
     Ok(())
 }
@@ -439,20 +440,22 @@ fn export_dir(chroot: &Path) -> Result<PathBuf, Error> {
             std::fs::DirBuilder::new()
                 .mode(0o755)
                 .create(&path)
-                .map_err(|source| {
-                    Error::context(format!("cannot create {}", path.display()), source)
+                .map_err(|source| Error::CreatePath {
+                    path: path.clone(),
+                    source,
                 })?;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).map_err(
-                |source| {
-                    Error::context(format!("cannot set the mode on {}", path.display()), source)
+                |source| Error::SetMode {
+                    path: path.clone(),
+                    source,
                 },
             )?;
         }
         Err(source) => {
-            return Err(Error::context(
-                format!("cannot read {}", path.display()),
+            return Err(Error::ReadPath {
+                path: path.clone(),
                 source,
-            ))
+            })
         }
     }
     check_export_dir(&path, unsafe { libc::geteuid() })?;
@@ -464,17 +467,23 @@ fn export_dir(chroot: &Path) -> Result<PathBuf, Error> {
 /// a refusal rather than a place to follow.
 fn create_bundle_dir(stamp: &Path, sub: &str) -> Result<PathBuf, Error> {
     if sub.is_empty() || sub.contains('/') {
-        return Err(Error::Failed(format!(
-            "the bundle path component {sub:?} is not one directory"
-        )));
+        return Err(Error::BundleComponent {
+            component: sub.to_string(),
+        });
     }
     let dir = stamp.join(sub);
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&dir)
-        .map_err(|source| Error::context(format!("cannot create {}", dir.display()), source))?;
+        .map_err(|source| Error::CreatePath {
+            path: dir.clone(),
+            source,
+        })?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
-        Error::context(format!("cannot set the mode on {}", dir.display()), source)
+        Error::SetMode {
+            path: dir.clone(),
+            source,
+        }
     })?;
     Ok(dir)
 }
@@ -487,31 +496,33 @@ fn write_bundle_file(path: &Path, bytes: &[u8], owner: (u32, u32)) -> Result<(),
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true).mode(0o600);
     opts.custom_flags(libc::O_NOFOLLOW);
-    let mut file = opts.open(path).map_err(|source| {
-        Error::context_with_suffix(
-            format!("cannot create {}", path.display()),
-            source,
-            "; the export does not write over or through an existing name",
-        )
+    let mut file = opts.open(path).map_err(|source| Error::CreateBundleFile {
+        path: path.to_path_buf(),
+        source,
     })?;
-    file.write_all(bytes)
-        .map_err(|source| Error::context(format!("cannot write {}", path.display()), source))?;
+    file.write_all(bytes).map_err(|source| Error::WritePath {
+        path: path.to_path_buf(),
+        source,
+    })?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|source| {
-            Error::context(format!("cannot set the mode on {}", path.display()), source)
+        .map_err(|source| Error::SetMode {
+            path: path.to_path_buf(),
+            source,
         })?;
     // chown needs root, and only root ever hands a bundle to another owner: a
     // test runs as the tree's own owner already.
     if unsafe { libc::geteuid() } == 0 {
-        fchown(&file, Some(owner.0), Some(owner.1)).map_err(|source| {
-            Error::context(
-                format!("cannot hand {} to {}:{}", path.display(), owner.0, owner.1),
-                source,
-            )
+        fchown(&file, Some(owner.0), Some(owner.1)).map_err(|source| Error::HandTo {
+            path: path.to_path_buf(),
+            uid: owner.0,
+            gid: owner.1,
+            source,
         })?;
     }
-    file.sync_all()
-        .map_err(|source| Error::context(format!("cannot sync {}", path.display()), source))
+    file.sync_all().map_err(|source| Error::SyncPath {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Hand one directory to the member, when this process is root. Path-based and
@@ -521,8 +532,12 @@ fn hand_one(path: &Path, (uid, gid): (u32, u32)) -> Result<(), Error> {
     if unsafe { libc::geteuid() } != 0 {
         return Ok(());
     }
-    std::os::unix::fs::chown(path, Some(uid), Some(gid))
-        .map_err(|e| Error::context(format!("cannot hand {} to {uid}:{gid}", path.display()), e))
+    std::os::unix::fs::chown(path, Some(uid), Some(gid)).map_err(|source| Error::HandTo {
+        path: path.to_path_buf(),
+        uid,
+        gid,
+        source,
+    })
 }
 
 /// Create the stamp directory and its files, then hand the files and their
@@ -538,18 +553,15 @@ fn write_tree(
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&stamp)
-        .map_err(|e| {
-            Error::context_with_suffix(
-                format!("cannot create {}", stamp.display()),
-                e,
-                "; the export directory must not already exist",
-            )
+        .map_err(|source| Error::CreateExportStamp {
+            path: stamp.clone(),
+            source,
         })?;
     std::fs::set_permissions(&stamp, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
-        Error::context(
-            format!("cannot set the mode on {}", stamp.display()),
+        Error::SetMode {
+            path: stamp.clone(),
             source,
-        )
+        }
     })?;
 
     let mut subdirs: Vec<PathBuf> = Vec::new();
@@ -577,8 +589,11 @@ fn write_tree(
 /// notice. Returns the bundle's path relative to the chroot, which is the shape
 /// the request record's `bundle` field carries.
 pub async fn deliver(cfg: &DrainConfig, store: &Store, username: &str) -> Result<String, Error> {
-    if let Some(why) = crate::flow::validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+    if let Some(source) = crate::flow::validate::username_shape(username) {
+        return Err(Error::UsernameShape {
+            username: username.to_string(),
+            source: Box::new(source),
+        });
     }
     let now = OffsetDateTime::now_utc();
     let (account, answer, docs) = written(cfg, store, username, now, false).await?;
@@ -586,16 +601,15 @@ pub async fn deliver(cfg: &DrainConfig, store: &Store, username: &str) -> Result
     match std::fs::symlink_metadata(&chroot) {
         Ok(md) if md.file_type().is_dir() => {}
         Ok(_) => {
-            return Err(Error::Failed(format!(
-                "the member's tree {} is not a directory; refusing to write the export",
-                chroot.display()
-            )))
+            return Err(Error::TreeNotDirectory {
+                path: chroot.clone(),
+            })
         }
         Err(e) => {
-            return Err(Error::Failed(format!(
-                "the member's tree {} is not there: {e}",
-                chroot.display()
-            )))
+            return Err(Error::TreeMissing {
+                path: chroot.clone(),
+                source: e,
+            })
         }
     }
     let owner = member_owner(&cfg.passwd, username)?;
@@ -612,7 +626,8 @@ pub async fn deliver(cfg: &DrainConfig, store: &Store, username: &str) -> Result
         &to,
         &answer,
     )
-    .await?;
+    .await
+    .map_err(|source| Error::Notice(Box::new(source)))?;
     Ok(format!("export/{name}/"))
 }
 
@@ -656,20 +671,24 @@ pub async fn deliver_by_mail(
     store: &Store,
     username: &str,
 ) -> Result<String, Error> {
-    if let Some(why) = crate::flow::validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+    if let Some(source) = crate::flow::validate::username_shape(username) {
+        return Err(Error::UsernameShape {
+            username: username.to_string(),
+            source: Box::new(source),
+        });
     }
     let key = keycheck::keyring_file(&cfg.keyring_dir, username);
     if !key.is_file() {
-        return Err(Error::Failed(format!(
-            "no public key for {username} at {}, so the written part cannot be sent encrypted.\n\n{}",
-            key.display(),
-            reachable()
-        )));
+        return Err(Error::NoMailKey {
+            username: username.to_string(),
+            path: key.clone(),
+        });
     }
     let now = OffsetDateTime::now_utc();
     let (account, answer, docs) = written(cfg, store, username, now, true).await?;
-    let armored = pgp::encrypt_to_cert(&cfg.gpg, &key, bundle_text(&docs).as_bytes()).await?;
+    let armored = pgp::encrypt_to_cert(&cfg.gpg, &key, bundle_text(&docs).as_bytes())
+        .await
+        .map_err(|source| Error::Encrypt(Box::new(source)))?;
     let filename = format!("export-{}.txt.asc", stamp(now));
     let to = account.notice_address();
     notice::send_account_notice_attachment(
@@ -683,7 +702,8 @@ pub async fn deliver_by_mail(
         &filename,
         &armored,
     )
-    .await?;
+    .await
+    .map_err(|source| Error::Notice(Box::new(source)))?;
     Ok(format!("mailed encrypted to the key in {}", key.display()))
 }
 
@@ -757,17 +777,17 @@ mod tests {
         assert!(check_export_dir(&dir, euid).is_ok());
         let err = check_export_dir(&dir, euid + 1).unwrap_err();
         assert!(
-            matches!(&err, Error::Failed(message) if message.contains("owned by uid")),
+            matches!(
+                &err,
+                Error::WrongOwner { found, expected, .. } if *found == euid && *expected == euid + 1
+            ),
             "{err}"
         );
 
         let link = dir.join("export");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         let err = check_export_dir(&link, euid).unwrap_err();
-        assert!(
-            matches!(&err, Error::Failed(message) if message.contains("not a directory") && message.contains("symlink")),
-            "{err}"
-        );
+        assert!(matches!(&err, Error::NotDirectory { .. }), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -784,7 +804,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &planted).unwrap();
         let err = write_bundle_file(&planted, b"export", (0, 0)).unwrap_err();
         assert!(
-            matches!(&err, Error::Context { context, .. } if context.contains("cannot create")),
+            matches!(&err, Error::CreateBundleFile { path, .. } if path == &planted),
             "{err}"
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"keep me");

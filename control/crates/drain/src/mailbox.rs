@@ -22,11 +22,13 @@
 //! judge it.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::path::PathBuf;
 
 use time::OffsetDateTime;
 use tokio::io::AsyncReadExt;
 
-use crate::transitions::Error;
+use crate::transitions::Error as Transitions;
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::config::HOST;
 use kyriakon_control_core::mail::bounce;
@@ -36,6 +38,61 @@ use kyriakon_control_core::mail::pgp;
 use kyriakon_control_core::store::draft::Draft;
 use kyriakon_control_core::store::journal::Journal;
 use kyriakon_control_core::store::Store;
+
+/// A spool file or a delivery report the mailbox pass could not use.
+#[derive(Debug)]
+pub enum Error {
+    /// A spool directory, entry or message could not be read.
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// A spool message could not be removed.
+    Remove {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// A delivery report says no lifecycle notice reached the account.
+    NoticeNeverReached {
+        username: String,
+        notice: String,
+        to: String,
+        status: String,
+    },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Read { path, source } => {
+                write!(f, "cannot read {}: {source}", path.display())
+            }
+            Error::Remove { path, source } => {
+                write!(f, "cannot remove {}: {source}", path.display())
+            }
+            Error::NoticeNeverReached {
+                username,
+                notice,
+                to,
+                status,
+            } => write!(
+                f,
+                "a delivery report says no lifecycle notice reached {username}: notice {notice} to \
+                 {to} reported {status}. The sweep continues; run `kyriakon-admin notice stop \
+                 {username}` to hold the account if the address is dead."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Read { source, .. } | Error::Remove { source, .. } => Some(source),
+            Error::NoticeNeverReached { .. } => None,
+        }
+    }
+}
 
 /// One reply per address per day. Only a live draft's recorded address is ever
 /// answered, and a day is long enough that a second mail from the same
@@ -47,18 +104,23 @@ const REPLY_SUBJECT: &str = "Your Kyriakon application key";
 /// Read the spool and act on every message in it. A failure on one message is
 /// reported and the rest still run; the message that failed is left for the next
 /// pass, so a transient store error loses nothing.
-pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<(), Error> {
+pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<(), Transitions> {
     let dir = std::path::Path::new(&cfg.mail_dir);
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Error::context(format!("cannot read {}", dir.display()), e)),
+        Err(e) => {
+            return Err(Error::Read {
+                path: dir.to_path_buf(),
+                source: e,
+            }
+            .into())
+        }
     };
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?
-    {
+    while let Some(entry) = entries.next_entry().await.map_err(|source| Error::Read {
+        path: dir.to_path_buf(),
+        source,
+    })? {
         let path = entry.path();
         if !entry.file_type().await.is_ok_and(|t| t.is_file()) {
             continue;
@@ -77,7 +139,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
                     journal,
                     name.as_ref(),
                     "mail",
-                    &Error::Failed(format!("cannot read {}: {e}", path.display())),
+                    &Transitions::from(Error::Read { path, source: e }),
                 )
                 .await;
                 continue;
@@ -95,7 +157,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
                 journal,
                 name.as_ref(),
                 "mail",
-                &Error::Failed(format!("cannot remove {}: {e}", path.display())),
+                &Transitions::from(Error::Remove { path, source: e }),
             )
             .await;
         }
@@ -110,7 +172,7 @@ pub async fn run(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<
 /// dropped, because filing it would let the capsule skip the key page the
 /// applicant never saw. A message with no token, or one whose token names no live
 /// draft, has no address to answer: it is dropped.
-async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
+async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Transitions> {
     let message = Message::parse(raw);
     let blocks = pgp::labelled_blocks(&message.body);
     if blocks.is_empty() {
@@ -233,7 +295,7 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Error> {
         Ok(Some(mailed)) => mailed,
         // The token names no live draft: no address to answer.
         Ok(None) => return Ok(()),
-        Err(e) => return Err(Error::from(e)),
+        Err(e) => return Err(Transitions::from(e)),
     };
     match mailed.outcome {
         // No address page yet: there is no recorded address to answer, and the
@@ -279,7 +341,7 @@ async fn reply_or_drop(
     store: &Store,
     to: Option<&str>,
     body: &str,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     match to {
         Some(to) => reply(cfg, store, to, body).await,
         None => Ok(()),
@@ -417,8 +479,12 @@ fn name_in_label(label: &str, name: &str, domain: &str) -> bool {
 /// Send one reply unless this sender already had one today. The timestamp is
 /// written before the enqueuer runs, so a crash or a failed send cannot produce
 /// a second reply on the next pass.
-async fn reply(cfg: &DrainConfig, store: &Store, sender: &str, body: &str) -> Result<(), Error> {
-    let path = store.path("mail/replies.json");
+async fn reply(
+    cfg: &DrainConfig,
+    store: &Store,
+    sender: &str,
+    body: &str,
+) -> Result<(), Transitions> {
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let mut sent: BTreeMap<String, i64> = match store.mail_replies_text().await? {
         Some(text) => serde_json::from_str(&text).unwrap_or_default(),
@@ -429,17 +495,17 @@ async fn reply(cfg: &DrainConfig, store: &Store, sender: &str, body: &str) -> Re
         return Ok(());
     }
     sent.insert(sender.to_string(), now);
-    let bytes = serde_json::to_vec_pretty(&sent).map_err(|source| Error::Json {
+    let bytes = serde_json::to_vec_pretty(&sent).map_err(|source| Transitions::Json {
         context: "encode the reply log",
         source,
     })?;
     store
         .write_mail_replies(&bytes)
         .await
-        .map_err(|e| Error::context(format!("cannot write {}", path.display()), e))?;
+        .map_err(Transitions::from)?;
     notice::enqueue(cfg, sender, REPLY_SUBJECT, body)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 fn missing_body(missing: &[String]) -> String {
@@ -617,19 +683,28 @@ const MAX_REPORT_BYTES: u64 = 256 * 1024;
 /// same reason. A read, store or latch failure keeps its file and sets the
 /// returned flag to `false`, so the caller skips the deletion sweep this pass
 /// and retries rather than settling on a state it could not write.
-pub async fn bounces(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<bool, Error> {
+pub async fn bounces(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<bool, Transitions> {
     let dir = std::path::Path::new(&cfg.bounce_dir);
     let mut settled = true;
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(e) => return Err(Error::context(format!("cannot read {}", dir.display()), e)),
+        Err(e) => {
+            return Err(Error::Read {
+                path: dir.to_path_buf(),
+                source: e,
+            }
+            .into())
+        }
     };
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| Error::context(format!("cannot read {}", dir.display()), e))?
-    {
+    while let Some(entry) = entries.next_entry().await.map_err(|source| Error::Read {
+        path: dir.to_path_buf(),
+        source,
+    })? {
         let path = entry.path();
         if !entry.file_type().await.is_ok_and(|t| t.is_file()) {
             continue;
@@ -648,7 +723,7 @@ pub async fn bounces(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Res
                     journal,
                     name.as_ref(),
                     "mail",
-                    &Error::Failed(format!("cannot read {}: {e}", path.display())),
+                    &Transitions::from(Error::Read { path, source: e }),
                 )
                 .await;
                 settled = false;
@@ -685,14 +760,12 @@ pub async fn bounces(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Res
                                         journal,
                                         &format!("notice-{username}"),
                                         "notice",
-                                        &Error::Failed(format!(
-                                            "a delivery report says no lifecycle notice reached \
-                                             {username}: notice {} to {} reported {}. The sweep \
-                                             continues; run `kyriakon-admin notice stop \
-                                             {username}` to hold the account if the address is \
-                                             dead.",
-                                            failed.id, failed.to, status
-                                        )),
+                                        &Transitions::from(Error::NoticeNeverReached {
+                                            username: username.clone(),
+                                            notice: failed.id,
+                                            to: failed.to,
+                                            status,
+                                        }),
                                     )
                                     .await;
                                 }
@@ -704,7 +777,7 @@ pub async fn bounces(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Res
                                         journal,
                                         name.as_ref(),
                                         "mail",
-                                        &Error::from(e),
+                                        &Transitions::from(e),
                                     )
                                     .await;
                                     file_settled = false;
@@ -718,7 +791,7 @@ pub async fn bounces(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Res
                                     journal,
                                     name.as_ref(),
                                     "mail",
-                                    &Error::from(e),
+                                    &Transitions::from(e),
                                 )
                                 .await;
                                 file_settled = false;
@@ -733,7 +806,7 @@ pub async fn bounces(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Res
                         journal,
                         name.as_ref(),
                         "mail",
-                        &Error::from(e),
+                        &Transitions::from(e),
                     )
                     .await;
                     file_settled = false;
@@ -753,7 +826,7 @@ pub async fn bounces(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Res
                 journal,
                 name.as_ref(),
                 "mail",
-                &Error::Failed(format!("cannot remove {}: {e}", path.display())),
+                &Transitions::from(Error::Remove { path, source: e }),
             )
             .await;
         }

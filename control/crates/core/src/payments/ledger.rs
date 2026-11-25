@@ -17,9 +17,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::Error;
 use crate::store::{Log, Store};
 use crate::util;
-use crate::Error;
 
 /// The one ledger of money movements.
 pub const PAYMENTS: &str = "ledger/payments.jsonl";
@@ -267,10 +267,9 @@ impl<'a> Ledger<'a> {
         // Every line on disk was written from a `json!` value, whose object is
         // sorted. Going through `Value` keeps the key order identical; a struct
         // serialised directly would write declaration order.
-        let value = serde_json::to_value(&line)
-            .map_err(|e| Error::context("cannot encode the ledger", e))?;
-        let encoded = serde_json::to_string(&value)
-            .map_err(|e| Error::context("cannot encode the ledger", e))?;
+        let value = serde_json::to_value(&line).map_err(|source| Error::EncodeLedger { source })?;
+        let encoded =
+            serde_json::to_string(&value).map_err(|source| Error::EncodeLedger { source })?;
         self.log
             .append_while_locked(&guard, encoded.as_bytes())
             .await?;
@@ -291,9 +290,7 @@ impl<'a> Ledger<'a> {
         for line in self.lines().await? {
             if line.token == token && line.kind == "payment" {
                 if line.amount_gbp.is_none() {
-                    return Err(Error::Failed(
-                        "a payment line carries no amount".to_string(),
-                    ));
+                    return Err(Error::PaymentLineNoAmount);
                 }
                 found = Some(line);
             }
@@ -324,17 +321,15 @@ impl<'a> Ledger<'a> {
             if line.refund_of() != Some(original) {
                 continue;
             }
-            let text = line.amount_gbp.as_deref().ok_or_else(|| {
-                Error::Failed(format!(
-                    "the refund at ledger seq {} has no amount",
-                    line.seq
-                ))
-            })?;
-            let pence = util::pence(text.strip_prefix('-').unwrap_or(text)).map_err(|e| {
-                Error::context(
-                    format!("the refund at ledger seq {} cannot be read", line.seq),
-                    e,
-                )
+            let text = line
+                .amount_gbp
+                .as_deref()
+                .ok_or(Error::RefundNoAmount { seq: line.seq })?;
+            let pence = util::pence(text.strip_prefix('-').unwrap_or(text)).map_err(|source| {
+                Error::RefundUnreadable {
+                    seq: line.seq,
+                    source,
+                }
             })?;
             total += pence;
             lines.push(line);
@@ -450,15 +445,13 @@ impl<'a> Ledger<'a> {
             return Ok(Settlement::NotFound);
         };
         if line.token != token {
-            return Err(Error::Failed(format!(
-                "ledger seq {seq} belongs to another payment token"
-            )));
+            return Err(Error::ForeignToken { seq });
         }
         if line.kind != "refund" {
-            return Err(Error::Failed(format!(
-                "ledger seq {seq} is a {}, not a refund",
-                line.kind
-            )));
+            return Err(Error::NotRefund {
+                seq,
+                kind: line.kind.clone(),
+            });
         }
         if let Some(on) = line.settled_on() {
             return Ok(Settlement::AlreadySettled {
@@ -470,11 +463,11 @@ impl<'a> Ledger<'a> {
         // build does not model survive the rewrite. Its key order is what the
         // value held, not the order this struct would declare.
         let mut value: Value = serde_json::from_str(&lines[index])
-            .map_err(|e| Error::context("the refund line does not parse", e))?;
+            .map_err(|source| Error::RefundLineNotParsed { source })?;
         value["settled_on"] = serde_json::json!(on);
         value["settled_intent"] = serde_json::json!(intent);
-        lines[index] = serde_json::to_string(&value)
-            .map_err(|e| Error::context("cannot encode the ledger", e))?;
+        lines[index] =
+            serde_json::to_string(&value).map_err(|source| Error::EncodeLedger { source })?;
         let mut text = lines.join("\n");
         text.push('\n');
         self.store.rewrite_log(PAYMENTS, text.as_bytes()).await?;

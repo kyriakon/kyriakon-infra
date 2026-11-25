@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 
 use crate::flow::questions::{self, Kind, Question, Rule};
+use crate::flow::Reason;
 use crate::mail::{keycheck, pgp};
 use crate::util;
 
@@ -30,16 +31,16 @@ pub fn reason(
     value: &str,
     reserved: &HashSet<String>,
     required: bool,
-) -> Option<String> {
+) -> Option<Reason> {
     let v = value.trim();
     if v.is_empty() {
         if !required {
             return None;
         }
         return Some(if q.rule == Rule::Username {
-            "a username is needed".to_string()
+            Reason::UsernameRequired
         } else {
-            "this is needed".to_string()
+            Reason::Required
         });
     }
     // The answer's type is a rule of its own, and the one the form offers: a
@@ -48,15 +49,13 @@ pub fn reason(
     // here; the web form and the capsule both read this, so neither can file a
     // value the other refuses.
     if let Some(why) = match q.kind {
-        Kind::YesNo => (!matches!(v, "yes" | "no")).then(|| "answer yes or no".to_string()),
+        Kind::YesNo => (!matches!(v, "yes" | "no")).then_some(Reason::YesNo),
         // An optional acceptance is unticked by leaving it empty; a value the
         // page never offers is still refused, and says what the page does offer.
-        Kind::Acceptance => (v != "yes").then(|| {
-            if required {
-                "this has to be accepted".to_string()
-            } else {
-                "answer yes to accept, or leave it unticked".to_string()
-            }
+        Kind::Acceptance => (v != "yes").then_some(if required {
+            Reason::AcceptanceRequired
+        } else {
+            Reason::AcceptanceOptional
         }),
         _ => None,
     } {
@@ -74,12 +73,24 @@ pub fn reason(
         // the key. The one advisory that proceeds is the parser-gap warning,
         // where `inspected` is false and a person checks the key instead.
         Rule::MailKey => match pgp::public_key(v) {
-            Err(e) => Some(e.to_string()),
-            Ok(checked) => checked.refusal().map(str::to_string),
+            Err(source) => Some(Reason::KeyUnusable {
+                source: Box::new(source),
+            }),
+            Ok(checked) => checked.refusal().map(|verdict| Reason::KeyRefused {
+                verdict: verdict.to_string(),
+            }),
         },
-        Rule::UploadKey => keycheck::openssh_public_key(v).err().map(|e| e.to_string()),
+        Rule::UploadKey => {
+            keycheck::openssh_public_key(v)
+                .err()
+                .map(|source| Reason::KeyUnusable {
+                    source: Box::new(source),
+                })
+        }
         Rule::Choice(opts) => choice(opts, v),
-        Rule::MaxLen(n) => (v.chars().count() > *n).then(|| format!("at most {n} characters")),
+        Rule::MaxLen(limit) => {
+            (v.chars().count() > *limit).then_some(Reason::MaxLength { limit: *limit })
+        }
         // The raw value, not the trimmed one: a trailing newline would be cut
         // by `trim` and land on the record anyway. The capsule prints this
         // answer as gemtext, where a line break starts a line of its own. The
@@ -87,10 +98,11 @@ pub fn reason(
         // repeat it.
         Rule::SingleLine => {
             if !printable(value) {
-                Some("one line, without control or invisible characters".to_string())
+                Some(Reason::SingleLineControl)
             } else {
-                (value.chars().count() > SINGLE_LINE_MAX)
-                    .then(|| format!("at most {SINGLE_LINE_MAX} characters"))
+                (value.chars().count() > SINGLE_LINE_MAX).then_some(Reason::MaxLength {
+                    limit: SINGLE_LINE_MAX,
+                })
             }
         }
     }
@@ -108,7 +120,7 @@ fn printable(text: &str) -> bool {
 /// A tab survives too, because an address line may separate `alias` from its
 /// target with one and [`util::clean_body`] keeps it. Every other character has
 /// to survive [`util::clean`] unchanged.
-fn free_text(kind: Kind, value: &str) -> Option<String> {
+fn free_text(kind: Kind, value: &str) -> Option<Reason> {
     let mut chars = value.chars().peekable();
     while let Some(c) = chars.next() {
         if kind.is_list()
@@ -117,7 +129,7 @@ fn free_text(kind: Kind, value: &str) -> Option<String> {
             continue;
         }
         if !util::terminal_safe(c) {
-            return Some("without control or invisible characters".to_string());
+            return Some(Reason::FreeTextControl);
         }
     }
     None
@@ -126,35 +138,33 @@ fn free_text(kind: Kind, value: &str) -> Option<String> {
 /// The username rule: the single DNS label `scripts/add-user.sh` enforces, 1-31
 /// characters of lowercase letters, digits and interior hyphens, and not a
 /// reserved name. Never whether it exists.
-pub fn username(value: &str, reserved: &HashSet<String>) -> Option<String> {
+pub fn username(value: &str, reserved: &HashSet<String>) -> Option<Reason> {
     if let Some(why) = username_shape(value) {
         return Some(why);
     }
-    reserved
-        .contains(value)
-        .then(|| "that name is held back by the platform".to_string())
+    reserved.contains(value).then_some(Reason::UsernameHeld)
 }
 
 /// The charset and length a username must fit, without the reserved set. The
 /// body's own addresses live on its own domain, so the platform's reserved
 /// names do not apply to them, but the shape does.
-pub fn username_shape(value: &str) -> Option<String> {
+pub fn username_shape(value: &str) -> Option<Reason> {
     if value.is_empty() {
-        return Some("a username is needed".to_string());
+        return Some(Reason::UsernameRequired);
     }
     if value.chars().count() > 31 {
-        return Some("a username is at most 31 characters".to_string());
+        return Some(Reason::UsernameTooLong { limit: 31 });
     }
     let bytes = value.as_bytes();
     let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     if !alnum(bytes[0]) {
-        return Some("a username starts with a lowercase letter or a digit".to_string());
+        return Some(Reason::UsernameFirst);
     }
     if !bytes.iter().all(|&b| alnum(b) || b == b'-') {
-        return Some("a username is lowercase letters, digits and hyphen".to_string());
+        return Some(Reason::UsernameCharset);
     }
     if !alnum(bytes[bytes.len() - 1]) {
-        return Some("a username ends with a lowercase letter or a digit".to_string());
+        return Some(Reason::UsernameLast);
     }
     None
 }
@@ -162,14 +172,19 @@ pub fn username_shape(value: &str) -> Option<String> {
 /// Every non-empty line is checked exactly as the single username is, reserved
 /// set included, and the refusal names the offending line: these lines become OS
 /// account names, created as root by the drain.
-pub fn usernames(value: &str, reserved: &HashSet<String>) -> Option<String> {
+pub fn usernames(value: &str, reserved: &HashSet<String>) -> Option<Reason> {
     let mut seen = HashSet::new();
     for line in value.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if !seen.insert(line) {
-            return Some(format!("the name {line:?} is given twice"));
+            return Some(Reason::UsernameTwice {
+                name: line.to_string(),
+            });
         }
-        if let Some(why) = username(line, reserved) {
-            return Some(format!("the name {line:?}: {why}"));
+        if let Some(source) = username(line, reserved) {
+            return Some(Reason::UsernameNamed {
+                name: line.to_string(),
+                source: Box::new(source),
+            });
         }
     }
     None
@@ -186,41 +201,41 @@ pub fn usernames(value: &str, reserved: &HashSet<String>) -> Option<String> {
 /// drain writes this rule's answers into that table, so the two must accept the
 /// same names: a name accepted here and refused there fails the render and every
 /// later transition that reloads smtpd.
-pub fn domain(value: &str) -> Option<String> {
+pub fn domain(value: &str) -> Option<Reason> {
     if value.len() > 253 {
-        return Some("a domain is at most 253 characters".to_string());
+        return Some(Reason::DomainTooLong { limit: 253 });
     }
     for label in value.split('.') {
         if label.is_empty() {
-            return Some("a domain has no empty labels".to_string());
+            return Some(Reason::DomainEmptyLabel);
         }
         if label.len() > 63 {
-            return Some("a domain label is at most 63 characters".to_string());
+            return Some(Reason::DomainLabelTooLong { limit: 63 });
         }
         if !label
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         {
-            return Some(format!(
-                "the domain label {label:?} is not lowercase letters, digits and hyphen"
-            ));
+            return Some(Reason::DomainLabelCharset {
+                label: label.to_string(),
+            });
         }
         if label.starts_with('-') || label.ends_with('-') {
-            return Some(format!(
-                "the domain label {label:?} begins or ends with a hyphen"
-            ));
+            return Some(Reason::DomainLabelHyphen {
+                label: label.to_string(),
+            });
         }
     }
     if value.split('.').count() < 2 {
-        return Some("a domain has at least two labels, like theirparish.example".to_string());
+        return Some(Reason::DomainTooFewLabels);
     }
     // A numeric or hyphenated top-level label is a real DNS name but not a
     // registrable domain, and the DKIM list will not take it.
     let tld = value.rsplit('.').next().unwrap_or_default();
     if tld.len() < 2 || !tld.bytes().all(|b| b.is_ascii_lowercase()) {
-        return Some(format!(
-            "the domain's last label {tld:?} must be two or more letters, like theirparish.example"
-        ));
+        return Some(Reason::DomainLastLabel {
+            label: tld.to_string(),
+        });
     }
     None
 }
@@ -228,25 +243,22 @@ pub fn domain(value: &str) -> Option<String> {
 /// The localpart of an own-domain address, the key written before `@` in the
 /// virtual table. It is not an account name, a keyring filename or a DNS label,
 /// so it keeps the wider address charset and the 32 character bound.
-pub fn address_localpart_shape(value: &str) -> Option<String> {
+pub fn address_localpart_shape(value: &str) -> Option<Reason> {
     if value.is_empty() {
-        return Some("an address localpart is needed".to_string());
+        return Some(Reason::LocalpartRequired);
     }
     if value.chars().count() > 32 {
-        return Some("an address localpart is at most 32 characters".to_string());
+        return Some(Reason::LocalpartTooLong { limit: 32 });
     }
     let first = value.as_bytes()[0];
     if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
-        return Some("an address localpart starts with a lowercase letter or a digit".to_string());
+        return Some(Reason::LocalpartFirst);
     }
     if !value
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
     {
-        return Some(
-            "an address localpart is lowercase letters, digits, dot, underscore and hyphen"
-                .to_string(),
-        );
+        return Some(Reason::LocalpartCharset);
     }
     None
 }
@@ -254,14 +266,14 @@ pub fn address_localpart_shape(value: &str) -> Option<String> {
 /// The body's addresses, one per line, each `localpart: own` or
 /// `localpart: alias localpart`, at most ten. The localpart is an address on the
 /// body's own domain, not an account name, so dots and underscores stay legal.
-pub fn address_lines(value: &str) -> Option<String> {
+pub fn address_lines(value: &str) -> Option<Reason> {
     let lines: Vec<&str> = value
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
     if lines.len() > 10 {
-        return Some(format!("up to ten addresses, {} given", lines.len()));
+        return Some(Reason::AddressLinesTooMany { count: lines.len() });
     }
     for line in lines {
         if let Some(why) = address_line(line) {
@@ -282,23 +294,30 @@ pub fn alias_target(rest: &str) -> Option<&str> {
     }
 }
 
-fn address_line(line: &str) -> Option<String> {
-    let malformed =
-        || format!("the address line {line:?} is not localpart: own or localpart: alias localpart");
+fn address_line(line: &str) -> Option<Reason> {
+    let malformed = || Reason::AddressLineMalformed {
+        line: line.to_string(),
+    };
     let (local, rest) = match line.split_once(':') {
         Some(parts) => parts,
         None => return Some(malformed()),
     };
     let (local, rest) = (local.trim(), rest.trim());
-    if let Some(why) = address_localpart_shape(local) {
-        return Some(format!("the address line {line:?}: {why}"));
+    if let Some(source) = address_localpart_shape(local) {
+        return Some(Reason::AddressLineNamed {
+            line: line.to_string(),
+            source: Box::new(source),
+        });
     }
     if rest == "own" {
         return None;
     }
     match alias_target(rest) {
-        Some(target) => address_localpart_shape(target)
-            .map(|why| format!("the address line {line:?}: the alias target {target:?} {why}")),
+        Some(target) => address_localpart_shape(target).map(|source| Reason::AddressLineTarget {
+            line: line.to_string(),
+            target: target.to_string(),
+            source: Box::new(source),
+        }),
         None => Some(malformed()),
     }
 }
@@ -309,7 +328,7 @@ fn address_line(line: &str) -> Option<String> {
 /// that reason, so the rule lives here once instead of twice: whitespace, a
 /// control character, a comma and the address-list punctuation are refused, in
 /// the local part as much as the domain.
-pub fn address(v: &str) -> Option<String> {
+pub fn address(v: &str) -> Option<Reason> {
     let mut parts = v.split('@');
     let (local, domain) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let punctuation = |c: char| {
@@ -320,16 +339,14 @@ pub fn address(v: &str) -> Option<String> {
         && parts.next().is_none()
         && domain.contains('.')
         && !v.chars().any(punctuation);
-    (!acceptable).then(|| {
-        "an address outside this platform is one, like someone@example.invalid".to_string()
-    })
+    (!acceptable).then_some(Reason::OutsideAddress)
 }
 
-fn choice(opts: &[questions::Choice], v: &str) -> Option<String> {
+fn choice(opts: &[questions::Choice], v: &str) -> Option<Reason> {
     if opts.iter().any(|o| o.value == v) {
         None
     } else {
-        Some("choose one of the answers offered".to_string())
+        Some(Reason::ChoiceNotOffered)
     }
 }
 
@@ -354,14 +371,16 @@ mod tests {
     #[test]
     fn a_username_outside_the_charset_is_refused_with_its_reason() {
         let r = name();
-        assert!(username("Upper", &r).unwrap().contains("starts with"));
-        assert!(username("bad_name!", &r)
-            .unwrap()
-            .contains("digits and hyphen"));
-        assert!(username("bad.name", &r)
-            .unwrap()
-            .contains("digits and hyphen"));
-        assert!(username("bad-", &r).unwrap().contains("ends with"));
+        assert!(matches!(username("Upper", &r), Some(Reason::UsernameFirst)));
+        assert!(matches!(
+            username("bad_name!", &r),
+            Some(Reason::UsernameCharset)
+        ));
+        assert!(matches!(
+            username("bad.name", &r),
+            Some(Reason::UsernameCharset)
+        ));
+        assert!(matches!(username("bad-", &r), Some(Reason::UsernameLast)));
     }
 
     #[test]
@@ -378,13 +397,19 @@ mod tests {
         for value in ["", "a.b", "a_b", "a-", "-a", thirty_two.as_str()] {
             assert!(username(value, &r).is_some(), "{value}");
         }
-        assert!(username(&thirty_two, &r).unwrap().contains("at most 31"));
+        assert!(matches!(
+            username(&thirty_two, &r),
+            Some(Reason::UsernameTooLong { limit: 31 })
+        ));
         assert!(username(&thirty_one, &r).is_none());
     }
 
     #[test]
     fn a_reserved_username_is_refused_with_its_reason() {
-        assert!(username("mail", &name()).unwrap().contains("held back"));
+        assert!(matches!(
+            username("mail", &name()),
+            Some(Reason::UsernameHeld)
+        ));
         assert!(username("theophilus", &name()).is_none());
     }
 
@@ -437,7 +462,7 @@ mod tests {
         assert!(reason(&q, "Parish of Example", &name(), true).is_none());
         let why = reason(&q, "Parish\n=> https://evil.example/", &name(), true)
             .expect("a newline is refused");
-        assert_eq!(why, "one line, without control or invisible characters");
+        assert!(matches!(why, Reason::SingleLineControl));
         for hostile in [
             "Parish\rX",
             "Parish\u{1b}X",
@@ -454,10 +479,12 @@ mod tests {
         assert!(reason(&q, &at_bound, &name(), true).is_none());
         let over = "a".repeat(SINGLE_LINE_MAX + 1);
         let why = reason(&q, &over, &name(), true).expect("one over the bound is refused");
-        assert!(
-            why.contains(&format!("at most {SINGLE_LINE_MAX} characters")),
-            "{why}"
-        );
+        assert!(matches!(
+            why,
+            Reason::MaxLength {
+                limit: SINGLE_LINE_MAX
+            }
+        ));
     }
 
     /// A free-text rule is not a hole in the escaping rules: an escape, a
@@ -544,11 +571,15 @@ mod tests {
             rule: Rule::MailKey,
         };
         assert!(reason(&q, CLEAN, &name(), true).is_none());
-        assert!(reason(&q, AEAD, &name(), true).unwrap().contains("AEAD"));
+        assert!(matches!(
+            reason(&q, AEAD, &name(), true),
+            Some(Reason::KeyRefused { verdict }) if verdict.contains("AEAD")
+        ));
         assert!(reason(&q, EXPIRED_SUBKEY, &name(), true).is_some());
-        assert!(reason(&q, NO_ENCRYPTION, &name(), true)
-            .unwrap()
-            .contains("encryption-capable"));
+        assert!(matches!(
+            reason(&q, NO_ENCRYPTION, &name(), true),
+            Some(Reason::KeyRefused { verdict }) if verdict.contains("encryption-capable")
+        ));
     }
 
     #[test]
@@ -580,9 +611,10 @@ mod tests {
         };
         assert!(reason(&yesno, "yes", &name(), true).is_none());
         assert!(reason(&yesno, "no", &name(), true).is_none());
-        assert!(reason(&yesno, "maybe", &name(), true)
-            .unwrap()
-            .contains("answer yes or no"));
+        assert!(matches!(
+            reason(&yesno, "maybe", &name(), true),
+            Some(Reason::YesNo)
+        ));
         // An empty value is the `required` question's, not the type's.
         assert!(reason(&yesno, "", &name(), false).is_none());
 
@@ -595,9 +627,10 @@ mod tests {
             rule: Rule::None,
         };
         assert!(reason(&acceptance, "yes", &name(), true).is_none());
-        assert!(reason(&acceptance, "no", &name(), true)
-            .unwrap()
-            .contains("this has to be accepted"));
+        assert!(matches!(
+            reason(&acceptance, "no", &name(), true),
+            Some(Reason::AcceptanceRequired)
+        ));
     }
 
     #[test]
@@ -619,13 +652,25 @@ mod tests {
     fn a_domain_is_a_dotted_hostname_and_each_refusal_names_its_reason() {
         assert!(domain("theirparish.example").is_none());
         assert!(domain("a-b.c-d.example").is_none());
-        assert!(domain("foo").unwrap().contains("at least two labels"));
-        assert!(domain("Foo.example").unwrap().contains("not lowercase"));
-        assert!(domain("-foo.example").unwrap().contains("begins or ends"));
-        assert!(domain("foo-.example").unwrap().contains("begins or ends"));
-        assert!(domain("a..b").unwrap().contains("empty labels"));
+        assert!(matches!(domain("foo"), Some(Reason::DomainTooFewLabels)));
+        assert!(matches!(
+            domain("Foo.example"),
+            Some(Reason::DomainLabelCharset { .. })
+        ));
+        assert!(matches!(
+            domain("-foo.example"),
+            Some(Reason::DomainLabelHyphen { .. })
+        ));
+        assert!(matches!(
+            domain("foo-.example"),
+            Some(Reason::DomainLabelHyphen { .. })
+        ));
+        assert!(matches!(domain("a..b"), Some(Reason::DomainEmptyLabel)));
         let long = format!("{}.example", "a".repeat(64));
-        assert!(domain(&long).unwrap().contains("at most 63"));
+        assert!(matches!(
+            domain(&long),
+            Some(Reason::DomainLabelTooLong { limit: 63 })
+        ));
         // The traversal a group key must never take.
         assert!(domain("../../../etc/cron.d/evil").is_some());
     }
@@ -646,8 +691,11 @@ mod tests {
             assert!(domain(good).is_none(), "{good}: {:?}", domain(good));
         }
         for bad in ["parish.12", "parish.ab-c", "parish.ex4mple", "parish.x"] {
-            let why = domain(bad).unwrap_or_default();
-            assert!(why.contains("last label"), "{bad}: {why}");
+            assert!(
+                matches!(domain(bad), Some(Reason::DomainLastLabel { .. })),
+                "{bad}: {:?}",
+                domain(bad)
+            );
         }
     }
 
@@ -673,7 +721,10 @@ mod tests {
         ]
         .join(".");
         assert_eq!(too_long.len(), 259);
-        assert!(domain(&too_long).unwrap().contains("at most 253"));
+        assert!(matches!(
+            domain(&too_long),
+            Some(Reason::DomainTooLong { limit: 253 })
+        ));
         let one_over = [
             "a".repeat(63),
             "a".repeat(63),
@@ -682,25 +733,34 @@ mod tests {
         ]
         .join(".");
         assert_eq!(one_over.len(), 254);
-        assert!(domain(&one_over).unwrap().contains("at most 253"));
+        assert!(matches!(
+            domain(&one_over),
+            Some(Reason::DomainTooLong { limit: 253 })
+        ));
     }
 
     #[test]
     fn every_line_of_a_username_list_is_checked_and_the_line_is_named() {
         let r = name();
         assert!(usernames("secretary\nhall\n", &r).is_none());
-        let why = usernames("secretary\nBad_Name", &r).unwrap();
-        assert!(why.contains("Bad_Name"), "{why}");
-        assert!(why.contains("starts with"), "{why}");
-        let why = usernames("mail", &r).unwrap();
-        assert!(why.contains("held back"), "{why}");
+        assert!(matches!(
+            usernames("secretary\nBad_Name", &r),
+            Some(Reason::UsernameNamed { name, source })
+                if name == "Bad_Name" && matches!(*source, Reason::UsernameFirst)
+        ));
+        assert!(matches!(
+            usernames("mail", &r),
+            Some(Reason::UsernameNamed { name, source })
+                if name == "mail" && matches!(*source, Reason::UsernameHeld)
+        ));
     }
 
     #[test]
     fn a_duplicate_account_name_is_refused_and_the_name_is_in_the_refusal() {
-        let why = usernames("secretary\nhall\nhall", &name()).unwrap();
-        assert!(why.contains("hall"), "{why}");
-        assert!(why.contains("twice"), "{why}");
+        assert!(matches!(
+            usernames("secretary\nhall\nhall", &name()),
+            Some(Reason::UsernameTwice { name }) if name == "hall"
+        ));
     }
 
     #[test]
@@ -715,22 +775,34 @@ mod tests {
         assert!(address_lines("first.last: own\nhall: alias first.last").is_none());
         assert!(address_lines("first_last: own").is_none());
         assert!(address_lines("secretary: own").is_none());
-        assert!(address_lines("secretary")
-            .unwrap()
-            .contains("not localpart: own"));
-        assert!(address_lines("Bad_Name: own").unwrap().contains("Bad_Name"));
-        assert!(address_lines("hall: alias Bad Target")
-            .unwrap()
-            .contains("Bad Target"));
-        assert!(address_lines("hall: alias")
-            .unwrap()
-            .contains("not localpart: own"));
-        assert!(address_lines("hall: shared secretary")
-            .unwrap()
-            .contains("not localpart: own"));
+        assert!(matches!(
+            address_lines("secretary"),
+            Some(Reason::AddressLineMalformed { .. })
+        ));
+        assert!(matches!(
+            address_lines("Bad_Name: own"),
+            Some(Reason::AddressLineNamed { line, .. }) if line == "Bad_Name: own"
+        ));
+        assert!(matches!(
+            address_lines("hall: alias Bad Target"),
+            Some(Reason::AddressLineMalformed { line }) if line == "hall: alias Bad Target"
+        ));
+        assert!(matches!(
+            address_lines("hall: alias Bad_Name"),
+            Some(Reason::AddressLineTarget { target, .. }) if target == "Bad_Name"
+        ));
+        assert!(matches!(
+            address_lines("hall: alias"),
+            Some(Reason::AddressLineMalformed { .. })
+        ));
+        assert!(matches!(
+            address_lines("hall: shared secretary"),
+            Some(Reason::AddressLineMalformed { .. })
+        ));
         let eleven: Vec<String> = (0..11).map(|i| format!("a{i}: own")).collect();
-        assert!(address_lines(&eleven.join("\n"))
-            .unwrap()
-            .contains("up to ten"));
+        assert!(matches!(
+            address_lines(&eleven.join("\n")),
+            Some(Reason::AddressLinesTooMany { count: 11 })
+        ));
     }
 }

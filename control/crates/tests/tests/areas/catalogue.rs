@@ -4,9 +4,8 @@
 //! The check lives in the acceptance suite, not in `flow`, because it is the one
 //! place that joins the shared catalogue to the handler's three renderers.
 
-use kyriakon_control_core::flow::catalogue::{
-    parse, row, Action, Job, Protocol, Row, Service, TRACKED,
-};
+use kyriakon_control_core::flow;
+use kyriakon_control_core::flow::catalogue::{parse, row, Action, Job, Protocol, Row, Service};
 use kyriakon_control_handler::{capsule, page};
 use kyriakon_control_tui as tui;
 
@@ -48,24 +47,46 @@ fn renderings(list: &[Service], member: Option<&str>) -> Vec<(&'static str, Vec<
     ]
 }
 
+/// A disagreement between the file and a front-end's rendering.
+///
+/// The fields are read by the derived `Debug` failure message when a test
+/// unwraps, not by the check itself.
+#[allow(dead_code)]
+#[derive(Debug)]
+enum Mismatch {
+    /// The file did not parse.
+    Catalogue(flow::Error),
+    /// The file carries no services at all.
+    NoServices,
+    /// A rendering has the wrong entries.
+    Count {
+        front_end: &'static str,
+        missing: Vec<String>,
+        invented: Vec<String>,
+    },
+    /// A rendering orders the entries differently.
+    Order {
+        front_end: &'static str,
+        shown: String,
+        expected: String,
+    },
+    /// A rendering shows an entry's values other than as the file has them.
+    Content { front_end: &'static str, id: String },
+}
+
 /// The check the spec asks for, on the file's own text: every entry the file
 /// carries appears in every rendering that exists, compared as rows, and no
 /// rendering shows one the file does not.
-fn check(text: &str, member: Option<&str>) -> Result<(), kyriakon_control_core::Error> {
-    let list = parse(text)?;
+fn check(text: &str, member: Option<&str>) -> Result<(), Mismatch> {
+    let list = parse(text).map_err(Mismatch::Catalogue)?;
     if list.is_empty() {
-        return Err(kyriakon_control_core::Error::Failed(format!(
-            "{TRACKED} has no services"
-        )));
+        return Err(Mismatch::NoServices);
     }
     compare(&list, &renderings(&list, member))
 }
 
 /// Compare what each front-end shows against the file it was rendered from.
-fn compare(
-    list: &[Service],
-    rendered: &[(&str, Vec<Row>)],
-) -> Result<(), kyriakon_control_core::Error> {
+fn compare(list: &[Service], rendered: &[(&'static str, Vec<Row>)]) -> Result<(), Mismatch> {
     for (front_end, rows) in rendered {
         if rows.len() != list.len() {
             let missing: Vec<&str> = list
@@ -78,28 +99,29 @@ fn compare(
                 .filter(|r| !list.iter().any(|s| s.id == r.id))
                 .map(|r| r.id.as_str())
                 .collect();
-            return Err(kyriakon_control_core::Error::Failed(format!(
-                "{front_end} shows {} entries where {TRACKED} carries {}: missing {missing:?}, invented {invented:?}",
-                rows.len(),
-                list.len()
-            )));
+            return Err(Mismatch::Count {
+                front_end,
+                missing: missing.into_iter().map(str::to_string).collect(),
+                invented: invented.into_iter().map(str::to_string).collect(),
+            });
         }
         for (s, r) in list.iter().zip(rows) {
             if r.id != s.id {
-                return Err(kyriakon_control_core::Error::Failed(format!(
-                    "{front_end} shows {:?} where {TRACKED} has {:?}: the file's order is the display order",
-                    r.id, s.id
-                )));
+                return Err(Mismatch::Order {
+                    front_end,
+                    shown: r.id.clone(),
+                    expected: s.id.clone(),
+                });
             }
             if r.name != s.name
                 || r.summary != s.summary
                 || r.state != s.state.word()
                 || r.action != s.action.word()
             {
-                return Err(kyriakon_control_core::Error::Failed(format!(
-                    "{front_end} shows {:?} other than as {TRACKED} has it, so the rendering is not the file",
-                    s.id
-                )));
+                return Err(Mismatch::Content {
+                    front_end,
+                    id: s.id.clone(),
+                });
             }
         }
     }
@@ -121,8 +143,15 @@ fn a_renderer_that_drops_an_entry_is_caught() {
     rows[1].1.retain(|r| r.id != "shop");
     let e = compare(&list, &rows).unwrap_err();
     assert!(
-        matches!(&e, kyriakon_control_core::Error::Failed(message) if message.contains("the account page") && message.contains("shop")),
-        "{e}"
+        matches!(
+            e,
+            Mismatch::Count {
+                front_end: "the account page",
+                ref missing,
+                ..
+            } if missing.iter().any(|id| id == "shop")
+        ),
+        "{e:?}"
     );
 }
 
@@ -136,8 +165,15 @@ fn a_renderer_that_invents_an_entry_is_caught() {
     rows[2].1.push(invented);
     let e = compare(&list, &rows).unwrap_err();
     assert!(
-        matches!(&e, kyriakon_control_core::Error::Failed(message) if message.contains("the capsule") && message.contains("newsletter")),
-        "{e}"
+        matches!(
+            e,
+            Mismatch::Count {
+                front_end: "the capsule",
+                ref invented,
+                ..
+            } if invented.iter().any(|id| id == "newsletter")
+        ),
+        "{e:?}"
     );
 }
 
@@ -163,19 +199,27 @@ fn every_renderer_follows_a_fixture_rather_than_a_list_of_its_own() {
     let ignoring = renderings(&shipped, None);
     let e = compare(&fixture, &ignoring).unwrap_err();
     assert!(
-        matches!(&e, kyriakon_control_core::Error::Failed(message) if message.contains("orchard")),
-        "{e}"
+        matches!(
+            e,
+            Mismatch::Count { ref missing, .. } if missing.iter().any(|id| id == "orchard")
+        ),
+        "{e:?}"
     );
 
     // And a value the crate has no word for fails the check on the text,
     // before any rendering is built.
     let soon = FIXTURE.replace("state = \"planned\"", "state = \"soon\"");
-    let e = check(&soon, None).unwrap_err();
+    let e = parse(&soon).unwrap_err();
     assert!(
-        matches!(&e, kyriakon_control_core::Error::Context { .. }),
+        matches!(
+            &e,
+            kyriakon_control_core::flow::Error::Service { source, .. } if matches!(
+                source.as_ref(),
+                kyriakon_control_core::flow::Error::UnknownState { value } if value == "soon"
+            )
+        ),
         "{e}"
     );
-    assert!(e.to_string().contains("soon"), "{e}");
 }
 
 /// The terminal's menu is one of the renderings the check compares. That the

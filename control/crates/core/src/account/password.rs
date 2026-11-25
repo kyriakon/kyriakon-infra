@@ -9,7 +9,7 @@
 //! which reads a `$2b$` hash, and the cost is the crate's default for that
 //! format.
 
-use crate::Error;
+use super::Error;
 use bcrypt::{hash, verify, DEFAULT_COST};
 
 /// The shortest password accepted. Twelve is what four common words reach
@@ -25,20 +25,20 @@ const MAX_LEN: usize = 72;
 pub fn validate(plain: &str) -> Result<(), Error> {
     let len = plain.chars().count();
     if len < MIN_LEN {
-        return Err(Error::Failed(format!("Use at least {MIN_LEN} characters.")));
+        return Err(Error::PasswordTooShort { min: MIN_LEN });
     }
     if plain.len() > MAX_LEN {
-        return Err(Error::Failed(format!("Use at most {MAX_LEN} characters.")));
+        return Err(Error::PasswordTooLong { max: MAX_LEN });
     }
     if plain.chars().any(char::is_control) {
-        return Err(Error::Failed("Use printable characters only.".to_string()));
+        return Err(Error::PasswordControlCharacter);
     }
     Ok(())
 }
 
 /// The hash the store keeps.
 pub fn make(plain: &str) -> Result<String, Error> {
-    hash(plain, DEFAULT_COST).map_err(|e| Error::context("cannot hash the password", e))
+    hash(plain, DEFAULT_COST).map_err(|source| Error::HashPassword { source })
 }
 
 /// Whether a stored hash is one this crate made. The drain checks the shape

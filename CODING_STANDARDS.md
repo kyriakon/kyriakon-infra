@@ -53,17 +53,33 @@ completing a recorded one.
 ## Errors and outcomes
 
 An outcome a caller branches on is an enum whose variants are the outcomes:
-`Settlement`, `Resolution`, `Refusal`, `Reply`. The names are the decision, and a
-new outcome adds a variant rather than a fourth `if` on a string.
+`Settlement`, `Resolution`, `Refusal`, `Reply`. A new outcome adds a variant
+rather than an `if` on a string.
 
-`Error` is the other case: a failure that ends the request, carried to one place
-that decides the answer. It holds a message and its context, not a taxonomy. A
-variant earns its place only when some caller acts differently on it: the
-mapper's `Refused` and `Line` arms are never reached, because the two listeners
-that construct those variants answer in their own format, and nine of the
-handler's twelve variants land in one 500/40 mapping. Add a variant when the
-reply, the retry or the journal line changes; otherwise add the sentence to the
-message.
+A failure is an enum of named failure states. Each area owns its `error.rs`, its
+`Error` and its `Display`; the crate's public `Error` wraps the area enums, so a
+caller still matches one type:
+
+```rust
+pub enum Error {
+    Store(store::Error),
+    Config(config::Error),
+    Fastcgi(fastcgi::Error),
+}
+```
+
+Every distinct failure state gets a variant, even when no caller branches on it,
+because the variant is what a log line, a retry or a later caller reads. The
+fields carry the data the sentence needs: a path, a record name, a record type,
+a limit, a mode. `Display` composes the operator sentence from those fields and
+nothing else writes it. There is no `Failed(String)` and no `Refused(String)`. A
+`String` field is for free-form external text, such as a program's stderr or a
+gpg diagnostic, never for a sentence this code wrote. Do not call `format!` at a
+construction site.
+
+A variant that wraps a lower-level failure returns it from `source()`, so
+`util::report_lines` prints the chain. Wrap an `io`, `serde` or store error
+instead of flattening it into a sentence.
 
 A client-visible reply is built from a constant or a value that passed its
 validation, never from an internal error's `to_string()`. A `59` that carries

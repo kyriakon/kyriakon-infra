@@ -7,6 +7,10 @@
 //! after-line work and the file's disposition stay here. The retry schedule and
 //! the failure report are the other half of the same seam.
 
+use crate::mailbox;
+use crate::sandbox;
+use crate::usage;
+use crate::validation;
 use kyriakon_control_core::account::sign::Reviewed;
 use kyriakon_control_core::config::{self, DrainConfig};
 use kyriakon_control_core::mail::notice;
@@ -31,8 +35,18 @@ pub mod stripe;
 /// source, and a parse or encode failure that kept its context.
 #[derive(Debug)]
 pub enum Error {
-    /// A transition failed for a reason that is not one of the typed sources.
-    Failed(String),
+    /// A filed intent did not survive the drain's own revalidation.
+    Validation(validation::Error),
+    /// The mailbox spool failed; its error keeps the path and source.
+    Mailbox(mailbox::Error),
+    /// The pass's sandbox policy failed.
+    Sandbox(sandbox::Error),
+    /// A command line the binary cannot read.
+    Usage(usage::Error),
+    /// Card deliveries were left unapplied for the next pass.
+    Backlog { pending: usize },
+    /// The body of an intent the journal had already settled ran anyway.
+    BodyRanOnSettledIntent,
     /// The store failed; its error keeps the path and source.
     Store(store::Error),
     /// The drain's configuration failed.
@@ -41,6 +55,16 @@ pub enum Error {
     Script(boxrun::Error),
     /// A core read or parse failed.
     Core(kyriakon_control_core::Error),
+    /// A lifecycle transition failed.
+    Lifecycle(lifecycle::Error),
+    /// A review transition failed.
+    Review(review::Error),
+    /// A group transition failed.
+    Groups(groups::Error),
+    /// A card transition failed.
+    Stripe(stripe::Error),
+    /// A payments transition failed.
+    Payments(payments::Error),
     /// A JSON record did not encode or parse.
     Json {
         context: &'static str,
@@ -51,11 +75,26 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Failed(message) => f.write_str(message),
+            Error::Validation(error) => error.fmt(f),
+            Error::Mailbox(error) => error.fmt(f),
+            Error::Sandbox(error) => error.fmt(f),
+            Error::Usage(error) => error.fmt(f),
+            Error::Backlog { pending } => write!(
+                f,
+                "{pending} card deliveries remain unapplied and are retried on the next pass"
+            ),
+            Error::BodyRanOnSettledIntent => {
+                f.write_str("the body ran on an intent the journal had already settled")
+            }
             Error::Store(error) => error.fmt(f),
             Error::Config(error) => error.fmt(f),
             Error::Script(error) => error.fmt(f),
             Error::Core(error) => error.fmt(f),
+            Error::Lifecycle(error) => error.fmt(f),
+            Error::Review(error) => error.fmt(f),
+            Error::Groups(error) => error.fmt(f),
+            Error::Stripe(error) => error.fmt(f),
+            Error::Payments(error) => error.fmt(f),
             Error::Json { context, source } => write!(f, "cannot {context}: {source}"),
         }
     }
@@ -64,11 +103,20 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Failed(_) => None,
+            Error::Validation(error) => Some(error),
+            Error::Mailbox(error) => Some(error),
+            Error::Sandbox(error) => Some(error),
+            Error::Usage(error) => Some(error),
+            Error::Backlog { .. } | Error::BodyRanOnSettledIntent => None,
             Error::Store(error) => Some(error),
             Error::Config(error) => Some(error),
             Error::Script(error) => Some(error),
             Error::Core(error) => Some(error),
+            Error::Lifecycle(error) => Some(error),
+            Error::Review(error) => Some(error),
+            Error::Groups(error) => Some(error),
+            Error::Stripe(error) => Some(error),
+            Error::Payments(error) => Some(error),
             Error::Json { source, .. } => Some(source),
         }
     }
@@ -80,7 +128,7 @@ impl Error {
     }
 
     pub fn context(
-        context: impl Into<String>,
+        context: &'static str,
         source: impl Into<kyriakon_control_core::Source>,
     ) -> Self {
         Error::Core(kyriakon_control_core::Error::context(context, source))
@@ -90,6 +138,30 @@ impl Error {
 impl From<store::Error> for Error {
     fn from(error: store::Error) -> Self {
         Error::Store(error)
+    }
+}
+
+impl From<validation::Error> for Error {
+    fn from(error: validation::Error) -> Self {
+        Error::Validation(error)
+    }
+}
+
+impl From<mailbox::Error> for Error {
+    fn from(error: mailbox::Error) -> Self {
+        Error::Mailbox(error)
+    }
+}
+
+impl From<sandbox::Error> for Error {
+    fn from(error: sandbox::Error) -> Self {
+        Error::Sandbox(error)
+    }
+}
+
+impl From<usage::Error> for Error {
+    fn from(error: usage::Error) -> Self {
+        Error::Usage(error)
     }
 }
 
@@ -108,6 +180,72 @@ impl From<boxrun::Error> for Error {
 impl From<kyriakon_control_core::Error> for Error {
     fn from(error: kyriakon_control_core::Error) -> Self {
         Error::Core(error)
+    }
+}
+
+impl From<lifecycle::Error> for Error {
+    fn from(error: lifecycle::Error) -> Self {
+        Error::Lifecycle(error)
+    }
+}
+
+impl From<review::Error> for Error {
+    fn from(error: review::Error) -> Self {
+        Error::Review(error)
+    }
+}
+
+impl From<groups::Error> for Error {
+    fn from(error: groups::Error) -> Self {
+        Error::Groups(error)
+    }
+}
+
+impl From<stripe::Error> for Error {
+    fn from(error: stripe::Error) -> Self {
+        Error::Stripe(error)
+    }
+}
+
+impl From<payments::Error> for Error {
+    fn from(error: payments::Error) -> Self {
+        Error::Payments(error)
+    }
+}
+
+impl From<kyriakon_control_core::account::Error> for Error {
+    fn from(error: kyriakon_control_core::account::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Account(error))
+    }
+}
+impl From<kyriakon_control_core::flow::Error> for Error {
+    fn from(error: kyriakon_control_core::flow::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Flow(error))
+    }
+}
+impl From<kyriakon_control_core::intent::Error> for Error {
+    fn from(error: kyriakon_control_core::intent::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Intent(error))
+    }
+}
+impl From<kyriakon_control_core::ipc::Error> for Error {
+    fn from(error: kyriakon_control_core::ipc::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Ipc(error))
+    }
+}
+impl From<kyriakon_control_core::util::Error> for Error {
+    fn from(error: kyriakon_control_core::util::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Util(error))
+    }
+}
+impl From<kyriakon_control_core::mail::Error> for Error {
+    fn from(error: kyriakon_control_core::mail::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Mail(error))
+    }
+}
+impl From<kyriakon_control_core::payments::Error> for Error {
+    fn from(error: kyriakon_control_core::payments::Error) -> Self {
+        Error::Core(kyriakon_control_core::Error::Payments(error))
     }
 }
 
@@ -693,11 +831,7 @@ mod tests {
                     AfterLine::RemoveGroupRecord("parish.example".to_string()),
                     RefusalFile::Keep,
                 ),
-                async {
-                    Err(Error::Failed(
-                        "the body ran on a settled intent".to_string(),
-                    ))
-                },
+                async { Err(Error::BodyRanOnSettledIntent) },
             ))
             .unwrap();
 
@@ -756,11 +890,7 @@ mod tests {
                     &format!("{id}.json"),
                     &envelope,
                     Disposition::new(AfterLine::Nothing, refusal),
-                    async {
-                        Err(Error::Failed(
-                            "the body ran on a settled intent".to_string(),
-                        ))
-                    },
+                    async { Err(Error::BodyRanOnSettledIntent) },
                 ))
                 .unwrap();
             let left = dir.join(format!("store/intents/{id}.json"));
@@ -878,11 +1008,7 @@ mod tests {
                     },
                     RefusalFile::Keep,
                 ),
-                async {
-                    Err(Error::Failed(
-                        "the body ran on a settled intent".to_string(),
-                    ))
-                },
+                async { Err(Error::BodyRanOnSettledIntent) },
             ))
             .unwrap();
 

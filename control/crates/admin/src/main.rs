@@ -118,7 +118,7 @@ async fn main() -> ExitCode {
             match args.next() {
                 Some(p) => cfg_path = PathBuf::from(p),
                 None => {
-                    Error::Failed("--config needs a path".to_string()).report("the console");
+                    Error::ConfigPathMissing.report("the console");
                     return ExitCode::FAILURE;
                 }
             }
@@ -139,7 +139,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), Error> {
     let cfg = DrainConfig::load(cfg_path)?;
     let store = Store::new(&cfg.store_root);
     let Some(verb) = rest.first().map(String::as_str) else {
-        return Err(Error::Failed(usage()));
+        return Err(Error::Usage);
     };
     match verb {
         "request" => request(&cfg, &store, &rest[1..]).await,
@@ -176,7 +176,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), Error> {
             // for an application nobody reviewed.
             let (username, token) = application_args(rest)?;
             let Some(decision) = intent::decision_for(verb) else {
-                return Err(Error::Failed(usage()));
+                return Err(Error::Usage);
             };
             let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
             sign_and_file(&store, &key, decision, username, token).await
@@ -184,7 +184,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), Error> {
     }
 }
 
-fn usage() -> String {
+pub(crate) fn usage() -> String {
     "usage: kyriakon-admin [--config PATH] \
      approve|approve-free|decline <username> <token>
        kyriakon-admin delete|show <username>
@@ -237,7 +237,7 @@ fn usage() -> String {
 /// username is only the label the operator reads, checked against the record.
 fn application_args(rest: &[String]) -> Result<(&str, &str), Error> {
     let [_, _, token] = rest else {
-        return Err(Error::Failed(usage()));
+        return Err(Error::Usage);
     };
     Ok((one_username(&rest[..2])?, token.as_str()))
 }
@@ -246,10 +246,13 @@ fn application_args(rest: &[String]) -> Result<(&str, &str), Error> {
 fn one_username(rest: &[String]) -> Result<&str, Error> {
     let username = match rest {
         [_, username] => username.as_str(),
-        _ => return Err(Error::Failed(usage())),
+        _ => return Err(Error::Usage),
     };
-    if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+    if let Some(source) = validate::username_shape(username) {
+        return Err(Error::InvalidUsername {
+            username: username.to_string(),
+            source,
+        });
     }
     Ok(username)
 }
@@ -265,19 +268,18 @@ fn flags(args: &[String], known: &[&str]) -> Result<Flags, Error> {
     while i < args.len() {
         let flag = &args[i];
         let Some(name) = flag.strip_prefix("--") else {
-            return Err(Error::Failed(format!(
-                "unexpected argument {flag:?}\n{}",
-                usage()
-            )));
+            return Err(Error::UnexpectedArgument {
+                argument: flag.clone(),
+            });
         };
         if !known.contains(&name) {
-            return Err(Error::Failed(format!("unknown flag {flag:?}\n{}", usage())));
+            return Err(Error::UnknownFlag { flag: flag.clone() });
         }
         let Some(value) = args.get(i + 1) else {
-            return Err(Error::Failed(format!("{flag} needs a value")));
+            return Err(Error::NeedsValue { flag: flag.clone() });
         };
         if out.insert(name.to_string(), value.clone()).is_some() {
-            return Err(Error::Failed(format!("{flag} is given twice")));
+            return Err(Error::Duplicate { flag: flag.clone() });
         }
         i += 2;
     }
@@ -288,7 +290,9 @@ fn need<'a>(flags: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, 
     flags
         .get(name)
         .map(String::as_str)
-        .ok_or_else(|| Error::Failed(format!("--{name} is needed")))
+        .ok_or_else(|| Error::MissingFlag {
+            flag: name.to_string(),
+        })
 }
 
 /// Stored text on the operator's terminal. The handler writes the application's
@@ -312,13 +316,16 @@ pub(crate) fn safe(text: &str) -> String {
 /// anyway.
 async fn export(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(), Error> {
     let Some(username) = args.first().map(String::as_str) else {
-        return Err(Error::Failed(usage()));
+        return Err(Error::Usage);
     };
     if username.starts_with("--") {
-        return Err(Error::Failed(usage()));
+        return Err(Error::Usage);
     }
-    if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+    if let Some(source) = validate::username_shape(username) {
+        return Err(Error::InvalidUsername {
+            username: username.to_string(),
+            source,
+        });
     }
     let rest = &args[1..];
     let by_mail = rest.iter().any(|arg| arg == "--by-mail");

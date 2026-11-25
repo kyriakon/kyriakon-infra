@@ -3656,7 +3656,7 @@ fn a_missing_or_unreadable_site_owner_record_is_reported_once() {
         Damage {
             case: "missing",
             apply: remove_the_record,
-            phrase: "accounts/parish-secretary/account.json is missing",
+            phrase: "the site owner record for parish-secretary is gone",
         },
         Damage {
             case: "corrupt",
@@ -3721,7 +3721,7 @@ fn a_missing_or_unreadable_site_owner_record_is_reported_once() {
         if case == "missing" {
             assert!(
                 fix.journal()
-                    .contains("parish.example's group notice has no addressee"),
+                    .contains("the group parish.example has no addressee"),
                 "{case}: {}",
                 fix.journal()
             );

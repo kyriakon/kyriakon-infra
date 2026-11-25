@@ -6,11 +6,11 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use super::Error;
 use crate::flow::questions::{self, Branch, Kind, Question, Rule};
 use crate::flow::validate;
 use crate::mail::pgp;
 use crate::store::draft;
-use crate::Error;
 
 /// One page of the applicant's path. A mail key is one page per mailbox, with
 /// the mailbox in the prompt: a body's key page would otherwise ask for every
@@ -116,7 +116,7 @@ pub fn flow_problem(
         return key_error(&blocks[0]);
     }
     if let Some(why) = validate::reason(q, value, reserved, required) {
-        return Some(why);
+        return Some(why.to_string());
     }
     // The shared key check is the web form's, because `validate::reason` only
     // proves the first block parses; it does not count blocks or compare them
@@ -127,7 +127,7 @@ pub fn flow_problem(
         }
     }
     if q.kind == Kind::Addresses {
-        return validate::address_lines(value);
+        return validate::address_lines(value).map(|why| why.to_string());
     }
     None
 }
@@ -201,7 +201,9 @@ pub fn label(form: &BTreeMap<String, String>) -> Result<&'static str, Error> {
         None | Some("web") => Ok("web"),
         Some("tui") => Ok("tui"),
         Some("capsule") => Ok("capsule"),
-        Some(other) => Err(Error::Failed(format!("unknown front_end {other:?}"))),
+        Some(other) => Err(Error::UnknownFrontEnd {
+            value: other.to_string(),
+        }),
     }
 }
 

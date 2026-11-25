@@ -54,6 +54,10 @@ pub(super) fn unavailable(front_end: FrontEnd) -> Reply {
     }
 }
 
+/// What a client is told when its request line is over the bound. The detail
+/// (`what`, `limit`) is in the log line, not the reply.
+pub(super) const TOO_LONG: &str = "That request is too long.";
+
 /// A refusal of a request that is well formed and simply asks for something the
 /// handler does not do. Not a field-level error: those go back into the form.
 pub(super) fn refused(message: &str) -> Reply {
@@ -68,14 +72,14 @@ pub(super) fn notice(title: &str, message: &str) -> NoticePage {
 }
 
 /// The one place an error becomes a reply. The front end decides the framing;
-/// the error kind decides whether the client may retry. The wording is the
-/// page and the meta line the handlers already served.
+/// the error kind decides whether the client may retry. The wording is a
+/// constant per client-visible answer, never an internal error's text.
 pub(super) fn respond(error: &Error, front_end: FrontEnd) -> Reply {
     error.report("the request failed");
     match front_end {
         FrontEnd::Httpd => match error {
-            Error::Refused(message) => refused(message),
-            Error::Line { .. } => refused(&error.to_string()),
+            Error::Refused(refusal) => refused(refusal.message()),
+            Error::Line { .. } => refused(TOO_LONG),
             _ => Reply::html(
                 500,
                 page_html(&notice(
@@ -86,8 +90,8 @@ pub(super) fn respond(error: &Error, front_end: FrontEnd) -> Reply {
         },
         FrontEnd::Gemini => match error {
             Error::Lookup(_) => Reply::gemini(50, "Permanent failure", String::new()),
-            Error::Refused(message) => Reply::gemini(59, message, String::new()),
-            Error::Line { .. } => Reply::gemini(59, &error.to_string(), String::new()),
+            Error::Refused(refusal) => Reply::gemini(59, refusal.message(), String::new()),
+            Error::Line { .. } => Reply::gemini(59, TOO_LONG, String::new()),
             _ => Reply::gemini(40, TEMP_FAILURE, String::new()),
         },
     }
@@ -108,16 +112,16 @@ mod tests {
     use super::*;
 
     fn store_failure() -> Error {
-        Error::Store(kyriakon_control_core::store::Error::Refused(
-            "boom".to_string(),
-        ))
+        Error::Store(kyriakon_control_core::store::Error::ListedAccountMissing {
+            name: "boom".to_string(),
+        })
     }
 
     #[test]
     fn a_refusal_is_a_client_error_and_a_store_failure_is_a_server_error() {
         assert_eq!(
             respond(
-                &Error::Refused("not this request".to_string()),
+                &Error::Refused(Refusal::PortalNoStatusRequest),
                 FrontEnd::Httpd
             )
             .code(),
@@ -138,21 +142,23 @@ mod tests {
         assert_eq!(respond(&store_failure(), FrontEnd::Gemini).code(), 40);
         assert_eq!(
             respond(
-                &Error::Lookup(kyriakon_control_core::store::Error::Refused(
-                    "boom".to_string()
-                )),
+                &Error::Lookup(kyriakon_control_core::store::Error::ListedAccountMissing {
+                    name: "boom".to_string(),
+                }),
                 FrontEnd::Gemini
             )
             .code(),
             50
         );
         let refusal = respond(
-            &Error::Refused("not this request".to_string()),
+            &Error::Refused(Refusal::PortalNoStatusRequest),
             FrontEnd::Gemini,
         );
         assert_eq!(refusal.code(), 59);
         match refusal {
-            Reply::Gemini { meta, .. } => assert_eq!(meta, "not this request"),
+            Reply::Gemini { meta, .. } => {
+                assert_eq!(meta, Refusal::PortalNoStatusRequest.message())
+            }
             Reply::Http(_) => panic!("a gemini request got an http reply"),
         }
         assert_eq!(

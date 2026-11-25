@@ -5,8 +5,8 @@
 //! account page and the capsule all render this one [`Recipe`], which is what
 //! keeps the three from disagreeing about a value only the body can publish.
 
+use super::Error;
 use crate::config::{Config, DrainConfig};
-use crate::Error;
 
 /// One row of the recipe: what the record is for, the name it is published at,
 /// its type and its value.
@@ -80,12 +80,13 @@ impl Values {
             ("dmarc_rua", &self.dmarc_rua),
         ] {
             if value.trim().is_empty() {
-                return Err(Error::Failed(format!("the DNS recipe's {name} is empty")));
+                return Err(Error::EmptyRecipeValue { name });
             }
             if value.contains("REPLACE_ME") {
-                return Err(Error::Failed(format!(
-                    "the DNS recipe's {name} is still the placeholder {value:?}"
-                )));
+                return Err(Error::PlaceholderRecipeValue {
+                    name,
+                    value: value.clone(),
+                });
             }
         }
         Ok(())

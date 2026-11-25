@@ -15,12 +15,13 @@ use super::boxrun::{
     run_script_tolerating, write_public_key,
 };
 use super::lifecycle::{close_box_account, dns_contact};
-use super::Error;
+use super::Error as Transitions;
 use super::{write_journal, Settlement};
 use kyriakon_control_core::account::state::Standing;
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::questions;
 use kyriakon_control_core::flow::validate;
+use kyriakon_control_core::flow::Reason;
 use kyriakon_control_core::intent::ADDRESS_ACTIONS;
 use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::mail::table::Table;
@@ -39,18 +40,23 @@ use std::collections::HashSet;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+mod error;
+pub use self::error::Error;
+
 /// The address table the community block answered, paired with the account
 /// names. An `own` line names a mailbox; an `alias` line points at one already
 /// named, and the address shares that mailbox. The name on an alias line is not
 /// used: the mailbox is the one its `own` target names.
-pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec<String>), Error> {
+pub(super) fn group_addresses(
+    record: &Record,
+) -> Result<(Vec<GroupAddress>, Vec<String>), Transitions> {
     let text = record
         .answers
         .get("body_addresses")
         .map(String::as_str)
         .unwrap_or("");
-    if let Some(why) = validate::address_lines(text) {
-        return Err(Error::Failed(format!("the address table: {why}")));
+    if let Some(source) = validate::address_lines(text) {
+        return Err(Transitions::Groups(Error::AddressTable { source }));
     }
     let lines: Vec<&str> = text
         .lines()
@@ -59,11 +65,10 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
         .collect();
     let names = questions::account_names(&record.answers)?;
     if names.len() != lines.len() {
-        return Err(Error::Failed(format!(
-            "{} addresses and {} account names; there is one name per address",
-            lines.len(),
-            names.len()
-        )));
+        return Err(Transitions::Groups(Error::AddressNameCount {
+            addresses: lines.len(),
+            names: names.len(),
+        }));
     }
 
     let mut own: BTreeMap<&str, &str> = BTreeMap::new();
@@ -71,21 +76,21 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
     let mut mailboxes: Vec<String> = Vec::new();
     for (line, name) in lines.iter().zip(&names) {
         let (local, rest) = line.split_once(':').ok_or_else(|| {
-            Error::Failed(format!(
-                "the address line {line:?} is not localpart: own or localpart: alias localpart"
-            ))
+            Transitions::Groups(Error::AddressLine {
+                line: line.to_string(),
+            })
         })?;
         let local = local.trim();
         if !seen.insert(local) {
-            return Err(Error::Failed(format!(
-                "the address {local} is in the table twice"
-            )));
+            return Err(Transitions::Groups(Error::AddressTwice {
+                address: local.to_string(),
+            }));
         }
         if rest.trim() == "own" {
             if mailboxes.iter().any(|m| m == name) {
-                return Err(Error::Failed(format!(
-                    "the mailbox {name} is named by two mailboxes; an alias shares a mailbox instead"
-                )));
+                return Err(Transitions::Groups(Error::MailboxNamedByTwo {
+                    mailbox: name.clone(),
+                }));
             }
             own.insert(local, name);
             mailboxes.push(name.clone());
@@ -95,21 +100,22 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
     let mut addresses = Vec::new();
     for (line, name) in lines.iter().zip(&names) {
         let (local, rest) = line.split_once(':').ok_or_else(|| {
-            Error::Failed(format!(
-                "the address line {line:?} is not localpart: own or localpart: alias localpart"
-            ))
+            Transitions::Groups(Error::AddressLine {
+                line: line.to_string(),
+            })
         })?;
         let local = local.trim();
         if rest.trim() != "own" {
             let target = validate::alias_target(rest).ok_or_else(|| {
-                Error::Failed(format!(
-                    "the address line {line:?} is not localpart: own or localpart: alias localpart"
-                ))
+                Transitions::Groups(Error::AddressLine {
+                    line: line.to_string(),
+                })
             })?;
             let shared = own.get(target).ok_or_else(|| {
-                Error::Failed(format!(
-                    "the address {local} is an alias into {target}, which is not a mailbox in the table"
-                ))
+                Transitions::Groups(Error::AliasTargetMissing {
+                    address: local.to_string(),
+                    target: target.to_string(),
+                })
             })?;
             addresses.push(GroupAddress {
                 address: local.to_string(),
@@ -132,27 +138,28 @@ pub(super) fn group_addresses(record: &Record) -> Result<(Vec<GroupAddress>, Vec
 /// shortcut: the community block has no site-owner question yet, so the site is
 /// the applicant's account when the table names it and the first mailbox
 /// otherwise; add the question and read it here.
-pub(super) fn site_owner(record: &Record, mailboxes: &[String]) -> Result<String, Error> {
+pub(super) fn site_owner(record: &Record, mailboxes: &[String]) -> Result<String, Transitions> {
     if mailboxes.iter().any(|m| m == &record.username) {
         return Ok(record.username.clone());
     }
-    mailboxes.first().cloned().ok_or_else(|| {
-        Error::Failed("the address table names no mailbox, so no account owns the site".to_string())
-    })
+    mailboxes
+        .first()
+        .cloned()
+        .ok_or_else(|| Transitions::Groups(Error::NoMailbox))
 }
 
 /// The group record, when one is already there. A record that cannot be read or
 /// parsed is an error rather than "no group": treating it as absent would let an
 /// approval adopt accounts the record names.
-pub async fn group_record(store: &Store, domain: &str) -> Result<Option<GroupRecord>, Error> {
+pub async fn group_record(store: &Store, domain: &str) -> Result<Option<GroupRecord>, Transitions> {
     let Some(record) = store.group(domain).await? else {
         return Ok(None);
     };
     if record.version != 1 {
-        return Err(Error::Failed(format!(
-            "groups/{domain}/group.json has version {}, which this build does not read",
-            record.version
-        )));
+        return Err(Transitions::Groups(Error::GroupVersion {
+            domain: domain.to_string(),
+            version: record.version,
+        }));
     }
     Ok(Some(record))
 }
@@ -166,7 +173,7 @@ pub(super) async fn check_group_names(
     domain: &str,
     mailboxes: &[String],
     record: Option<&GroupRecord>,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     for mailbox in mailboxes {
         name_allowed(cfg, mailbox).await?;
         let in_record = record
@@ -183,19 +190,20 @@ pub(super) async fn check_group_names(
         // A name a removed mailbox left is held for ninety days before the
         // group can reuse it. Both the approval and an add-mailbox pass here.
         if let Some(until) = name_held(store, mailbox).await? {
-            return Err(Error::Failed(format!(
-                "the account name {mailbox} is held until {until}, so it cannot be reused yet"
-            )));
+            return Err(Transitions::Groups(Error::NameHeld {
+                mailbox: mailbox.clone(),
+                until,
+            }));
         }
         if existing.is_some() {
-            return Err(Error::Failed(format!(
-                "the account name {mailbox} is already taken"
-            )));
+            return Err(Transitions::Groups(Error::NameTaken {
+                mailbox: mailbox.clone(),
+            }));
         }
         if account_on_box(cfg, mailbox)? {
-            return Err(Error::Failed(format!(
-                "the account name {mailbox} is already in use on this box"
-            )));
+            return Err(Transitions::Groups(Error::NameInUseOnBox {
+                mailbox: mailbox.clone(),
+            }));
         }
     }
     Ok(())
@@ -205,14 +213,13 @@ pub(super) async fn check_group_names(
 /// `scripts/lib.sh`'s `mail_domains_first` reads and `provision-member.sh`
 /// addresses a new member on. Read rather than configured, so the drain and the
 /// scripts can never disagree about which name belongs to the operator.
-async fn platform_domain(cfg: &DrainConfig) -> Result<String, Error> {
+async fn platform_domain(cfg: &DrainConfig) -> Result<String, Transitions> {
     let text = Store::read_text(&cfg.mail_domains).await?;
     match text.lines().next().map(str::trim) {
         Some(first) if !first.is_empty() => Ok(first.to_string()),
-        _ => Err(Error::Failed(format!(
-            "{} has no first line, so the platform's own domain is unknown",
-            cfg.mail_domains
-        ))),
+        _ => Err(Transitions::Groups(Error::NoPlatformDomain {
+            path: cfg.mail_domains.clone(),
+        })),
     }
 }
 
@@ -225,7 +232,7 @@ async fn platform_domain(cfg: &DrainConfig) -> Result<String, Error> {
 pub(super) async fn body_domain_refusal(
     cfg: &DrainConfig,
     domain: &str,
-) -> Result<Option<String>, Error> {
+) -> Result<Option<String>, Transitions> {
     let platform = platform_domain(cfg).await?;
     // The defensive registrations are the platform's too: `kyriakon.com` is
     // served with the platform's own certificate and relayd keypair, so a body
@@ -245,62 +252,58 @@ pub async fn provision_group(
     store: &Store,
     journal: &Journal,
     intent: GroupIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     if intent.kind != "provision-group" {
-        return Err(Error::Failed(format!(
-            "kind {:?} is not a group intent",
-            intent.kind
-        )));
+        return Err(Transitions::Groups(Error::NotAGroupIntent {
+            kind: intent.kind.clone(),
+        }));
     }
-    if let Some(why) = validate::domain(&intent.domain) {
-        return Err(Error::Failed(format!(
-            "the domain {:?}: {why}",
-            intent.domain
-        )));
+    if let Some(source) = validate::domain(&intent.domain) {
+        return Err(Transitions::Groups(Error::InvalidDomain {
+            domain: intent.domain.clone(),
+            source,
+        }));
     }
     if let Some(reason) = body_domain_refusal(cfg, &intent.domain).await? {
         return Ok(Settlement::refused(reason));
     }
     if intent.mailboxes.is_empty() {
-        return Err(Error::Failed(
-            "the intent names no mailbox, so there is nothing to provision".to_string(),
-        ));
+        return Err(Transitions::Groups(Error::NoMailboxToProvision));
     }
     if !intent.mailboxes.iter().any(|m| m == &intent.site_owner) {
-        return Err(Error::Failed(format!(
-            "the site owner {} is not one of the mailboxes",
-            intent.site_owner
-        )));
+        return Err(Transitions::Groups(Error::SiteOwnerNotMailbox {
+            owner: intent.site_owner.clone(),
+        }));
     }
     let mut mailboxes = HashSet::new();
     for mailbox in &intent.mailboxes {
         if !mailboxes.insert(mailbox.as_str()) {
-            return Err(Error::Failed(format!(
-                "the mailbox {mailbox} is named twice"
-            )));
+            return Err(Transitions::Groups(Error::MailboxNamedTwice {
+                mailbox: mailbox.clone(),
+            }));
         }
     }
     for address in &intent.addresses {
-        if let Some(why) = validate::address_localpart_shape(&address.address) {
-            return Err(Error::Failed(format!(
-                "the address {:?}: {why}",
-                address.address
-            )));
+        if let Some(source) = validate::address_localpart_shape(&address.address) {
+            return Err(Transitions::Groups(Error::InvalidAddress {
+                address: address.address.clone(),
+                source,
+            }));
         }
         if !intent.mailboxes.iter().any(|m| m == &address.mailbox) {
-            return Err(Error::Failed(format!(
-                "the address {}@{} points at {}, which is not a mailbox",
-                address.address, intent.domain, address.mailbox
-            )));
+            return Err(Transitions::Groups(Error::AddressPointsOutside {
+                address: address.address.clone(),
+                domain: intent.domain.clone(),
+                mailbox: address.mailbox.clone(),
+            }));
         }
     }
     let mut seen = HashSet::new();
     for address in &intent.addresses {
         if !seen.insert(address.address.as_str()) {
-            return Err(Error::Failed(format!(
-                "the address {} is in the table twice",
-                address.address
-            )));
+            return Err(Transitions::Groups(Error::AddressTwice {
+                address: address.address.clone(),
+            }));
         }
     }
 
@@ -315,15 +318,15 @@ pub async fn provision_group(
             .cloned()
             .collect();
         if mine.is_empty() {
-            return Err(Error::Failed(format!(
-                "the mailbox {mailbox} has no mail key, so its mail would bounce"
-            )));
+            return Err(Transitions::Groups(Error::MailboxNoMailKey {
+                mailbox: mailbox.clone(),
+            }));
         }
         if mine.len() > 1 {
-            return Err(Error::Failed(format!(
-                "the mailbox {mailbox} has {} keys; there is one key per mailbox",
-                mine.len()
-            )));
+            return Err(Transitions::Groups(Error::MailboxSeveralKeys {
+                mailbox: mailbox.clone(),
+                keys: mine.len(),
+            }));
         }
         keys.insert(mailbox.clone(), mine);
     }
@@ -425,15 +428,17 @@ pub async fn provision_group(
                 }
             }
             *current = Some(group);
-            Ok::<(), Error>(())
+            Ok::<(), Transitions>(())
         })
         .await?;
 
     let app_copy = application_copy(
         store,
-        intent.application.status_token.as_deref().ok_or_else(|| {
-            Error::Failed("the group intent names no application token".to_string())
-        })?,
+        intent
+            .application
+            .status_token
+            .as_deref()
+            .ok_or_else(|| Transitions::Groups(Error::NoApplicationToken))?,
     )
     .await?;
 
@@ -506,7 +511,7 @@ pub async fn provision_group(
             group: Some(intent.domain.clone()),
             issued_at: now.clone(),
         };
-        let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Error::Json {
+        let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Transitions::Json {
             context: "encode the token record",
             source,
         })?;
@@ -563,14 +568,14 @@ pub async fn provision_group(
 /// The application's own copy, written into each mailbox's account so the block's
 /// answers sit inside the ninety-day purge with the rest of the application. The
 /// status link's end is stamped the way the person path's copy is.
-async fn application_copy(store: &Store, token: &str) -> Result<Option<String>, Error> {
+async fn application_copy(store: &Store, token: &str) -> Result<Option<String>, Transitions> {
     let Some(text) = store.filed_application_text(token).await? else {
         return Ok(None);
     };
-    let mut value: Value =
-        serde_json::from_str(&text).map_err(|e| Error::context("the application record", e))?;
+    let mut value: Value = serde_json::from_str(&text)
+        .map_err(|source| Transitions::Groups(Error::ApplicationUnreadable { source }))?;
     value["status_link_until"] = json!(util::after_days(7));
-    let bytes = serde_json::to_string_pretty(&value).map_err(|source| Error::Json {
+    let bytes = serde_json::to_string_pretty(&value).map_err(|source| Transitions::Json {
         context: "encode the application copy",
         source,
     })?;
@@ -583,14 +588,14 @@ async fn write_group_application(
     store: &Store,
     mailbox: &str,
     copy: Option<&str>,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let Some(copy) = copy else {
         return Ok(());
     };
     store
         .write_application_copy(mailbox, copy.as_bytes())
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// The mailbox's account record: a reference to its group and no payment block
@@ -602,7 +607,7 @@ async fn write_group_account(
     domain: &str,
     payment: &GroupPayment,
     mail_key: Option<&KeyRecord>,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let existing = store.account(mailbox).await?;
     let now = util::filed_at();
     // A new mailbox gets its own one-time link; a retry keeps the token the
@@ -637,9 +642,9 @@ async fn write_group_account(
             else {
                 // The record was purged between this pass's read and its lock,
                 // and there is no link to carry over. The next pass remakes it.
-                return Err(Error::Failed(format!(
-                    "{mailbox} went while its group mailbox was being written"
-                )));
+                return Err(Transitions::Groups(Error::AccountVanishedMidWrite {
+                    mailbox: mailbox.to_string(),
+                }));
             };
             let account = Account {
                 version: 1,
@@ -682,7 +687,7 @@ async fn write_group_account(
                 notice_stopped: None,
             };
             *current = Some(account);
-            Ok::<(), Error>(())
+            Ok::<(), Transitions>(())
         })
         .await
 }
@@ -693,7 +698,7 @@ async fn write_group_account(
 /// is trapped and the sender blocklisted, so the domain goes in with the other
 /// two rather than waiting for an operator to notice. smtpd's configuration is
 /// re-expanded from the DKIM list by the reload that follows.
-fn ensure_group_domain(cfg: &DrainConfig, domain: &str) -> Result<(), Error> {
+fn ensure_group_domain(cfg: &DrainConfig, domain: &str) -> Result<(), Transitions> {
     ensure_table_line(&cfg.mail_domains, domain, None)?;
     ensure_table_line(&cfg.dkim_domains, domain, None)?;
     ensure_table_line(&cfg.spamd_alloweddomains, &format!("@{domain}"), None)
@@ -702,42 +707,48 @@ fn ensure_group_domain(cfg: &DrainConfig, domain: &str) -> Result<(), Error> {
 /// Ensure one line is in a table: a bare value when `value` is `None`
 /// (a `mail_domains` line), and `name: value` otherwise (a `virtuals` entry).
 /// The module owns the lock and the atomic rename.
-fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), Error> {
-    Table::at(path)?.ensure(name, value).map_err(Error::from)?;
+fn ensure_table_line(path: &str, name: &str, value: Option<&str>) -> Result<(), Transitions> {
+    Table::at(path)?
+        .ensure(name, value)
+        .map_err(Transitions::from)?;
     Ok(())
 }
 
 /// The value a virtual table maps `name` to, or `None` when the key is absent.
-fn table_value(path: &str, name: &str) -> Result<Option<String>, Error> {
-    Table::at(path)?.lookup(name).map_err(Error::from)
+fn table_value(path: &str, name: &str) -> Result<Option<String>, Transitions> {
+    Table::at(path)?.lookup(name).map_err(Transitions::from)
 }
 
 /// How many addresses the body's domain has: every `<localpart>@<domain>` line,
 /// mailboxes and aliases alike, which is the ten-address cap's count.
-fn address_count(path: &str, domain: &str) -> Result<usize, Error> {
+fn address_count(path: &str, domain: &str) -> Result<usize, Transitions> {
     Table::at(path)?
         .count_suffix(&format!("@{domain}"))
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// Repoint an existing virtual entry. A value that is already right is left
 /// alone, so an upgrade intent applied twice changes nothing. `ensure_table_line`
 /// refuses a different value on purpose (it must not overrule a line somebody
 /// else made), so this is the explicit repoint.
-fn repoint_table_line(path: &str, name: &str, want: &str) -> Result<(), Error> {
+fn repoint_table_line(path: &str, name: &str, want: &str) -> Result<(), Transitions> {
     Table::at(path)?
         .set(&format!("{name}: {want}"))
-        .map_err(Error::from)?;
+        .map_err(Transitions::from)?;
     Ok(())
 }
 
 /// Drop every line for `domain` that points at `mailbox`. That is the mailbox's
 /// own address and any alias into it, so no entry is left delivering nowhere.
 /// Returns whether the table changed.
-pub(super) fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Result<bool, Error> {
+pub(super) fn remove_addresses(
+    path: &str,
+    domain: &str,
+    mailbox: &str,
+) -> Result<bool, Transitions> {
     Ok(Table::at(path)?
         .drop_delivering(&format!("@{domain}"), mailbox)
-        .map_err(Error::from)?
+        .map_err(Transitions::from)?
         .changed)
 }
 
@@ -745,10 +756,10 @@ pub(super) fn remove_addresses(path: &str, domain: &str, mailbox: &str) -> Resul
 /// when the account has none. A list that already names it is left alone, so a
 /// retry changes nothing. The mapping is what the listeners' `senders` option
 /// checks, so an address here is one this account may submit as.
-fn ensure_sender(path: &str, account: &str, address: &str) -> Result<(), Error> {
+fn ensure_sender(path: &str, account: &str, address: &str) -> Result<(), Transitions> {
     Table::at(path)?
         .map_add(account, address)
-        .map_err(Error::from)?;
+        .map_err(Transitions::from)?;
     Ok(())
 }
 
@@ -757,10 +768,10 @@ fn ensure_sender(path: &str, account: &str, address: &str) -> Result<(), Error> 
 /// it came from must stop submitting as it, and the new mailbox must start.
 /// `keep` has no line yet on a first upgrade, so one is appended. Returns
 /// whether the table changed.
-fn repoint_sender(path: &str, address: &str, keep: &str) -> Result<bool, Error> {
+fn repoint_sender(path: &str, address: &str, keep: &str) -> Result<bool, Transitions> {
     Ok(Table::at(path)?
         .map_move(address, keep)
-        .map_err(Error::from)?
+        .map_err(Transitions::from)?
         .changed)
 }
 
@@ -771,10 +782,10 @@ pub(super) fn remove_senders_for_domain(
     path: &str,
     domain: &str,
     mailbox: &str,
-) -> Result<bool, Error> {
+) -> Result<bool, Transitions> {
     Ok(Table::at(path)?
         .drop_sender_suffix(mailbox, &format!("@{domain}"))
-        .map_err(Error::from)?
+        .map_err(Transitions::from)?
         .changed)
 }
 
@@ -782,7 +793,10 @@ pub(super) fn remove_senders_for_domain(
 /// a record that cannot be read is an error rather than no hold, because a
 /// broken hold file must not release a name the platform is still holding. A
 /// readable record with no usable date is no hold.
-pub(super) async fn name_held(store: &Store, username: &str) -> Result<Option<String>, Error> {
+pub(super) async fn name_held(
+    store: &Store,
+    username: &str,
+) -> Result<Option<String>, Transitions> {
     let Some(value) = store.hold(username).await? else {
         return Ok(None);
     };
@@ -818,7 +832,7 @@ pub async fn application_token(store: &Store, username: &str) -> Option<String> 
 /// The hold also records the account's application status token where the
 /// account's copy still exists, which is what the journal prune uses to tell
 /// this account's lines from another applicant who asks for the same name.
-pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Error> {
+pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Transitions> {
     if name_held(store, username).await?.is_some() {
         return Ok(());
     }
@@ -830,7 +844,7 @@ pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Error
     if let Some(token) = token {
         hold["token"] = json!(token);
     }
-    let bytes = serde_json::to_vec_pretty(&hold).map_err(|source| Error::Json {
+    let bytes = serde_json::to_vec_pretty(&hold).map_err(|source| Transitions::Json {
         context: "encode the hold",
         source,
     })?;
@@ -838,7 +852,7 @@ pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Error
     store
         .write_record("holds", &format!("{username}.json"), &bytes)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// Close one mailbox through the same five steps `delete_account` takes, so a
@@ -846,44 +860,53 @@ pub(super) async fn hold_name(store: &Store, username: &str) -> Result<(), Error
 /// disagree about what a closed account is. Shared by a mailbox leaving a group
 /// and a whole group going. The caller removes the virtual entry first, because
 /// it is the one that knows which table line belongs to the account.
-async fn close_mailbox(cfg: &DrainConfig, store: &Store, username: &str) -> Result<(), Error> {
+async fn close_mailbox(
+    cfg: &DrainConfig,
+    store: &Store,
+    username: &str,
+) -> Result<(), Transitions> {
     close_box_account(cfg, store, username).await
 }
 
 /// The mail key a new mailbox carries, checked before anything is written: the
 /// material must be there and must be the mailbox's own key.
-fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Error> {
+fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Transitions> {
     let Some(key) = intent.mail_key.as_ref() else {
-        return Err(Error::Failed(format!(
-            "the mailbox {} has no mail key, so its mail would bounce",
-            intent.mailbox
-        )));
+        return Err(Transitions::Groups(Error::MailboxNoMailKey {
+            mailbox: intent.mailbox.clone(),
+        }));
     };
     if !key.mailbox.is_empty() && key.mailbox != intent.mailbox {
-        return Err(Error::Failed(format!(
-            "the mail key names {}, not {}",
-            key.mailbox, intent.mailbox
-        )));
+        return Err(Transitions::Groups(Error::MailKeyNamesOther {
+            mailbox: intent.mailbox.clone(),
+            named: key.mailbox.clone(),
+        }));
     }
     if key.material.trim().is_empty() {
-        return Err(Error::Failed(format!(
-            "the mail key for {} is empty",
-            intent.mailbox
-        )));
+        return Err(Transitions::Groups(Error::MailKeyEmpty {
+            mailbox: intent.mailbox.clone(),
+        }));
     }
     // The console carries whatever file the operator named. A private key, an
     // SSH key or a truncated block would reach the encryptor's keyring and
     // fail closed, so the shared check refuses it before the journal line.
-    let checked = kyriakon_control_core::mail::pgp::public_key(&key.material)
-        .map_err(|e| Error::context(format!("the mail key for {}", intent.mailbox), e))?;
+    let checked =
+        kyriakon_control_core::mail::pgp::public_key(&key.material).map_err(|source| {
+            Transitions::Groups(Error::MailKeyUnreadable {
+                mailbox: intent.mailbox.clone(),
+                source,
+            })
+        })?;
     // The form and the rotation path refuse a key whose verdict is not "works";
     // the console is the same boundary, so an AEAD advert or an expiring subkey
     // cannot reach the keyring by this route.
-    if let Some(why) = checked.refusal() {
-        return Err(Error::Failed(format!(
-            "the mail key for {} cannot be used: {why}",
-            intent.mailbox
-        )));
+    if let Some(verdict) = checked.refusal() {
+        return Err(Transitions::Groups(Error::MailKeyUnusable {
+            mailbox: intent.mailbox.clone(),
+            source: Reason::KeyRefused {
+                verdict: verdict.to_string(),
+            },
+        }));
     }
     let mut key = key.clone();
     key.mailbox = intent.mailbox.clone();
@@ -892,10 +915,9 @@ fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Error> {
     // fingerprint is computed from the parsed key rather than trusted.
     key.fingerprint =
         kyriakon_control_core::mail::pgp::fingerprint(&key.material).ok_or_else(|| {
-            Error::Failed(format!(
-                "the mail key for {} has no fingerprint this build can derive",
-                intent.mailbox
-            ))
+            Transitions::Groups(Error::MailKeyNoFingerprint {
+                mailbox: intent.mailbox.clone(),
+            })
         })?;
     Ok(key)
 }
@@ -910,24 +932,22 @@ pub async fn group_address(
     journal: &Journal,
     key: &[u8],
     intent: GroupAddressIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     if intent.kind != "group-address" {
-        return Err(Error::Failed(format!(
-            "kind {:?} is not an address intent",
-            intent.kind
-        )));
+        return Err(Transitions::Groups(Error::NotAnAddressIntent {
+            kind: intent.kind.clone(),
+        }));
     }
     if !ADDRESS_ACTIONS.contains(&intent.action.as_str()) {
-        return Err(Error::Failed(format!(
-            "{:?} is not an address change",
-            intent.action
-        )));
+        return Err(Transitions::Groups(Error::NotAnAddressChange {
+            action: intent.action.clone(),
+        }));
     }
-    if let Some(why) = validate::domain(&intent.domain) {
-        return Err(Error::Failed(format!(
-            "the domain {:?}: {why}",
-            intent.domain
-        )));
+    if let Some(source) = validate::domain(&intent.domain) {
+        return Err(Transitions::Groups(Error::InvalidDomain {
+            domain: intent.domain.clone(),
+            source,
+        }));
     }
     let Some(mut group) = group_record(store, &intent.domain).await? else {
         // Settled, not failed: a signed address change left armed would land
@@ -937,18 +957,18 @@ pub async fn group_address(
             intent.domain
         )));
     };
-    if let Some(why) = validate::username_shape(&intent.mailbox) {
-        return Err(Error::Failed(format!(
-            "the mailbox {:?}: {why}",
-            intent.mailbox
-        )));
+    if let Some(source) = validate::username_shape(&intent.mailbox) {
+        return Err(Transitions::Groups(Error::InvalidMailbox {
+            mailbox: intent.mailbox.clone(),
+            source,
+        }));
     }
     if intent.action != "remove" {
-        if let Some(why) = validate::address_localpart_shape(&intent.address) {
-            return Err(Error::Failed(format!(
-                "the address {:?}: {why}",
-                intent.address
-            )));
+        if let Some(source) = validate::address_localpart_shape(&intent.address) {
+            return Err(Transitions::Groups(Error::InvalidAddress {
+                address: intent.address.clone(),
+                source,
+            }));
         }
     }
     if intent.action == "remove" && !intent.address.is_empty() {
@@ -975,24 +995,27 @@ pub async fn group_address(
     match intent.action.as_str() {
         "add-alias" => {
             if !in_group(&intent.mailbox) {
-                return Err(Error::Failed(format!(
-                    "the alias {}@{} points at {}, which is not a mailbox in the group",
-                    intent.address, intent.domain, intent.mailbox
-                )));
+                return Err(Transitions::Groups(Error::AliasPointsOutside {
+                    address: intent.address.clone(),
+                    domain: intent.domain.clone(),
+                    mailbox: intent.mailbox.clone(),
+                }));
             }
             match &current {
                 Some(have) if have == &intent.mailbox => {}
                 Some(have) => {
-                    return Err(Error::Failed(format!(
-                        "{} already maps {entry} to {have}, not {}",
-                        cfg.virtuals, intent.mailbox
-                    )))
+                    return Err(Transitions::Groups(Error::AddressPointsOther {
+                        path: cfg.virtuals.clone(),
+                        entry: entry.clone(),
+                        have: have.clone(),
+                        mailbox: intent.mailbox.clone(),
+                    }))
                 }
                 None if address_count(&cfg.virtuals, &intent.domain)? >= 10 => {
-                    return Err(Error::Failed(format!(
-                        "{} already carries ten addresses, so {entry} cannot be added",
-                        intent.domain
-                    )))
+                    return Err(Transitions::Groups(Error::AddressCapReached {
+                        domain: intent.domain.clone(),
+                        entry: entry.clone(),
+                    }))
                 }
                 None => {}
             }
@@ -1001,10 +1024,12 @@ pub async fn group_address(
             address_key(&intent)?;
             if let Some(have) = &current {
                 if have != &intent.mailbox {
-                    return Err(Error::Failed(format!(
-                        "{} already maps {entry} to {have}, not {}",
-                        cfg.virtuals, intent.mailbox
-                    )));
+                    return Err(Transitions::Groups(Error::AddressPointsOther {
+                        path: cfg.virtuals.clone(),
+                        entry: entry.clone(),
+                        have: have.clone(),
+                        mailbox: intent.mailbox.clone(),
+                    }));
                 }
             }
             if !in_group(&intent.mailbox) {
@@ -1021,28 +1046,28 @@ pub async fn group_address(
             // already in the group: a second address into an existing mailbox
             // still costs one of the ten.
             if current.is_none() && address_count(&cfg.virtuals, &intent.domain)? >= 10 {
-                return Err(Error::Failed(format!(
-                    "{} already carries ten addresses, so {} cannot be added",
-                    intent.domain, entry
-                )));
+                return Err(Transitions::Groups(Error::AddressCapReached {
+                    domain: intent.domain.clone(),
+                    entry: entry.clone(),
+                }));
             }
         }
         "upgrade" => {
             address_key(&intent)?;
             match &current {
                 None => {
-                    return Err(Error::Failed(format!(
-                        "{} is not an address in {}, so there is no alias to upgrade",
-                        entry, intent.domain
-                    )))
+                    return Err(Transitions::Groups(Error::NotAnAddressToUpgrade {
+                        entry: entry.clone(),
+                        domain: intent.domain.clone(),
+                    }))
                 }
                 Some(have) if have == &intent.mailbox => {}
                 Some(have) => {
                     if !in_group(have) {
-                        return Err(Error::Failed(format!(
-                            "{} points at {have}, which is not a mailbox in the group",
-                            entry
-                        )));
+                        return Err(Transitions::Groups(Error::AddressPointsOutsideGroup {
+                            entry: entry.clone(),
+                            mailbox: have.clone(),
+                        }));
                     }
                 }
             }
@@ -1060,15 +1085,14 @@ pub async fn group_address(
         "remove" => {
             if group.site_owner == intent.mailbox {
                 let Some(replacement) = intent.site_owner.as_deref() else {
-                    return Err(Error::Failed(format!(
-                        "{} owns the site, so the intent must name the account that takes it",
-                        intent.mailbox
-                    )));
+                    return Err(Transitions::Groups(Error::SiteOwnerNeedsReplacement {
+                        mailbox: intent.mailbox.clone(),
+                    }));
                 };
                 if replacement == intent.mailbox || !in_group(replacement) {
-                    return Err(Error::Failed(format!(
-                        "the replacement site owner {replacement} is not another mailbox in the group"
-                    )));
+                    return Err(Transitions::Groups(Error::ReplacementNotMailbox {
+                        replacement: replacement.to_string(),
+                    }));
                 }
             }
             let existing = store.account(&intent.mailbox).await?;
@@ -1077,10 +1101,10 @@ pub async fn group_address(
                 .map(|a| a.group.as_deref() == Some(intent.domain.as_str()))
                 .unwrap_or(false);
             if !in_group(&intent.mailbox) && !ours && account_on_box(cfg, &intent.mailbox)? {
-                return Err(Error::Failed(format!(
-                    "the account {} is not a mailbox in {}",
-                    intent.mailbox, intent.domain
-                )));
+                return Err(Transitions::Groups(Error::AccountNotMailbox {
+                    mailbox: intent.mailbox.clone(),
+                    domain: intent.domain.clone(),
+                }));
             }
         }
         _ => unreachable!("the action was checked against ADDRESS_ACTIONS"),
@@ -1120,7 +1144,7 @@ pub async fn group_address(
                                 current.accounts.push(intent.mailbox.clone());
                             }
                         }
-                        Ok::<(), Error>(())
+                        Ok::<(), Transitions>(())
                     })
                     .await?;
             }
@@ -1153,7 +1177,7 @@ pub async fn group_address(
                                 current.accounts.push(intent.mailbox.clone());
                             }
                         }
-                        Ok::<(), Error>(())
+                        Ok::<(), Transitions>(())
                     })
                     .await?;
             }
@@ -1202,9 +1226,10 @@ pub async fn group_address(
             // that member the site.
             let site_owner_leaving = group.site_owner == intent.mailbox;
             if site_owner_leaving {
-                let replacement = intent.site_owner.as_deref().ok_or_else(|| {
-                    Error::Failed("the site owner is leaving without a replacement".to_string())
-                })?;
+                let replacement = intent
+                    .site_owner
+                    .as_deref()
+                    .ok_or_else(|| Transitions::Groups(Error::NoReplacement))?;
                 // The departing owner's upload key is never copied: the leaver
                 // would keep the site's sftp and git sessions, and a key the
                 // replacement had already added would be overwritten. The site
@@ -1266,7 +1291,7 @@ pub async fn group_address(
                             current.site_owner = replacement;
                         }
                     }
-                    Ok::<(), Error>(())
+                    Ok::<(), Transitions>(())
                 })
                 .await?;
             let routes_changed = remove_addresses(&cfg.virtuals, &intent.domain, &intent.mailbox)?;
@@ -1318,11 +1343,12 @@ async fn mail_password_link(
     key: &[u8],
     group: &GroupRecord,
     mailbox: &str,
-) -> Result<(), Error> {
-    let account = store
-        .account(mailbox)
-        .await?
-        .ok_or_else(|| Error::Failed(format!("the mailbox {mailbox} has no account record")))?;
+) -> Result<(), Transitions> {
+    let account = store.account(mailbox).await?.ok_or_else(|| {
+        Transitions::Groups(Error::MailboxNoAccountRecord {
+            mailbox: mailbox.to_string(),
+        })
+    })?;
     let Some(link) = account.password_link else {
         return Ok(());
     };
@@ -1374,18 +1400,17 @@ pub async fn remove_group(
     store: &Store,
     journal: &Journal,
     intent: GroupRemoveIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     if intent.kind != "remove-group" {
-        return Err(Error::Failed(format!(
-            "kind {:?} is not a remove-group intent",
-            intent.kind
-        )));
+        return Err(Transitions::Groups(Error::NotARemoveGroupIntent {
+            kind: intent.kind.clone(),
+        }));
     }
-    if let Some(why) = validate::domain(&intent.domain) {
-        return Err(Error::Failed(format!(
-            "the domain {:?}: {why}",
-            intent.domain
-        )));
+    if let Some(source) = validate::domain(&intent.domain) {
+        return Err(Transitions::Groups(Error::InvalidDomain {
+            domain: intent.domain.clone(),
+            source,
+        }));
     }
     if let Some(reason) = body_domain_refusal(cfg, &intent.domain).await? {
         return Ok(Settlement::refused(reason));
@@ -1433,7 +1458,7 @@ pub(super) async fn take_group_down(
     cfg: &DrainConfig,
     store: &Store,
     domain: &str,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     run_script(cfg, "remove-group.sh", &[domain]).await?;
     run_script(cfg, "cron-apply.sh", &["--web"]).await?;
     let Some(group) = group_record(store, domain).await? else {
@@ -1457,15 +1482,15 @@ pub(super) async fn take_group_down(
 
 /// Remove the group's directory, record and all. A directory that is not there
 /// reads as done, the same rule `Store::remove` applies to a file.
-pub(super) async fn remove_group_record(store: &Store, domain: &str) -> Result<(), Error> {
+pub(super) async fn remove_group_record(store: &Store, domain: &str) -> Result<(), Transitions> {
     let dir = store.path(&format!("groups/{domain}"));
     match tokio::fs::remove_dir_all(&dir).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::Failed(format!(
-            "cannot remove {}: {e}",
-            dir.display()
-        ))),
+        Err(source) => Err(Transitions::Groups(Error::RemoveGroupDir {
+            path: dir,
+            source,
+        })),
     }
 }
 
@@ -1474,7 +1499,10 @@ pub(super) async fn remove_group_record(store: &Store, domain: &str) -> Result<(
 /// is by `TokenRecord.username` rather than by the filename, because the
 /// directory also holds tokens that are not these accounts' and the record is
 /// what says whose one is.
-pub(super) async fn close_group_tokens(store: &Store, accounts: &[String]) -> Result<(), Error> {
+pub(super) async fn close_group_tokens(
+    store: &Store,
+    accounts: &[String],
+) -> Result<(), Transitions> {
     for name in store.list("tokens").await? {
         if !name.ends_with(".json") {
             continue;
@@ -1501,9 +1529,13 @@ pub(super) async fn close_group_tokens(store: &Store, accounts: &[String]) -> Re
 /// has no `account.json`, and the drain must neither adopt it nor release its
 /// name. An unreadable file is an error rather than a "no", so the drain fails
 /// closed instead of acting on a box it cannot see.
-pub(super) fn account_on_box(cfg: &DrainConfig, username: &str) -> Result<bool, Error> {
-    let text = std::fs::read_to_string(&cfg.passwd)
-        .map_err(|e| Error::context(format!("cannot read {}", cfg.passwd), e))?;
+pub(super) fn account_on_box(cfg: &DrainConfig, username: &str) -> Result<bool, Transitions> {
+    let text = std::fs::read_to_string(&cfg.passwd).map_err(|source| {
+        Transitions::Groups(Error::ReadPasswd {
+            path: cfg.passwd.clone(),
+            source,
+        })
+    })?;
     Ok(text
         .lines()
         .any(|line| line.split(':').next() == Some(username)))
@@ -1514,7 +1546,7 @@ pub(super) fn account_on_box(cfg: &DrainConfig, username: &str) -> Result<bool, 
 /// Read where it is used rather than held for the pass: it is a short file, read
 /// at most twice a minute by a cron job, and a read that fails must refuse the
 /// work rather than let it through on an empty list.
-async fn reserved_names(cfg: &DrainConfig) -> Result<HashSet<String>, Error> {
+async fn reserved_names(cfg: &DrainConfig) -> Result<HashSet<String>, Transitions> {
     Ok(validate::reserved(&Store::read_text(&cfg.reserved).await?))
 }
 
@@ -1524,11 +1556,14 @@ async fn reserved_names(cfg: &DrainConfig) -> Result<HashSet<String>, Error> {
 /// The name is in the message because a failed pass is journalled against an
 /// empty application and mailed to the operator, so the message is the only
 /// place either of them can read which name was refused.
-pub(super) async fn name_allowed(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
+pub(super) async fn name_allowed(cfg: &DrainConfig, username: &str) -> Result<(), Transitions> {
     let reserved = reserved_names(cfg).await?;
     match validate::username(username, &reserved) {
         None => Ok(()),
-        Some(why) => Err(Error::Failed(format!("the username {username}: {why}"))),
+        Some(source) => Err(Transitions::Groups(Error::InvalidUsername {
+            username: username.to_string(),
+            source,
+        })),
     }
 }
 
@@ -1542,7 +1577,7 @@ pub(super) async fn append_ledger(
     intent: &str,
     at: &str,
     amount_gbp: &str,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let ledger = Ledger::open(store);
     if ledger.has_window_open(token).await? {
         return Ok(());

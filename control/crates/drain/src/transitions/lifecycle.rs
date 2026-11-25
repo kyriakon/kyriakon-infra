@@ -14,7 +14,7 @@ use super::groups::{
     remove_addresses, remove_group_record, remove_senders_for_domain, take_group_down,
 };
 use super::payments::{resolve_payment, token_join};
-use super::Error;
+use super::Error as Transitions;
 use super::{due, report_failure, write_journal, Settlement};
 use kyriakon_control_core::account::state::{Standing, WindowState};
 use kyriakon_control_core::account::{dns, export, session};
@@ -44,6 +44,9 @@ use time::Duration;
 use time::OffsetDateTime;
 use tokio::process::Command;
 
+mod error;
+pub use self::error::Error;
+
 /// The address a body's approval notice goes to. A body has no account of the
 /// applicant's own, so the fallback is the site owner's mailbox on the body's
 /// domain rather than the person path's `username@kyriakon.net`, which the drain
@@ -52,7 +55,7 @@ pub(super) fn group_recipient(
     record: &Record,
     site_owner: &str,
     domain: &str,
-) -> Result<String, Error> {
+) -> Result<String, Transitions> {
     Ok(outside_address(record)?.unwrap_or_else(|| format!("{site_owner}@{domain}")))
 }
 
@@ -73,7 +76,7 @@ pub(super) async fn report_record(
     journal: &Journal,
     kind: &str,
     name: &str,
-    error: &Error,
+    error: &Transitions,
 ) {
     let id = format!("{kind}:{name}");
     if !due(journal, &id, OffsetDateTime::now_utc()) {
@@ -94,7 +97,15 @@ async fn sweep_account(
     match store.account(username).await {
         Ok(account) => account,
         Err(e) => {
-            report_record(cfg, store, journal, "account", username, &Error::from(e)).await;
+            report_record(
+                cfg,
+                store,
+                journal,
+                "account",
+                username,
+                &Transitions::from(e),
+            )
+            .await;
             None
         }
     }
@@ -127,7 +138,15 @@ async fn sweep_application(
     match store.application(token).await {
         Ok(record) => record,
         Err(e) => {
-            report_record(cfg, store, journal, "application", token, &Error::from(e)).await;
+            report_record(
+                cfg,
+                store,
+                journal,
+                "application",
+                token,
+                &Transitions::from(e),
+            )
+            .await;
             None
         }
     }
@@ -148,7 +167,7 @@ pub async fn issue_password_link(
     store: &Store,
     username: &str,
     key: &[u8],
-) -> Result<String, Error> {
+) -> Result<String, Transitions> {
     let link = PasswordLink::fresh().await?;
     let url = kyriakon_control_core::account::sign::password_link(
         &cfg.base_url,
@@ -165,7 +184,9 @@ pub async fn issue_password_link(
     store
         .update_account(username, |current| {
             let Some(account) = current.as_mut() else {
-                return Err(Error::Failed(format!("no account for {username}")));
+                return Err(Transitions::Lifecycle(Error::NoAccount {
+                    username: username.to_string(),
+                }));
             };
             account.password_link = Some(link);
             Ok(())
@@ -177,7 +198,7 @@ pub async fn issue_password_link(
 /// Clear the status page's copy of an application's password link, when the copy
 /// belongs to this account. A group mailbox stores the body's application copy,
 /// whose username is the applicant and not the mailbox, so it is left alone.
-async fn clear_status_link(store: &Store, username: &str) -> Result<(), Error> {
+async fn clear_status_link(store: &Store, username: &str) -> Result<(), Transitions> {
     let Some(copy) = store.account_application_text(username).await? else {
         return Ok(());
     };
@@ -191,7 +212,7 @@ async fn clear_status_link(store: &Store, username: &str) -> Result<(), Error> {
         return Ok(());
     };
     let mut record: Value = serde_json::from_str(&text)
-        .map_err(|e| Error::context("the application record does not parse", e))?;
+        .map_err(|e| Transitions::context("the application record does not parse", e))?;
     if record.get("username").and_then(Value::as_str) != Some(username) {
         return Ok(());
     }
@@ -199,14 +220,14 @@ async fn clear_status_link(store: &Store, username: &str) -> Result<(), Error> {
         return Ok(());
     }
     record["password_link"] = Value::Null;
-    let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Transitions::Json {
         context: "encode the application record",
         source,
     })?;
     store
         .write_filed_application(token, &bytes)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// Apply a password set through a one-time link.
@@ -230,11 +251,12 @@ pub async fn set_password(
     intent: PasswordIntent,
     file: &str,
     value: &Value,
-) -> Result<Settlement, Error> {
-    let token =
-        intent.application.status_token.as_deref().ok_or_else(|| {
-            Error::Failed("the password intent names no status token".to_string())
-        })?;
+) -> Result<Settlement, Transitions> {
+    let token = intent
+        .application
+        .status_token
+        .as_deref()
+        .ok_or_else(|| Transitions::Lifecycle(Error::PasswordNoStatusToken))?;
     let username = intent.application.username.as_str();
     // A link's single use is recorded in `spent/`, root's own directory, because
     // the application record is the handler's to rewrite. Checked before the
@@ -267,7 +289,7 @@ pub async fn set_password(
     let mut app_record: Option<Value> = match store.filed_application_text(token).await? {
         Some(text) => Some(
             serde_json::from_str(&text)
-                .map_err(|e| Error::context("the application record does not parse", e))?,
+                .map_err(|e| Transitions::context("the application record does not parse", e))?,
         ),
         None => None,
     };
@@ -304,7 +326,7 @@ pub async fn set_password(
     // what the replay check above reads. It carries no secret, only the account
     // and the moment, because the password was hashed above.
     let marker = json!({"username": username, "spent_at": util::filed_at()});
-    let marker = serde_json::to_vec_pretty(&marker).map_err(|source| Error::Json {
+    let marker = serde_json::to_vec_pretty(&marker).map_err(|source| Transitions::Json {
         context: "encode the spent link",
         source,
     })?;
@@ -329,7 +351,7 @@ pub async fn set_password(
                         account.password_link = None;
                     }
                 }
-                Ok::<(), Error>(())
+                Ok::<(), Transitions>(())
             })
             .await?;
 
@@ -338,10 +360,11 @@ pub async fn set_password(
         if let Some(record) = app_record.as_mut() {
             if record.get("password_link").is_some_and(|v| !v.is_null()) {
                 record["password_link"] = Value::Null;
-                let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
-                    context: "encode the application record",
-                    source,
-                })?;
+                let bytes =
+                    serde_json::to_vec_pretty(&record).map_err(|source| Transitions::Json {
+                        context: "encode the application record",
+                        source,
+                    })?;
                 // `applications/` belongs to the handler, which renders the status
                 // page as _onboard: a root-owned record reads as missing to it.
                 store.write_filed_application(token, &bytes).await?;
@@ -351,7 +374,7 @@ pub async fn set_password(
         // A password set through a link ends every page session the account
         // holds, as a change from the page does.
         session::close_all(store, username).await?;
-        Ok::<(), Error>(())
+        Ok::<(), Transitions>(())
     }
     .await;
     if let Err(e) = finished {
@@ -391,7 +414,11 @@ async fn password_refusal(
 /// a retry is the operator's decision, but the plaintext must not stay in
 /// `intents/` and every backup. The rewrite is the same atomic write, handed to
 /// the directory's owner so the unprivileged handler can still read it.
-pub(crate) async fn redact_password(store: &Store, file: &str, value: &Value) -> Result<(), Error> {
+pub(crate) async fn redact_password(
+    store: &Store,
+    file: &str,
+    value: &Value,
+) -> Result<(), Transitions> {
     let mut redacted = value.clone();
     let Some(object) = redacted.as_object_mut() else {
         return Ok(());
@@ -399,20 +426,23 @@ pub(crate) async fn redact_password(store: &Store, file: &str, value: &Value) ->
     if object.remove("password").is_none() {
         return Ok(());
     }
-    let bytes = serde_json::to_vec_pretty(&redacted).map_err(|source| Error::Json {
+    let bytes = serde_json::to_vec_pretty(&redacted).map_err(|source| Transitions::Json {
         context: "encode the intent",
         source,
     })?;
     store
         .write_intent_record(file, &bytes)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// Give an open payment window its one extension, as `kyriakon-admin window extend`
 /// asks. The new close is fourteen days past the old one, and the counter makes
 /// a second extension a refusal: the window is a courtesy, not a free tier.
-pub async fn window_extend(store: &Store, intent: WindowExtendIntent) -> Result<Settlement, Error> {
+pub async fn window_extend(
+    store: &Store,
+    intent: WindowExtendIntent,
+) -> Result<Settlement, Transitions> {
     // A refusal is journaled once and the intent is left in place, as the credit
     // path does; a new intent is the way to change the answer.
     if !store::is_payment_token(&intent.token) {
@@ -454,7 +484,7 @@ pub async fn window_extend(store: &Store, intent: WindowExtendIntent) -> Result<
                 if let Some(group) = current.as_mut() {
                     group.payment = payment.clone();
                 }
-                Ok::<(), Error>(())
+                Ok::<(), Transitions>(())
             })
             .await?;
         if let Some(token) = application_token(store, &group.site_owner).await {
@@ -488,7 +518,7 @@ pub async fn window_extend(store: &Store, intent: WindowExtendIntent) -> Result<
             if let Some(account) = current.as_mut() {
                 account.payment = payment.clone();
             }
-            Ok::<(), Error>(())
+            Ok::<(), Transitions>(())
         })
         .await?;
     if let Some(payment) = account.payment.as_ref() {
@@ -528,7 +558,7 @@ pub async fn window_sweep(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let now = OffsetDateTime::now_utc();
     for username in store.list("accounts").await? {
         let Some(account) = sweep_account(cfg, store, journal, &username).await else {
@@ -555,7 +585,7 @@ pub async fn window_sweep(
                 // it already held, so a late sweep does not restart the clock.
                 Standing::Active if payment.paid_until.is_none() => {
                     if let Err(e) = run_script(cfg, "lapse-user.sh", &[username.as_str()]).await {
-                        Error::from(e).report(&format!("stopping access for {username}"));
+                        Transitions::from(e).report(&format!("stopping access for {username}"));
                         continue;
                     }
                     let grace = account
@@ -565,7 +595,9 @@ pub async fn window_sweep(
                     let account = store
                         .update_account(&username, |current| {
                             let Some(account) = current.as_mut() else {
-                                return Err(Error::Failed(format!("no account for {username}")));
+                                return Err(Transitions::Lifecycle(Error::NoAccount {
+                                    username: username.to_string(),
+                                }));
                             };
                             if account.state == Standing::Active {
                                 account.lapse(grace.clone());
@@ -591,10 +623,10 @@ pub async fn window_sweep(
                 journal,
                 "account",
                 &username,
-                &Error::Failed(format!(
-                    "the payment window's close date {:?} cannot be read, so {username} was not swept",
-                    window.closes_at
-                )),
+                &Transitions::Lifecycle(Error::WindowCloseDateUnreadable {
+                    closes_at: window.closes_at.clone(),
+                    username: username.to_string(),
+                }),
             )
             .await;
             continue;
@@ -614,7 +646,7 @@ pub async fn window_sweep(
                     if let Some(account) = current.as_mut() {
                         account.payment = Some(payment.clone());
                     }
-                    Ok::<(), Error>(())
+                    Ok::<(), Transitions>(())
                 })
                 .await?;
             store.write_payment_copy(&username, &payment).await?;
@@ -624,7 +656,7 @@ pub async fn window_sweep(
         // failure leaves the window open, so the next pass tries again rather
         // than the account reading lapsed while it still sends and pushes.
         if let Err(e) = run_script(cfg, "lapse-user.sh", &[username.as_str()]).await {
-            Error::from(e).report(&format!("stopping access for {username}"));
+            Transitions::from(e).report(&format!("stopping access for {username}"));
             continue;
         }
         let Some(window) = payment.window.as_mut() else {
@@ -639,7 +671,9 @@ pub async fn window_sweep(
         let account = store
             .update_account(&username, |current| {
                 let Some(account) = current.as_mut() else {
-                    return Err(Error::Failed(format!("no account for {username}")));
+                    return Err(Transitions::Lifecycle(Error::NoAccount {
+                        username: username.to_string(),
+                    }));
                 };
                 account.state = Standing::Lapsed;
                 account.grace_until = Some(grace.clone());
@@ -684,10 +718,10 @@ pub async fn window_sweep(
                 journal,
                 "group",
                 &domain,
-                &Error::Failed(format!(
-                    "the group's payment window close date {:?} cannot be read, so {domain} was not swept",
-                    window.closes_at
-                )),
+                &Transitions::Lifecycle(Error::GroupWindowCloseDateUnreadable {
+                    closes_at: window.closes_at.clone(),
+                    domain: domain.to_string(),
+                }),
             )
             .await;
             continue;
@@ -720,7 +754,7 @@ pub async fn window_sweep(
                 continue;
             }
             if let Err(e) = run_script(cfg, "lapse-user.sh", &[mailbox.as_str()]).await {
-                Error::from(e).report(&format!("stopping access for {mailbox} in {domain}"));
+                Transitions::from(e).report(&format!("stopping access for {mailbox} in {domain}"));
                 stopped = false;
                 continue;
             }
@@ -728,7 +762,15 @@ pub async fn window_sweep(
                 Ok(Some(account)) => account,
                 Ok(None) => continue,
                 Err(e) => {
-                    report_record(cfg, store, journal, "account", mailbox, &Error::from(e)).await;
+                    report_record(
+                        cfg,
+                        store,
+                        journal,
+                        "account",
+                        mailbox,
+                        &Transitions::from(e),
+                    )
+                    .await;
                     stopped = false;
                     continue;
                 }
@@ -748,7 +790,7 @@ pub async fn window_sweep(
                             account.grace_until = Some(grace.clone());
                         }
                     }
-                    Ok::<(), Error>(())
+                    Ok::<(), Transitions>(())
                 })
                 .await?;
         }
@@ -776,7 +818,7 @@ async fn group_lapse_notice(
     journal: &Journal,
     group: &GroupRecord,
     window: &Window,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let Some(to) = group_notice_recipient(cfg, store, journal, group).await else {
         return Ok(());
     };
@@ -818,7 +860,7 @@ async fn group_grace_notice(
     journal: &Journal,
     group: &GroupRecord,
     grace: time::Date,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let Some(to) = group_notice_recipient(cfg, store, journal, group).await else {
         return Ok(());
     };
@@ -857,7 +899,7 @@ async fn group_final_notice(
     journal: &Journal,
     group: &GroupRecord,
     grace: time::Date,
-) -> Result<bool, Error> {
+) -> Result<bool, Transitions> {
     let Some(to) = group_notice_recipient(cfg, store, journal, group).await else {
         return Ok(false);
     };
@@ -886,7 +928,7 @@ async fn group_final_notice(
         &body,
     )
     .await
-    .map_err(Error::from)
+    .map_err(Transitions::from)
 }
 
 /// Whether a lapsed group mailbox still has a body-level addressee. When it
@@ -913,7 +955,7 @@ async fn group_mailbox_has_addressee(
     match store.account(&group.site_owner).await {
         Ok(owner) => owner.is_some(),
         Err(e) => {
-            Error::from(e).report(&format!(
+            Transitions::from(e).report(&format!(
                 "the notice record for {} of {domain}",
                 group.site_owner
             ));
@@ -927,7 +969,11 @@ async fn group_mailbox_has_addressee(
 /// deletion transition at `grace_until`. The notice is deduplicated by its
 /// `notices.jsonl` line, and the deletion is due-gated on the transition's own
 /// journal id so a failed erase backs off rather than being retried every minute.
-pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) -> Result<(), Error> {
+pub async fn grace_sweep(
+    cfg: &DrainConfig,
+    store: &Store,
+    journal: &Journal,
+) -> Result<(), Transitions> {
     let now = OffsetDateTime::now_utc();
     let today = now.date();
     for username in store.list("accounts").await? {
@@ -962,9 +1008,10 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
                 journal,
                 "account",
                 &username,
-                &Error::Failed(format!(
-                    "the grace date {grace_text:?} cannot be read, so {username} was not swept"
-                )),
+                &Transitions::Lifecycle(Error::GraceDateUnreadable {
+                    grace: grace_text.to_string(),
+                    username: username.to_string(),
+                }),
             )
             .await;
             continue;
@@ -1001,7 +1048,7 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
                             if let Some(account) = current.as_mut() {
                                 account.grace_until = Some(util::date_after_days(7));
                             }
-                            Ok::<(), Error>(())
+                            Ok::<(), Transitions>(())
                         })
                         .await?;
                     continue;
@@ -1078,10 +1125,10 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
                 journal,
                 "group",
                 &domain,
-                &Error::Failed(format!(
-                    "the group's grace date {:?} cannot be read, so {domain} was not swept",
-                    group.grace_until.as_deref().unwrap_or("")
-                )),
+                &Transitions::Lifecycle(Error::GroupGraceDateUnreadable {
+                    grace: group.grace_until.clone().unwrap_or_default(),
+                    domain: domain.to_string(),
+                }),
             )
             .await;
             continue;
@@ -1103,7 +1150,8 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
             let owner = match store.account(&group.site_owner).await {
                 Ok(owner) => owner,
                 Err(e) => {
-                    Error::from(e).report(&format!("the notice record for {}", group.site_owner));
+                    Transitions::from(e)
+                        .report(&format!("the notice record for {}", group.site_owner));
                     continue;
                 }
             };
@@ -1124,7 +1172,7 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
                                 if let Some(group) = current.as_mut() {
                                     group.grace_until = Some(util::date_after_days(7));
                                 }
-                                Ok::<(), Error>(())
+                                Ok::<(), Transitions>(())
                             })
                             .await?;
                         continue;
@@ -1146,10 +1194,10 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
                     journal,
                     &format!("{id}-no-owner"),
                     "delete",
-                    &Error::Failed(format!(
-                        "the site owner record for {} is gone, so the group {domain} has no addressee; its member accounts are deleted under their own notices before the group record goes",
-                        group.site_owner
-                    )),
+                    &Transitions::Lifecycle(Error::SiteOwnerGone {
+                        owner: group.site_owner.clone(),
+                        domain: domain.to_string(),
+                    }),
                 )
                 .await;
                 let mut remaining = None;
@@ -1161,7 +1209,7 @@ pub async fn grace_sweep(cfg: &DrainConfig, store: &Store, journal: &Journal) ->
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            Error::from(e)
+                            Transitions::from(e)
                                 .report(&format!("the account record for {mailbox} in {domain}"));
                             remaining = Some(mailbox.clone());
                             break;
@@ -1210,21 +1258,24 @@ fn valid_contact(address: Option<&str>) -> Option<String> {
 /// because provisioning writes a group mailbox's account without an outside
 /// address of its own. Both are read through the typed accessors of #554, and
 /// both are held to the same validation rule as a person's notice.
-async fn group_notice_address(store: &Store, group: &GroupRecord) -> Result<String, Error> {
-    let path = format!("accounts/{}/account.json", group.site_owner);
-    let account = store
-        .account(&group.site_owner)
-        .await?
-        .ok_or_else(|| Error::Failed(format!("{path} is missing")))?;
+async fn group_notice_address(
+    store: &Store,
+    group: &GroupRecord,
+) -> Result<Option<String>, store::Error> {
+    let Some(account) = store.account(&group.site_owner).await? else {
+        return Ok(None);
+    };
     if let Some(to) = valid_contact(account.outside_address.as_deref()) {
-        return Ok(to);
+        return Ok(Some(to));
     }
     let copy = store
         .account_application_text(&group.site_owner)
         .await?
         .and_then(|text| serde_json::from_str::<Record>(&text).ok());
     let from_copy = copy.and_then(|copy| valid_contact(copy.outside_address.as_deref()));
-    Ok(from_copy.unwrap_or_else(|| account.platform_address()))
+    Ok(Some(
+        from_copy.unwrap_or_else(|| account.platform_address()),
+    ))
 }
 
 /// The recipient a group's lifecycle notice takes, or `None` when the site
@@ -1239,18 +1290,33 @@ async fn group_notice_recipient(
     group: &GroupRecord,
 ) -> Option<String> {
     match group_notice_address(store, group).await {
-        Ok(to) => Some(to),
-        Err(e) => {
+        Ok(Some(to)) => Some(to),
+        Ok(None) => {
             report_record(
                 cfg,
                 store,
                 journal,
                 "account",
                 &group.site_owner,
-                &Error::Failed(format!(
-                    "{e}, so {}'s group notice has no addressee",
-                    group.domain
-                )),
+                &Transitions::Lifecycle(Error::SiteOwnerGone {
+                    owner: group.site_owner.clone(),
+                    domain: group.domain.clone(),
+                }),
+            )
+            .await;
+            None
+        }
+        Err(source) => {
+            report_record(
+                cfg,
+                store,
+                journal,
+                "account",
+                &group.site_owner,
+                &Transitions::Lifecycle(Error::NoAddressee {
+                    domain: group.domain.clone(),
+                    source,
+                }),
             )
             .await;
             None
@@ -1267,7 +1333,7 @@ async fn grace_notice(
     store: &Store,
     username: &str,
     account: &Account,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let grace = account.grace_until.as_deref().unwrap_or("");
     let token = account
         .payment_state()
@@ -1306,7 +1372,7 @@ async fn delete_group(
     journal: &Journal,
     group: &GroupRecord,
     id: &str,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     if journal.has(id, "applied") {
         return remove_group_record(store, &group.domain).await;
     }
@@ -1355,7 +1421,7 @@ async fn final_notice(
     store: &Store,
     username: &str,
     account: &Account,
-) -> Result<bool, Error> {
+) -> Result<bool, Transitions> {
     let grace = account.grace_until.as_deref().unwrap_or("");
     let token = account
         .payment_state()
@@ -1381,7 +1447,7 @@ async fn final_notice(
         &body,
     )
     .await
-    .map_err(Error::from)
+    .map_err(Transitions::from)
 }
 
 /// The last notice before a suspended account's grace ends. It names the reason
@@ -1393,7 +1459,7 @@ async fn suspension_final_notice(
     store: &Store,
     username: &str,
     account: &Account,
-) -> Result<bool, Error> {
+) -> Result<bool, Transitions> {
     let grace = account.grace_until.as_deref().unwrap_or("");
     let reason = account.suspension_reason.as_deref().unwrap_or("");
     let to = account.notice_address();
@@ -1420,7 +1486,7 @@ async fn suspension_final_notice(
         &body,
     )
     .await
-    .map_err(Error::from)
+    .map_err(Transitions::from)
 }
 
 /// `kyriakon-admin notice stop`: hold the account's grace clock after the
@@ -1429,24 +1495,27 @@ async fn suspension_final_notice(
 /// refuses unless a permanent failure is recorded for every address a lifecycle
 /// notice went to, then latches the stop the sweep reads. `notice resend`
 /// clears it.
-pub async fn stop_notice(store: &Store, username: &str) -> Result<store::NoticeStop, Error> {
-    if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+pub async fn stop_notice(store: &Store, username: &str) -> Result<store::NoticeStop, Transitions> {
+    if let Some(source) = validate::username_shape(username) {
+        return Err(Transitions::Lifecycle(Error::InvalidUsername {
+            username: username.to_string(),
+            source,
+        }));
     }
     if store.account(username).await?.is_none() {
-        return Err(Error::Failed(format!("no account for {username}")));
+        return Err(Transitions::Lifecycle(Error::NoAccount {
+            username: username.to_string(),
+        }));
     }
     if !bounce::every_address_failed(store, username).await? {
-        return Err(Error::Failed(format!(
-            "the lifecycle notices to {username} have not all hard-bounced, so there is no \
-             delivery report to hold it on"
-        )));
+        return Err(Transitions::Lifecycle(Error::NoHardBounce {
+            username: username.to_string(),
+        }));
     }
     let Some(failed) = bounce::last_failure(store, username).await? else {
-        return Err(Error::Failed(format!(
-            "the lifecycle notices to {username} have not all hard-bounced, so there is no \
-             delivery report to hold it on"
-        )));
+        return Err(Transitions::Lifecycle(Error::NoHardBounce {
+            username: username.to_string(),
+        }));
     };
     let stop = store::NoticeStop {
         address: failed.to.clone(),
@@ -1471,7 +1540,7 @@ pub async fn stop_notice(store: &Store, username: &str) -> Result<store::NoticeS
             if let Some(account) = current {
                 account.notice_stopped = Some(latched);
             }
-            Ok::<(), Error>(())
+            Ok::<(), Transitions>(())
         })
         .await?;
     Ok(stop)
@@ -1497,16 +1566,24 @@ pub async fn resend_notice(
     username: &str,
     to: Option<&str>,
     group: Option<&str>,
-) -> Result<(String, String), Error> {
-    if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+) -> Result<(String, String), Transitions> {
+    if let Some(source) = validate::username_shape(username) {
+        return Err(Transitions::Lifecycle(Error::InvalidUsername {
+            username: username.to_string(),
+            source,
+        }));
     }
     let Some(account) = store.account(username).await? else {
-        return Err(Error::Failed(format!("no account for {username}")));
+        return Err(Transitions::Lifecycle(Error::NoAccount {
+            username: username.to_string(),
+        }));
     };
     if let Some(domain) = group {
-        if let Some(why) = validate::domain(domain) {
-            return Err(Error::Failed(format!("the domain {domain:?}: {why}")));
+        if let Some(source) = validate::domain(domain) {
+            return Err(Transitions::Lifecycle(Error::InvalidDomain {
+                domain: domain.to_string(),
+                source,
+            }));
         }
         return resend_group(cfg, store, &account, username, domain, to).await;
     }
@@ -1534,15 +1611,15 @@ pub async fn resend_notice(
         candidates.push(record.domain);
     }
     match candidates.as_slice() {
-        [] => Err(Error::Failed(format!(
-            "{username} is {}, so it has no grace clock to restart",
-            account.state
-        ))),
+        [] => Err(Transitions::Lifecycle(Error::NoGraceClock {
+            username: username.to_string(),
+            standing: account.state,
+        })),
         [domain] => resend_group(cfg, store, &account, username, domain, to).await,
-        many => Err(Error::Failed(format!(
-            "{username} owns more than one lapsed group ({}); name one with --group",
-            many.join(", ")
-        ))),
+        many => Err(Transitions::Lifecycle(Error::SeveralLapsedGroups {
+            username: username.to_string(),
+            domains: many.to_vec(),
+        })),
     }
 }
 
@@ -1553,7 +1630,7 @@ async fn resend_account(
     account: Account,
     username: &str,
     to: Option<&str>,
-) -> Result<(String, String), Error> {
+) -> Result<(String, String), Transitions> {
     let to = resend_address(to, &account)?;
     let token = account
         .payment_state()
@@ -1600,7 +1677,9 @@ async fn resend_account(
     store
         .update_account(username, |current| {
             let Some(account) = current.as_mut() else {
-                return Err(Error::Failed(format!("no account for {username}")));
+                return Err(Transitions::Lifecycle(Error::NoAccount {
+                    username: username.to_string(),
+                }));
             };
             if to != account.notice_address() {
                 account.outside_address = Some(to.clone());
@@ -1622,19 +1701,22 @@ async fn resend_group(
     username: &str,
     domain: &str,
     to: Option<&str>,
-) -> Result<(String, String), Error> {
+) -> Result<(String, String), Transitions> {
     let Some(group) = store.group(domain).await? else {
-        return Err(Error::Failed(format!("no group for {domain}")));
+        return Err(Transitions::Lifecycle(Error::NoGroup {
+            domain: domain.to_string(),
+        }));
     };
     if group.site_owner != username {
-        return Err(Error::Failed(format!(
-            "{domain} is not {username}'s group, so this account cannot clear its stop"
-        )));
+        return Err(Transitions::Lifecycle(Error::NotOwnGroup {
+            domain: domain.to_string(),
+            username: username.to_string(),
+        }));
     }
     if group.payment.no_charge {
-        return Err(Error::Failed(format!(
-            "{domain} has no charge, so it has no grace clock to restart"
-        )));
+        return Err(Transitions::Lifecycle(Error::NoCharge {
+            domain: domain.to_string(),
+        }));
     }
     if group
         .payment
@@ -1642,14 +1724,14 @@ async fn resend_group(
         .as_ref()
         .is_none_or(|window| window.state != WindowState::Closed)
     {
-        return Err(Error::Failed(format!(
-            "{domain}'s payment window is not closed, so it has no grace clock to restart"
-        )));
+        return Err(Transitions::Lifecycle(Error::WindowNotClosed {
+            domain: domain.to_string(),
+        }));
     }
     if group.grace_until.is_none() {
-        return Err(Error::Failed(format!(
-            "{domain} has no grace date, so it has no clock to restart"
-        )));
+        return Err(Transitions::Lifecycle(Error::NoGraceDate {
+            domain: domain.to_string(),
+        }));
     }
     let to = resend_address(to, account)?;
     let grace = util::date_after_days(40);
@@ -1677,7 +1759,9 @@ async fn resend_group(
     store
         .update_group(domain, |current| {
             let Some(group) = current.as_mut() else {
-                return Err(Error::Failed(format!("no group for {domain}")));
+                return Err(Transitions::Lifecycle(Error::NoGroup {
+                    domain: domain.to_string(),
+                }));
             };
             group.grace_until = Some(grace.clone());
             Ok(())
@@ -1690,7 +1774,9 @@ async fn resend_group(
     store
         .update_account(username, |current| {
             let Some(account) = current.as_mut() else {
-                return Err(Error::Failed(format!("no account for {username}")));
+                return Err(Transitions::Lifecycle(Error::NoAccount {
+                    username: username.to_string(),
+                }));
             };
             if to != account.notice_address() {
                 account.outside_address = Some(to.clone());
@@ -1705,11 +1791,14 @@ async fn resend_group(
 /// The address a resend goes to: the operator's when they named one that is a
 /// mail address, and otherwise the platform mailbox, which a lapsed or
 /// suspended account can still read.
-fn resend_address(to: Option<&str>, account: &Account) -> Result<String, Error> {
+fn resend_address(to: Option<&str>, account: &Account) -> Result<String, Transitions> {
     match to {
         Some(to) => {
-            if let Some(why) = validate::address(to) {
-                return Err(Error::Failed(format!("the address {to:?}: {why}")));
+            if let Some(source) = validate::address(to) {
+                return Err(Transitions::Lifecycle(Error::InvalidAddress {
+                    address: to.to_string(),
+                    source,
+                }));
             }
             Ok(to.to_string())
         }
@@ -1726,11 +1815,11 @@ async fn lapse_notice(
     username: &str,
     account: &Account,
     payment: &Payment,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let window = payment
         .window
         .as_ref()
-        .ok_or_else(|| Error::Failed("a lapsed account has no window".to_string()))?;
+        .ok_or_else(|| Transitions::Lifecycle(Error::LapsedNoWindow))?;
     let closes_on = &window.closes_at[..10.min(window.closes_at.len())];
     let token = payment.token_ref.as_deref().unwrap_or("");
     let grace = account.grace_until.as_deref().unwrap_or("");
@@ -1774,18 +1863,21 @@ pub async fn suspend(
     journal: &Journal,
     username: &str,
     reason: &str,
-) -> Result<(), Error> {
-    if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+) -> Result<(), Transitions> {
+    if let Some(source) = validate::username_shape(username) {
+        return Err(Transitions::Lifecycle(Error::InvalidUsername {
+            username: username.to_string(),
+            source,
+        }));
     }
     let reason = reason.trim();
     if reason.is_empty() {
-        return Err(Error::Failed(
-            "a suspension needs a reason, in the words the member will read".to_string(),
-        ));
+        return Err(Transitions::Lifecycle(Error::SuspensionReasonEmpty));
     }
     let Some(account) = store.account(username).await? else {
-        return Err(Error::Failed(format!("no account for {username}")));
+        return Err(Transitions::Lifecycle(Error::NoAccount {
+            username: username.to_string(),
+        }));
     };
     // The id is the account's own, so a retry after a crash finishes the same
     // suspension rather than starting a second one.
@@ -1808,7 +1900,9 @@ pub async fn suspend(
     let account = store
         .update_account(username, |current| {
             let Some(account) = current.as_mut() else {
-                return Err(Error::Failed(format!("no account for {username}")));
+                return Err(Transitions::Lifecycle(Error::NoAccount {
+                    username: username.to_string(),
+                }));
             };
             account.suspend(reason);
             // The suspension enters the same forty-day grace as a lapse. A retry
@@ -1882,17 +1976,22 @@ pub async fn resume(
     store: &Store,
     journal: &Journal,
     username: &str,
-) -> Result<Resume, Error> {
-    if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username:?}: {why}")));
+) -> Result<Resume, Transitions> {
+    if let Some(source) = validate::username_shape(username) {
+        return Err(Transitions::Lifecycle(Error::InvalidUsername {
+            username: username.to_string(),
+            source,
+        }));
     }
     let Some(account) = store.account(username).await? else {
-        return Err(Error::Failed(format!("no account for {username}")));
+        return Err(Transitions::Lifecycle(Error::NoAccount {
+            username: username.to_string(),
+        }));
     };
     if account.state != Standing::Suspended {
-        return Err(Error::Failed(format!(
-            "{username} is not suspended, so there is nothing to resume"
-        )));
+        return Err(Transitions::Lifecycle(Error::NotSuspended {
+            username: username.to_string(),
+        }));
     }
     let id = format!("resume-{username}-{}", account.created_at);
     let application = ApplicationRef::account(username.to_string());
@@ -1934,7 +2033,9 @@ pub async fn resume(
     let standing = store
         .update_account(username, |current| {
             let Some(account) = current.as_mut() else {
-                return Err(Error::Failed(format!("no account for {username}")));
+                return Err(Transitions::Lifecycle(Error::NoAccount {
+                    username: username.to_string(),
+                }));
             };
             let standing = account.resume(lapsed)?;
             Ok(standing)
@@ -1984,9 +2085,12 @@ pub async fn delete_account(
     store: &Store,
     journal: &Journal,
     username: &str,
-) -> Result<(), Error> {
-    if let Some(why) = validate::username_shape(username) {
-        return Err(Error::Failed(format!("the username {username}: {why}")));
+) -> Result<(), Transitions> {
+    if let Some(source) = validate::username_shape(username) {
+        return Err(Transitions::Lifecycle(Error::InvalidUsername {
+            username: username.to_string(),
+            source,
+        }));
     }
     // The account record is read before the journal line so the answer can name
     // a refund from the token's ledger lines. A record that has already gone is
@@ -2088,7 +2192,7 @@ pub async fn delete_account(
                         if let Some(group) = current.as_mut() {
                             group.accounts.retain(|mailbox| mailbox != username);
                         }
-                        Ok::<(), Error>(())
+                        Ok::<(), Transitions>(())
                     })
                     .await?;
             }
@@ -2128,7 +2232,7 @@ pub(super) async fn close_box_account(
     cfg: &DrainConfig,
     store: &Store,
     username: &str,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     hold_name(store, username).await?;
     store.remove("keys", &format!("{username}.pub")).await?;
     run_script(cfg, "delete-user.sh", &[username]).await?;
@@ -2141,7 +2245,7 @@ pub(super) async fn close_box_account(
 /// nothing when the ledger has none. Read from the ledger rather than the
 /// account because the refund is a ledger line and the account record is about
 /// to go.
-async fn erasure_refund(store: &Store, account: &Account) -> Result<Option<String>, Error> {
+async fn erasure_refund(store: &Store, account: &Account) -> Result<Option<String>, Transitions> {
     let Some(token) = account.payment_state().and_then(|p| p.token_ref) else {
         return Ok(None);
     };
@@ -2169,27 +2273,33 @@ async fn erasure_refund(store: &Store, account: &Account) -> Result<Option<Strin
 /// `scripts/check-keyring-drift.sh` alerts on a published key the box no longer
 /// serves: publishing the removal first keeps that signal to the window the
 /// change takes to merge.
-pub(super) async fn remove_published_key(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
+pub(super) async fn remove_published_key(
+    cfg: &DrainConfig,
+    username: &str,
+) -> Result<(), Transitions> {
     run_script(
         cfg,
         "publish-mail-key.sh",
         &["--remove", username, cfg.keyring_publish_token.as_str()],
     )
     .await
-    .map_err(Error::from)
+    .map_err(Transitions::from)
 }
 
 /// Drop one account's published key from the box keyring. A missing directory or
 /// file is already done, which is what makes a retry safe.
-pub(super) async fn remove_keyring_entry(cfg: &DrainConfig, username: &str) -> Result<(), Error> {
+pub(super) async fn remove_keyring_entry(
+    cfg: &DrainConfig,
+    username: &str,
+) -> Result<(), Transitions> {
     let path = kyriakon_control_core::mail::keycheck::keyring_file(&cfg.keyring_dir, username);
     match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::Failed(format!(
-            "cannot remove {}: {e}",
-            path.display()
-        ))),
+        Err(e) => Err(Transitions::Lifecycle(Error::RemoveFile {
+            path,
+            source: e,
+        })),
     }
 }
 
@@ -2201,12 +2311,11 @@ pub async fn close_account(
     cfg: &DrainConfig,
     store: &Store,
     intent: CloseIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     if intent.kind != "close" {
-        return Err(Error::Failed(format!(
-            "kind {:?} is not a close intent",
-            intent.kind
-        )));
+        return Err(Transitions::Lifecycle(Error::NotCloseIntent {
+            kind: intent.kind.clone(),
+        }));
     }
     let application = ApplicationRef::account(intent.username.clone());
     let Some(mut account) = store.account(&intent.username).await? else {
@@ -2230,9 +2339,11 @@ pub async fn close_account(
         id: Some(&intent.id),
     };
     if let Err(e) = kyriakon_control_core::account::requests::record(store, request).await {
-        if !matches!(&e, kyriakon_control_core::Error::Failed(message) if message.contains("already recorded"))
-        {
-            return Err(Error::from(e));
+        if !matches!(
+            &e,
+            kyriakon_control_core::account::Error::AlreadyRecorded { .. }
+        ) {
+            return Err(Transitions::from(e));
         }
     }
     if account.state == Standing::Closing {
@@ -2280,7 +2391,7 @@ pub async fn close_account(
                 );
                 account.payment = payment.clone();
             }
-            Ok::<(), Error>(())
+            Ok::<(), Transitions>(())
         })
         .await?;
     Ok(Settlement::line(
@@ -2296,12 +2407,14 @@ pub async fn close_account(
 /// returns to it. The purge is the sweep's and runs on the date, so an intent
 /// that arrives after it finds no record and is refused with the reason the
 /// member needs.
-pub async fn cancel_close(store: &Store, intent: CancelCloseIntent) -> Result<Settlement, Error> {
+pub async fn cancel_close(
+    store: &Store,
+    intent: CancelCloseIntent,
+) -> Result<Settlement, Transitions> {
     if intent.kind != "cancel-close" {
-        return Err(Error::Failed(format!(
-            "kind {:?} is not a cancel-close intent",
-            intent.kind
-        )));
+        return Err(Transitions::Lifecycle(Error::NotCancelCloseIntent {
+            kind: intent.kind.clone(),
+        }));
     }
     let application = ApplicationRef::account(intent.username.clone());
     let Some(mut account) = store.account(&intent.username).await? else {
@@ -2330,11 +2443,7 @@ pub async fn cancel_close(store: &Store, intent: CancelCloseIntent) -> Result<Se
     let prior = match account.cancel_close() {
         Ok(prior) => prior,
         Err(e) => {
-            let reason = match &e {
-                kyriakon_control_core::Error::Failed(message) => message.clone(),
-                _ => e.to_string(),
-            };
-            return Ok(Settlement::refused(reason));
+            return Ok(Settlement::refused(e.to_string()));
         }
     };
     // The closure took the mailbox out of its group's list, so a cancellation
@@ -2359,7 +2468,7 @@ pub async fn cancel_close(store: &Store, intent: CancelCloseIntent) -> Result<Se
                 account.closing_prior_state = None;
                 account.closing_refunded = false;
             }
-            Ok::<(), Error>(())
+            Ok::<(), Transitions>(())
         })
         .await?;
     Ok(Settlement::line(
@@ -2391,7 +2500,7 @@ pub async fn change_password(
     cfg: &DrainConfig,
     store: &Store,
     intent: ChangePasswordIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let Some(account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -2443,7 +2552,7 @@ pub async fn upload_key(
     cfg: &DrainConfig,
     store: &Store,
     intent: UploadKeyIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let Some(mut account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -2591,7 +2700,7 @@ pub async fn upload_key(
                 account.site_served = site_served;
                 account.capsule_served = capsule_served;
             }
-            Ok::<(), Error>(())
+            Ok::<(), Transitions>(())
         })
         .await?;
     Ok(Settlement::line(
@@ -2607,7 +2716,7 @@ pub async fn upload_key(
 pub async fn set_outside_address(
     store: &Store,
     intent: OutsideAddressIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let Some(account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -2632,7 +2741,7 @@ pub async fn set_outside_address(
             if let Some(account) = current.as_mut() {
                 account.outside_address = outside;
             }
-            Ok::<(), Error>(())
+            Ok::<(), Transitions>(())
         })
         .await?;
     Ok(Settlement::line(
@@ -2649,7 +2758,7 @@ pub async fn set_serving(
     cfg: &DrainConfig,
     store: &Store,
     intent: ServingIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let Some(account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -2703,7 +2812,7 @@ pub async fn set_serving(
                 account.site_served = Some(intent.http);
                 account.capsule_served = Some(intent.gemini);
             }
-            Ok::<(), Error>(())
+            Ok::<(), Transitions>(())
         })
         .await?;
     Ok(Settlement::line(
@@ -2723,7 +2832,7 @@ pub async fn cancel_renewal(
     cfg: &DrainConfig,
     store: &Store,
     intent: CancelRenewalIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let Some(mut account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -2774,7 +2883,7 @@ pub async fn cancel_renewal(
                         payment.stripe.cancel_at_period_end = true;
                     }
                 }
-                Ok::<(), Error>(())
+                Ok::<(), Transitions>(())
             })
             .await?;
     }
@@ -2794,7 +2903,7 @@ pub async fn test_mail(
     cfg: &DrainConfig,
     store: &Store,
     intent: TestMailIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let Some(account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -2878,7 +2987,7 @@ async fn rotation_notices(
     request: &str,
     subject: &str,
     body: &str,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     for (i, to) in account_addresses(account).iter().enumerate() {
         let kind = if i == 0 {
             format!("{notice_type}.{request}")
@@ -2910,7 +3019,7 @@ async fn signed_by_current_key(
     expected: &str,
     fingerprint: &str,
     signature: &str,
-) -> Result<bool, Error> {
+) -> Result<bool, Transitions> {
     Ok(kyriakon_control_core::mail::pgp::verify_detached(
         &cfg.gpg,
         key_file,
@@ -2933,14 +3042,14 @@ async fn apply_rotation(
     store: &Store,
     account: &mut Account,
     rotation: &store::Rotation,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let key =
         kyriakon_control_core::mail::keycheck::mail_key(String::new(), "", &rotation.material);
     if key.fingerprint != rotation.fingerprint {
-        return Err(Error::Failed(format!(
-            "the pending key's fingerprint is {} and the key reads as {}",
-            rotation.fingerprint, key.fingerprint
-        )));
+        return Err(Transitions::Lifecycle(Error::FingerprintMismatch {
+            pending: rotation.fingerprint.clone(),
+            read: key.fingerprint.clone(),
+        }));
     }
     publish_mail_keys(cfg, &account.username, std::slice::from_ref(&key)).await?;
     let username = account.username.clone();
@@ -2951,7 +3060,7 @@ async fn apply_rotation(
                 account.mail_key = Some(fingerprint.clone());
                 account.rotation = None;
             }
-            Ok::<(), Error>(())
+            Ok::<(), Transitions>(())
         })
         .await?;
     // The published set is the operator's step, and the box keyring and the
@@ -3005,7 +3114,7 @@ pub async fn mail_key(
     cfg: &DrainConfig,
     store: &Store,
     intent: MailKeyIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let Some(mut account) = store.account(&intent.username).await? else {
         return Ok(account_gone(&intent.username));
     };
@@ -3025,7 +3134,7 @@ pub async fn mail_key(
                     if let Some(account) = current.as_mut() {
                         account.rotation = None;
                     }
-                    Ok::<(), Error>(())
+                    Ok::<(), Transitions>(())
                 })
                 .await?;
             let body = "The replacement of your mail key was cancelled. The key in use is \
@@ -3086,7 +3195,10 @@ pub async fn mail_key(
                     Some(fingerprint) if !fingerprint.is_empty() => fingerprint.to_string(),
                     _ => {
                         let material = std::fs::read_to_string(&key_file).map_err(|e| {
-                            Error::context(format!("cannot read {}", key_file.display()), e)
+                            Transitions::Lifecycle(Error::ReadKeyFile {
+                                path: key_file.clone(),
+                                source: e,
+                            })
                         })?;
                         match kyriakon_control_core::mail::pgp::inspect_single_cert(&material) {
                             Ok(cert) => cert.fingerprint,
@@ -3124,7 +3236,7 @@ pub async fn mail_key(
                 requested_at: util::filed_at(),
                 applies_at: (OffsetDateTime::now_utc() + Duration::hours(72))
                     .format(&Rfc3339)
-                    .map_err(|e| Error::context("cannot write the window's end", e))?,
+                    .map_err(|e| Transitions::context("cannot write the window's end", e))?,
             };
             account.rotation = Some(rotation.clone());
             if signed {
@@ -3137,7 +3249,7 @@ pub async fn mail_key(
                         if let Some(account) = current.as_mut() {
                             account.rotation = Some(pending.clone());
                         }
-                        Ok::<(), Error>(())
+                        Ok::<(), Transitions>(())
                     })
                     .await?;
                 let body = format!(
@@ -3187,7 +3299,7 @@ pub async fn mail_key_rotations(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     for username in store.list("accounts").await? {
         let Some(mut account) = sweep_account(cfg, store, journal, &username).await else {
             continue;
@@ -3196,10 +3308,10 @@ pub async fn mail_key_rotations(
             continue;
         };
         let applies = OffsetDateTime::parse(&rotation.applies_at, &Rfc3339).map_err(|e| {
-            Error::context(
-                format!("the rotation window of {username} does not parse"),
-                e,
-            )
+            Transitions::Lifecycle(Error::RotationWindowUnparseable {
+                username: username.to_string(),
+                source: e,
+            })
         })?;
         if OffsetDateTime::now_utc() < applies {
             continue;
@@ -3253,12 +3365,12 @@ pub async fn check_group_dns(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let values = dns::Values::from(cfg);
     if let Err(e) = values.check() {
         // The approval already refuses a placeholder; a box that has one has no
         // published values to watch, and that is not a reason to hold the pass.
-        Error::from(e).report("the DNS values");
+        Transitions::from(e).report("the DNS values");
         return Ok(());
     }
     let now = OffsetDateTime::now_utc();
@@ -3285,7 +3397,7 @@ async fn check_one_group(
     values: &dns::Values,
     group: &GroupRecord,
     now: OffsetDateTime,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let state: Option<Value> = store
         .dns_check_text(&group.domain)
         .await?
@@ -3369,7 +3481,7 @@ async fn write_dns_state(
     broken: bool,
     outage: Option<&str>,
     notified: bool,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let bytes = serde_json::to_vec_pretty(&json!({
         "version": 1,
         "checked_at": checked_at,
@@ -3377,14 +3489,14 @@ async fn write_dns_state(
         "outage": outage,
         "notified": notified,
     }))
-    .map_err(|source| Error::Json {
+    .map_err(|source| Transitions::Json {
         context: "encode the DNS check state",
         source,
     })?;
     store
         .write_record(&format!("groups/{domain}"), "dns-check.json", &bytes)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// Whether any row the recipe names has stopped resolving, or a TXT answer no
@@ -3392,7 +3504,11 @@ async fn write_dns_state(
 /// The resolver is a configured command so the acceptance test never touches the
 /// network; it is read-only by construction and the body's zone is not a file
 /// this box can write.
-async fn dns_broken(cfg: &DrainConfig, values: &dns::Values, domain: &str) -> Result<bool, Error> {
+async fn dns_broken(
+    cfg: &DrainConfig,
+    values: &dns::Values,
+    domain: &str,
+) -> Result<bool, Transitions> {
     // The checks come from the recipe itself, so a row added to it (or a
     // rotated selector) is watched without a second list to edit.
     let recipe = dns::recipe(domain, values);
@@ -3422,19 +3538,22 @@ async fn dns_broken(cfg: &DrainConfig, values: &dns::Values, domain: &str) -> Re
                 .output()
                 .await
                 .map_err(|e| {
-                    Error::context(format!("cannot run the resolver {}", cfg.resolver), e)
+                    Transitions::Lifecycle(Error::RunResolver {
+                        resolver: cfg.resolver.clone(),
+                        source: e,
+                    })
                 })?;
             if !out.status.success() {
                 // No answer is not the body's zone being broken: dig exits
                 // non-zero when it could not reach a server, and a name that
                 // does not resolve answers successfully with nothing. Only the
                 // second is an outage, so this is the platform's own failure.
-                return Err(Error::Failed(format!(
-                    "the resolver {} could not answer {name} {}: {}",
-                    cfg.resolver,
-                    row.record_type,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )));
+                return Err(Transitions::Lifecycle(Error::ResolverUnavailable {
+                    resolver: cfg.resolver.clone(),
+                    name: name.clone(),
+                    record_type: row.record_type.to_string(),
+                    stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                }));
             }
             let answer = String::from_utf8_lossy(&out.stdout);
             let answer = answer.trim();
@@ -3453,7 +3572,7 @@ async fn dns_broken(cfg: &DrainConfig, values: &dns::Values, domain: &str) -> Re
 /// in the mailbox's retained application copy, and the accountable address
 /// otherwise. The copy is inside the ninety-day purge, so an application already
 /// cleared falls back rather than failing the sweep.
-pub(super) async fn dns_contact(store: &Store, group: &GroupRecord) -> Result<String, Error> {
+pub(super) async fn dns_contact(store: &Store, group: &GroupRecord) -> Result<String, Transitions> {
     let copy: Option<Value> = store
         .account_application_text(&group.site_owner)
         .await?
@@ -3503,7 +3622,7 @@ pub async fn refresh_space_used(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     // A pass with no accounts has nothing to record, so it writes neither the
     // report nor the state. That keeps a store that has never been provisioned
     // byte-identical across a pass, which the sweep tests rely on.
@@ -3535,15 +3654,21 @@ pub async fn refresh_space_used(
             // No repquota on this box, or no permission: the same no-op the
             // other sweeps take, and the state still moves so the error is not
             // printed every minute.
-            Error::Failed(format!("cannot read the quota with {}: {e}", cfg.repquota))
-                .report("the quota report");
+            Transitions::Lifecycle(Error::ReadQuota {
+                repquota: cfg.repquota.clone(),
+                source: e,
+            })
+            .report("the quota report");
             write_quota_state(store).await?;
             return Ok(());
         }
     };
     if !report.status.success() {
-        Error::Failed(format!("{} exited {}", cfg.repquota, report.status))
-            .report("the quota report");
+        Transitions::Lifecycle(Error::QuotaExited {
+            repquota: cfg.repquota.clone(),
+            status: report.status,
+        })
+        .report("the quota report");
         write_quota_state(store).await?;
         return Ok(());
     }
@@ -3567,7 +3692,7 @@ pub async fn refresh_space_used(
                 if let Some(account) = current.as_mut() {
                     account.space_used = Some(bytes);
                 }
-                Ok::<(), Error>(())
+                Ok::<(), Transitions>(())
             })
             .await
         {
@@ -3606,7 +3731,15 @@ pub async fn refresh_space_used(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    report_record(cfg, store, journal, "account", mailbox, &Error::from(e)).await;
+                    report_record(
+                        cfg,
+                        store,
+                        journal,
+                        "account",
+                        mailbox,
+                        &Transitions::from(e),
+                    )
+                    .await;
                     readable = false;
                     break;
                 }
@@ -3680,16 +3813,16 @@ fn over_limit_flags(field: &str) -> bool {
 
 /// The sweep's own due stamp, root-only at the store root. It carries the time
 /// alone: the figures are on the accounts, where the page reads them.
-async fn write_quota_state(store: &Store) -> Result<(), Error> {
+async fn write_quota_state(store: &Store) -> Result<(), Transitions> {
     let state = json!({ "version": 1, "checked_at": util::filed_at() });
-    let bytes = serde_json::to_vec_pretty(&state).map_err(|source| Error::Json {
+    let bytes = serde_json::to_vec_pretty(&state).map_err(|source| Transitions::Json {
         context: "encode the quota state",
         source,
     })?;
     store
         .write_record("", "quota-check.json", &bytes)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// The yearly note to an account approved without charge: nothing is due, and
@@ -3702,7 +3835,7 @@ pub async fn free_anniversaries(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let today = OffsetDateTime::now_utc().date();
     for username in store.list("accounts").await? {
         let Some(account) = sweep_account(cfg, store, journal, &username).await else {
@@ -3756,7 +3889,7 @@ pub async fn free_anniversaries(
         )
         .await
         {
-            Error::from(e).report(&format!("the free anniversary note for {username}"));
+            Transitions::from(e).report(&format!("the free anniversary note for {username}"));
         }
     }
     Ok(())
@@ -3771,7 +3904,7 @@ pub async fn prepaid_renewals(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let today = OffsetDateTime::now_utc().date();
     for username in store.list("accounts").await? {
         let Some(account) = sweep_account(cfg, store, journal, &username).await else {
@@ -3838,7 +3971,7 @@ pub async fn prepaid_renewals(
         )
         .await
         {
-            Error::from(e).report(&format!("the renewal note for {username}"));
+            Transitions::from(e).report(&format!("the renewal note for {username}"));
         }
     }
 
@@ -3895,7 +4028,7 @@ pub async fn prepaid_renewals(
         )
         .await
         {
-            Error::from(e).report(&format!("the renewal note for {domain}"));
+            Transitions::from(e).report(&format!("the renewal note for {domain}"));
         }
     }
     Ok(())
@@ -3953,7 +4086,7 @@ impl Released {
 /// applicant who asks for the still-held name keeps their own lines even though
 /// the username matches. A hold that cannot be read is left alone: releasing a
 /// name the platform cannot see the end of is worse than keeping it.
-pub async fn holds_sweep(store: &Store) -> Result<(), Error> {
+pub async fn holds_sweep(store: &Store) -> Result<(), Transitions> {
     let now = OffsetDateTime::now_utc();
     let mut expired: Vec<Released> = Vec::new();
     for name in store.list("holds").await? {
@@ -4048,7 +4181,7 @@ pub async fn export_account(
     store: &Store,
     intent: ExportIntent,
     file: &str,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let username = intent.username.as_str();
     let id = if intent.id.is_empty() {
         file.trim_end_matches(".json").to_string()
@@ -4105,10 +4238,11 @@ pub async fn export_account(
                 .map(str::to_string)
         })
         .unwrap_or_default();
-    let account = store
-        .account(username)
-        .await?
-        .ok_or_else(|| Error::Failed(format!("accounts/{username}/account.json is missing")))?;
+    let account = store.account(username).await?.ok_or_else(|| {
+        Transitions::Lifecycle(Error::AccountRecordMissing {
+            username: username.to_string(),
+        })
+    })?;
     let application = ApplicationRef::application(username.to_string(), status_token);
     // A pass that delivered and closed but crashed before its journal line is
     // replayed by the next pass. The delivered bundle is already on the line,
@@ -4199,7 +4333,7 @@ pub(super) async fn erase_half_made(
     store: &Store,
     journal: &Journal,
     username: &str,
-) -> Result<bool, Error> {
+) -> Result<bool, Transitions> {
     if let Some(account) = store.account(username).await? {
         // A group mailbox carries this name but is another transition's
         // account. A failed person approval began under the same name, and
@@ -4248,7 +4382,7 @@ async fn release_username(
     kind: &str,
     username: &str,
     half_made: bool,
-) -> Result<bool, Error> {
+) -> Result<bool, Transitions> {
     let recorded = match store.account(username).await {
         Ok(record) => record.is_some(),
         Err(e) => {
@@ -4256,7 +4390,15 @@ async fn release_username(
             // tell whether releasing the name would take an account with it.
             // Report and leave the application for the next pass rather than
             // release on a guess.
-            report_record(cfg, store, journal, "account", username, &Error::from(e)).await;
+            report_record(
+                cfg,
+                store,
+                journal,
+                "account",
+                username,
+                &Transitions::from(e),
+            )
+            .await;
             return Ok(false);
         }
     };
@@ -4285,7 +4427,7 @@ async fn release_username(
     }
     if !recorded && (!on_box || half_made) {
         if let Err(e) = run_script(cfg, "delete-user.sh", &[username]).await {
-            report_failure(cfg, store, journal, purge_id, kind, &Error::from(e)).await;
+            report_failure(cfg, store, journal, purge_id, kind, &Transitions::from(e)).await;
             return Ok(false);
         }
     }
@@ -4305,7 +4447,7 @@ pub async fn purge_declined(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let now = OffsetDateTime::now_utc();
     let today = now.date();
     for name in store.list("applications").await? {
@@ -4328,7 +4470,9 @@ pub async fn purge_declined(
                 journal,
                 "application",
                 token,
-                &Error::Failed(format!("application {name} names another token; skipped")),
+                &Transitions::Lifecycle(Error::ApplicationNamesAnotherToken {
+                    name: name.to_string(),
+                }),
             )
             .await;
             continue;
@@ -4352,9 +4496,9 @@ pub async fn purge_declined(
         // revalidated before it can reach a root script's argv; a record whose
         // name does not fit is skipped rather than erroring the whole pass.
         if validate::username_shape(&record.username).is_some() {
-            Error::Failed(format!(
-                "declined record {name} has no usable username; skipped"
-            ))
+            Transitions::Lifecycle(Error::DeclinedNoUsername {
+                name: name.to_string(),
+            })
             .report("the purge sweep");
             continue;
         }
@@ -4459,7 +4603,7 @@ async fn keep_copy_join(
     copy: &Value,
     token: &str,
     payment: Option<&Value>,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let mut kept = json!({
         "status_token": token,
         "filed_at": copy.get("filed_at").cloned().unwrap_or(Value::Null),
@@ -4467,14 +4611,14 @@ async fn keep_copy_join(
     if let Some(payment) = payment.or_else(|| copy.get("payment")) {
         kept["payment"] = payment.clone();
     }
-    let bytes = serde_json::to_vec_pretty(&kept).map_err(|source| Error::Json {
+    let bytes = serde_json::to_vec_pretty(&kept).map_err(|source| Transitions::Json {
         context: "encode the application copy",
         source,
     })?;
     store
         .write_application_copy(mailbox, &bytes)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// Drop the fields ADR 0005 bounds from an application record.
@@ -4491,17 +4635,17 @@ fn strip_answers(record: &mut Record) {
 /// Write the shared record back with its answers gone, keeping the payment join
 /// and the domain, so the card pass can resolve a payment through it and a
 /// declined body is still known to be a body.
-async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result<(), Error> {
+async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result<(), Transitions> {
     let mut kept = record.clone();
     strip_answers(&mut kept);
-    let bytes = serde_json::to_vec_pretty(&kept).map_err(|source| Error::Json {
+    let bytes = serde_json::to_vec_pretty(&kept).map_err(|source| Transitions::Json {
         context: "encode the application record",
         source,
     })?;
     store
         .write_filed_application(token, &bytes)
         .await
-        .map_err(Error::from)?;
+        .map_err(Transitions::from)?;
     // The snapshot is what the card pass resolves a payment through, so it is
     // never rebuilt from this handler-owned record: strip the answers from the
     // snapshot itself, keeping the payment block root wrote. An approval that
@@ -4512,26 +4656,26 @@ async fn keep_record_join(store: &Store, token: &str, record: &Record) -> Result
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => return Ok(()),
         Err(e) => {
-            Error::from(e).report("the purge sweep");
+            Transitions::from(e).report("the purge sweep");
             return Ok(());
         }
     };
     strip_answers(&mut snapshot);
-    let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|source| Error::Json {
+    let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|source| Transitions::Json {
         context: "encode the reviewed application",
         source,
     })?;
     store
         .write_reviewed_application(token, &bytes)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// The status tokens queued intents name. An approval writes `mark_decided`
 /// last, so a failure or a backoff leaves the record at `received` with its
 /// intent still in `intents/`; the purge must not take the record out from under
 /// that retry.
-async fn queued_tokens(store: &Store) -> Result<HashSet<String>, Error> {
+async fn queued_tokens(store: &Store) -> Result<HashSet<String>, Transitions> {
     let mut queued = HashSet::new();
     for name in store.list("intents").await? {
         let Some(text) = store.intent_text(&name).await? else {
@@ -4567,7 +4711,7 @@ pub async fn purge_applications(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let now = OffsetDateTime::now_utc();
     let today = now.date();
 
@@ -4582,7 +4726,7 @@ pub async fn purge_applications(
                     journal,
                     "application",
                     &mailbox,
-                    &Error::from(e),
+                    &Transitions::from(e),
                 )
                 .await;
                 continue;
@@ -4619,7 +4763,7 @@ pub async fn purge_applications(
         let shared = match store.application(&token).await {
             Ok(shared) => shared,
             Err(e) => {
-                let e = Error::from(e);
+                let e = Transitions::from(e);
                 report_record(cfg, store, journal, "application", &mailbox, &e).await;
                 continue;
             }
@@ -4700,7 +4844,9 @@ pub async fn purge_applications(
                 journal,
                 "application",
                 token,
-                &Error::Failed(format!("application {name} names another token; skipped")),
+                &Transitions::Lifecycle(Error::ApplicationNamesAnotherToken {
+                    name: name.to_string(),
+                }),
             )
             .await;
             continue;
@@ -4737,9 +4883,9 @@ pub async fn purge_applications(
         // The record was written by the unprivileged half, so the username is
         // revalidated before it can reach a root script's argv.
         if abandoned && validate::username_shape(&record.username).is_some() {
-            Error::Failed(format!(
-                "application {name} has no usable username; skipped"
-            ))
+            Transitions::Lifecycle(Error::ApplicationNoUsername {
+                name: name.to_string(),
+            })
             .report("the purge sweep");
             continue;
         }
@@ -4816,7 +4962,7 @@ pub async fn purge_drafts(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let cutoff = OffsetDateTime::now_utc()
         - Duration::days(kyriakon_control_core::store::draft::RETENTION_DAYS);
     for name in store.list("drafts").await? {
@@ -4828,7 +4974,7 @@ pub async fn purge_drafts(
         let in_lock_id = purge_id.clone();
         let in_lock_subject = subject.clone();
         let removed = match store
-            .purge_draft::<bool, Error, _>(token, |draft| async move {
+            .purge_draft::<bool, Transitions, _>(token, |draft| async move {
                 // A stamp that cannot be read is not an age this sweep can
                 // prove, so the file stays for the operator's report rather
                 // than being deleted.
@@ -4896,7 +5042,7 @@ pub async fn purge_closing(
     cfg: &DrainConfig,
     store: &Store,
     journal: &Journal,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let today = util::date_after_days(0);
     for username in store.list("accounts").await? {
         if validate::username_shape(&username).is_some() {

@@ -22,7 +22,7 @@ fn flags_read_pairs_and_refuse_a_bad_shape() {
 
     assert!(matches!(
         flags(&args(&["--nope", "x"]), &["username"]).unwrap_err(),
-        Error::Failed(message) if message.contains("unknown flag")
+        Error::UnknownFlag { flag } if flag == "--nope"
     ));
     assert!(matches!(
         flags(
@@ -30,15 +30,15 @@ fn flags_read_pairs_and_refuse_a_bad_shape() {
             &["username"]
         )
         .unwrap_err(),
-        Error::Failed(message) if message.contains("given twice")
+        Error::Duplicate { flag } if flag == "--username"
     ));
     assert!(matches!(
         flags(&args(&["--username"]), &["username"]).unwrap_err(),
-        Error::Failed(message) if message.contains("needs a value")
+        Error::NeedsValue { flag } if flag == "--username"
     ));
     assert!(matches!(
         flags(&args(&["alice"]), &["username"]).unwrap_err(),
-        Error::Failed(message) if message.contains("unexpected argument")
+        Error::UnexpectedArgument { argument } if argument == "alice"
     ));
 }
 
@@ -60,7 +60,8 @@ fn a_removal_refuses_an_address_and_requires_confirmation() {
     ]);
     let err = crate::address::address_args(&both).unwrap_err();
     assert!(
-        matches!(&err, Error::Failed(message) if message.contains("--address") && message.contains("alice@parish.example")),
+        matches!(&err, Error::AddressOnRemoval { address, mailbox, domain }
+            if address == "oldalias" && mailbox == "alice" && domain == "parish.example"),
         "{err}"
     );
 
@@ -74,7 +75,8 @@ fn a_removal_refuses_an_address_and_requires_confirmation() {
     ]);
     let err = crate::address::address_args(&unconfirmed).unwrap_err();
     assert!(
-        matches!(&err, Error::Failed(message) if message.contains("--confirm-remove") && message.contains("alice@parish.example")),
+        matches!(&err, Error::ConfirmRequired { mailbox, domain }
+            if mailbox == "alice" && domain == "parish.example"),
         "{err}"
     );
 
@@ -105,10 +107,7 @@ fn a_removal_refuses_an_address_and_requires_confirmation() {
         "--confirm-remove",
     ]);
     let err = crate::address::address_args(&wrong_action).unwrap_err();
-    assert!(
-        matches!(&err, Error::Failed(message) if message.contains("--confirm-remove") && message.contains("only for")),
-        "{err}"
-    );
+    assert!(matches!(&err, Error::ConfirmOnlyForRemove), "{err}");
 }
 
 #[test]
@@ -119,7 +118,9 @@ fn one_username_takes_exactly_one_valid_name() {
     assert!(one_username(&args(&["show", "alice", "extra"])).is_err());
     assert!(matches!(
         one_username(&args(&["show", "Alice"])).unwrap_err(),
-        Error::Failed(message) if message.contains("starts with")
+        Error::InvalidUsername { username, source }
+            if username == "Alice"
+                && matches!(source, kyriakon_control_core::flow::Reason::UsernameFirst)
     ));
 }
 
@@ -136,7 +137,9 @@ fn a_decision_takes_a_username_and_a_token() {
     assert!(application_args(&args(&["approve", "alice", token, "extra"])).is_err());
     assert!(matches!(
         application_args(&args(&["approve", "Alice", token])).unwrap_err(),
-        Error::Failed(message) if message.contains("starts with")
+        Error::InvalidUsername { username, source }
+            if username == "Alice"
+                && matches!(source, kyriakon_control_core::flow::Reason::UsernameFirst)
     ));
 }
 
@@ -265,7 +268,8 @@ fn an_outer_from_that_differs_from_the_armour_is_refused() {
     )
     .unwrap_err();
     assert!(
-        matches!(&err, Error::Failed(message) if message.contains("attacker@evil.example") && message.contains("alice@kyriakon.net")),
+        matches!(&err, Error::FromMismatch { outer, armour }
+            if outer == "attacker@evil.example" && armour == "alice@kyriakon.net"),
         "{err}"
     );
     // The verified plaintext's From is the one used when there is no outer one.

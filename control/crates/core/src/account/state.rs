@@ -16,9 +16,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use super::Error;
 use crate::store::Account;
 use crate::util;
-use crate::Error;
 
 /// The account's own word, as the record writes it. `closing` is the one
 /// standing with fields of its own, and they sit beside it on the record.
@@ -119,24 +119,16 @@ impl AccountState {
             until,
         } = self
         else {
-            return Err(Error::Failed(
-                "the account is not closing, so there is no closure to cancel".to_string(),
-            ));
+            return Err(Error::NotClosing);
         };
         if *refund_closed {
-            return Err(Error::Failed(
-                "the closure was paid out by a refund, so it cannot be cancelled".to_string(),
-            ));
+            return Err(Error::ClosureRefunded);
         }
         if util::parse_date(until).is_none() {
-            return Err(Error::Failed(
-                "the closing date cannot be read, so the closure cannot be cancelled".to_string(),
-            ));
+            return Err(Error::ClosingDateUnreadable);
         }
         if *prior_state == Standing::Closing {
-            return Err(Error::Failed(
-                "the record says the closure began from a closure".to_string(),
-            ));
+            return Err(Error::ClosureFromClosure);
         }
         Ok(*prior_state)
     }
@@ -150,9 +142,7 @@ impl AccountState {
             } else {
                 Standing::Active
             }),
-            _ => Err(Error::Failed(
-                "the account is not suspended, so there is nothing to resume".to_string(),
-            )),
+            _ => Err(Error::NotSuspended),
         }
     }
 }

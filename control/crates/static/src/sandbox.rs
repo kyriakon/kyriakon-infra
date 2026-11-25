@@ -13,18 +13,13 @@ use kyriakon_control_core::sandbox;
 /// Unveil the two readable trees, lock the list, probe them, then pledge the
 /// syscalls a request uses: stdio for the connection and the served file,
 /// rpath for the tree, and unix for accept on the already-bound listeners.
-pub fn restrict(root: &Path, hosts: &Path) -> Result<(), String> {
-    let root = utf8(root, "root")?;
-    let hosts = utf8(hosts, "hosts")?;
+pub fn restrict(root: &Path, hosts: &Path) -> Result<(), sandbox::Error> {
+    let root = sandbox::path(root, "root")?;
+    let hosts = sandbox::path(hosts, "hosts")?;
     sandbox::unveil(root, "r")?;
     sandbox::unveil(hosts, "r")?;
     sandbox::lock()?;
     sandbox::probe(root)?;
     sandbox::probe(hosts)?;
     sandbox::pledge("stdio rpath unix")
-}
-
-fn utf8<'a>(path: &'a Path, what: &str) -> Result<&'a str, String> {
-    path.to_str()
-        .ok_or_else(|| format!("the {what} path is not UTF-8: {}", path.display()))
 }

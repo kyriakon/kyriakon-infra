@@ -1,25 +1,42 @@
 //! The core's shared error for the account, mail, flow, payment and IPC
-//! modules. `store` and `config` keep their own enums because every other
-//! module converts through them; the rest name the few cases their callers act
-//! on here.
+//! modules. Each area owns its own enum and `Display`; this one wraps them so a
+//! caller that reads several areas has one type. `store` and `config` keep
+//! their own enums because every other module converts through them.
 
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use crate::account;
 use crate::config;
+use crate::flow;
+use crate::intent;
+use crate::ipc;
+use crate::mail;
+use crate::payments;
 use crate::store;
+use crate::util;
 
 #[derive(Debug)]
 pub enum Error {
-    /// A request or record the core refuses, in the words the caller shows.
-    Refused(String),
-    /// A failure with no more specific case yet.
-    Failed(String),
     /// The store failed.
     Store(store::Error),
     /// The configuration failed.
     Config(config::Error),
+    /// An account action failed.
+    Account(account::Error),
+    /// An application-flow vocabulary file failed.
+    Flow(flow::Error),
+    /// An intent file failed.
+    Intent(intent::Error),
+    /// The handler protocol failed.
+    Ipc(ipc::Error),
+    /// A utility parse failed.
+    Util(util::Error),
+    /// A mail action failed.
+    Mail(mail::Error),
+    /// A payment action failed.
+    Payments(payments::Error),
     /// A file or socket operation failed.
     Io {
         what: &'static str,
@@ -39,7 +56,7 @@ pub enum Error {
     },
     /// A failure whose context is the value the caller needs, with its source.
     Context {
-        context: String,
+        context: &'static str,
         source: Box<Source>,
         suffix: &'static str,
     },
@@ -48,9 +65,15 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Refused(message) | Error::Failed(message) => f.write_str(message),
             Error::Store(error) => error.fmt(f),
             Error::Config(error) => error.fmt(f),
+            Error::Account(error) => error.fmt(f),
+            Error::Flow(error) => error.fmt(f),
+            Error::Intent(error) => error.fmt(f),
+            Error::Ipc(error) => error.fmt(f),
+            Error::Util(error) => error.fmt(f),
+            Error::Mail(error) => error.fmt(f),
+            Error::Payments(error) => error.fmt(f),
             Error::Io {
                 what,
                 path: Some(path),
@@ -77,9 +100,15 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Refused(_) | Error::Failed(_) => None,
             Error::Store(error) => Some(error),
             Error::Config(error) => Some(error),
+            Error::Account(error) => Some(error),
+            Error::Flow(error) => Some(error),
+            Error::Intent(error) => Some(error),
+            Error::Ipc(error) => Some(error),
+            Error::Util(error) => Some(error),
+            Error::Mail(error) => Some(error),
+            Error::Payments(error) => Some(error),
             Error::Io { source, .. } => Some(source),
             Error::Json { source, .. } => Some(source),
             Error::ParseLine { source, .. } => Some(source),
@@ -93,21 +122,21 @@ impl Error {
         crate::util::report(self, context);
     }
 
-    pub fn context(context: impl Into<String>, source: impl Into<Source>) -> Self {
+    pub fn context(context: &'static str, source: impl Into<Source>) -> Self {
         Error::Context {
-            context: context.into(),
+            context,
             source: Box::new(source.into()),
             suffix: "",
         }
     }
 
     pub fn context_with_suffix(
-        context: impl Into<String>,
+        context: &'static str,
         source: impl Into<Source>,
         suffix: &'static str,
     ) -> Self {
         Error::Context {
-            context: context.into(),
+            context,
             source: Box::new(source.into()),
             suffix,
         }
@@ -236,6 +265,41 @@ impl From<store::Error> for Source {
         Source::Core(Box::new(Error::Store(e)))
     }
 }
+impl From<account::Error> for Source {
+    fn from(e: account::Error) -> Self {
+        Source::Core(Box::new(Error::Account(e)))
+    }
+}
+impl From<flow::Error> for Source {
+    fn from(e: flow::Error) -> Self {
+        Source::Core(Box::new(Error::Flow(e)))
+    }
+}
+impl From<intent::Error> for Source {
+    fn from(e: intent::Error) -> Self {
+        Source::Core(Box::new(Error::Intent(e)))
+    }
+}
+impl From<ipc::Error> for Source {
+    fn from(e: ipc::Error) -> Self {
+        Source::Core(Box::new(Error::Ipc(e)))
+    }
+}
+impl From<util::Error> for Source {
+    fn from(e: util::Error) -> Self {
+        Source::Core(Box::new(Error::Util(e)))
+    }
+}
+impl From<mail::Error> for Source {
+    fn from(e: mail::Error) -> Self {
+        Source::Core(Box::new(Error::Mail(e)))
+    }
+}
+impl From<payments::Error> for Source {
+    fn from(e: payments::Error) -> Self {
+        Source::Core(Box::new(Error::Payments(e)))
+    }
+}
 impl From<config::Error> for Source {
     fn from(e: config::Error) -> Self {
         Source::Core(Box::new(Error::Config(e)))
@@ -245,6 +309,48 @@ impl From<config::Error> for Source {
 impl From<store::Error> for Error {
     fn from(error: store::Error) -> Self {
         Error::Store(error)
+    }
+}
+
+impl From<account::Error> for Error {
+    fn from(error: account::Error) -> Self {
+        Error::Account(error)
+    }
+}
+
+impl From<flow::Error> for Error {
+    fn from(error: flow::Error) -> Self {
+        Error::Flow(error)
+    }
+}
+
+impl From<intent::Error> for Error {
+    fn from(error: intent::Error) -> Self {
+        Error::Intent(error)
+    }
+}
+
+impl From<ipc::Error> for Error {
+    fn from(error: ipc::Error) -> Self {
+        Error::Ipc(error)
+    }
+}
+
+impl From<util::Error> for Error {
+    fn from(error: util::Error) -> Self {
+        Error::Util(error)
+    }
+}
+
+impl From<mail::Error> for Error {
+    fn from(error: mail::Error) -> Self {
+        Error::Mail(error)
+    }
+}
+
+impl From<payments::Error> for Error {
+    fn from(error: payments::Error) -> Self {
+        Error::Payments(error)
     }
 }
 

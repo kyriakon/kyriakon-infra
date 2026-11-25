@@ -77,58 +77,56 @@ fn run() -> Result<Departure, Error> {
             // program's own path, so there is nothing in it the program does not
             // already know.
             "-c" => {
-                args.next().ok_or_else(|| {
-                    Error::Failed("-c needs the command sshd supplied".to_string())
-                })?;
+                args.next().ok_or(Error::MissingForcedCommand)?;
             }
             "--config" => {
-                cfg_path = PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| Error::Failed("--config needs a path".to_string()))?,
-                );
+                cfg_path = PathBuf::from(args.next().ok_or(Error::MissingConfigPath)?);
             }
             // The session-lock directory, the same testing seam as --plain: the
             // live path is the fixed one, and sshd sets no AcceptEnv, so no client
             // can reach either.
             "--state" => {
-                state = PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| Error::Failed("--state needs a path".to_string()))?,
-                );
+                state = PathBuf::from(args.next().ok_or(Error::MissingStatePath)?);
             }
             "--plain" => forced = Some(Mode::Plain),
             "--full" => forced = Some(Mode::Full),
             other => {
-                return Err(Error::Failed(format!(
-                    "unknown argument {other:?}; usage: kyriakon-control-tui \
-                     [-c COMMAND] [--config PATH] [--state PATH] [--plain | --full]"
-                )))
+                return Err(Error::UnknownArgument {
+                    argument: other.to_string(),
+                })
             }
         }
     }
 
     let cfg = config::Config::load(&cfg_path)?;
-    let text = std::fs::read_to_string(&cfg.catalogue)
-        .map_err(|e| Error::context(format!("cannot read {}", cfg.catalogue), e))?;
+    let text = std::fs::read_to_string(&cfg.catalogue).map_err(|source| Error::Io {
+        what: "read",
+        path: Some(cfg.catalogue.clone().into()),
+        source,
+    })?;
     let list = catalogue::parse(&text)?;
     let questions = questions::shipped()?;
-    let reserved = validate::reserved(
-        &std::fs::read_to_string(&cfg.reserved)
-            .map_err(|e| Error::context(format!("cannot read {}", cfg.reserved), e))?,
-    );
+    let reserved =
+        validate::reserved(&std::fs::read_to_string(&cfg.reserved).map_err(|source| {
+            Error::Io {
+                what: "read",
+                path: Some(cfg.reserved.clone().into()),
+                source,
+            }
+        })?);
     // The session directory is created while the view is still whole: the
     // deploy makes the live one, and a run whose `--state` names a new directory
     // must not fail because the veil cannot create it.
-    std::fs::create_dir_all(&state).map_err(|e| {
-        Error::context(
-            format!("cannot create the state directory {}", state.display()),
-            e,
-        )
+    std::fs::create_dir_all(&state).map_err(|source| Error::Io {
+        what: "create",
+        path: Some(state.clone()),
+        source,
     })?;
     // The mode is decided before the view narrows, because the full screen needs
     // the `tty` promise and the plain one does not.
     let mode = forced.unwrap_or_else(chosen);
-    sandbox::restrict(&cfg, &state, mode != Mode::Plain).map_err(Error::Failed)?;
+    sandbox::restrict(&cfg, &state, mode != Mode::Plain)
+        .map_err(|source| Error::Restrict { source })?;
 
     // The session's member, where the key it presented names one: [#381] asks the
     // handler which account a key fingerprint belongs to and passes the answer
@@ -145,7 +143,7 @@ fn run() -> Result<Departure, Error> {
     let address = source_address();
     let _session = match tui::Sessions::open(&state, address)? {
         tui::Admission::Busy => {
-            print!("{}", tui::TOO_MANY);
+            print!("{}", tui::Refusal::Busy);
             return Ok(Departure::Quit);
         }
         tui::Admission::Open(session) => session,
@@ -300,10 +298,11 @@ impl Term {
         }
         let mut now = std::mem::MaybeUninit::<libc::termios>::uninit();
         if unsafe { libc::tcgetattr(libc::STDIN_FILENO, now.as_mut_ptr()) } != 0 {
-            return Err(Error::Failed(format!(
-                "cannot read the terminal's settings: {}",
-                std::io::Error::last_os_error()
-            )));
+            return Err(Error::Io {
+                what: "read the terminal's settings",
+                path: None,
+                source: std::io::Error::last_os_error(),
+            });
         }
         self.saved = Some(unsafe { now.assume_init() });
         Ok(())
@@ -314,10 +313,11 @@ impl Term {
         self.save()?;
         let mut raw = std::mem::MaybeUninit::<libc::termios>::uninit();
         if unsafe { libc::tcgetattr(libc::STDIN_FILENO, raw.as_mut_ptr()) } != 0 {
-            return Err(Error::Failed(format!(
-                "cannot read the terminal's settings: {}",
-                std::io::Error::last_os_error()
-            )));
+            return Err(Error::Io {
+                what: "read the terminal's settings",
+                path: None,
+                source: std::io::Error::last_os_error(),
+            });
         }
         let mut raw = unsafe { raw.assume_init() };
         raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
@@ -336,7 +336,7 @@ impl Term {
             // Nothing better is available here: the session is ending, or a prompt
             // is about to be read with the terminal in whatever state it is in,
             // and neither is something this program can act on.
-            Error::Failed(format!("cannot restore the terminal: {why}")).report("the terminal");
+            why.report("restoring the terminal");
         }
     }
 
@@ -411,10 +411,11 @@ impl Drop for Term {
 /// Put the terminal into `want`.
 fn set(want: &libc::termios) -> Result<(), Error> {
     if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, want) } != 0 {
-        return Err(Error::Failed(format!(
-            "cannot set the terminal's settings: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(Error::Io {
+            what: "set the terminal's settings",
+            path: None,
+            source: std::io::Error::last_os_error(),
+        });
     }
     Ok(())
 }

@@ -2,12 +2,15 @@
 //! requests, exports, and the DNS recipe a body publishes.
 
 pub mod dns;
+mod error;
 pub mod export;
 pub mod password;
 pub mod requests;
 pub mod session;
 pub mod sign;
 pub mod state;
+
+pub use error::Error;
 
 /// The lapse's own words, shared by the page, the capsule and the notice: mail
 /// stays readable and published work stays up; sending, uploading and pushing

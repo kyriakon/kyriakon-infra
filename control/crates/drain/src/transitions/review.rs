@@ -11,7 +11,7 @@ use super::groups::{
     group_record, name_allowed, name_held, site_owner,
 };
 use super::lifecycle::group_recipient;
-use super::Error;
+use super::Error as Transitions;
 use super::{write_journal, write_review_journal, Settlement};
 use kyriakon_control_core::account::dns;
 use kyriakon_control_core::account::sign;
@@ -19,6 +19,7 @@ use kyriakon_control_core::account::state::Standing;
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::questions;
 use kyriakon_control_core::flow::validate;
+use kyriakon_control_core::flow::Reason;
 use kyriakon_control_core::intent::{DecisionIntent, ResendIntent, DECISIONS, RAILS};
 use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::payments::rails::{card_link, rail_instructions};
@@ -31,6 +32,9 @@ use kyriakon_control_core::util;
 use serde_json::json;
 use serde_json::Value;
 use time::OffsetDateTime;
+
+mod error;
+pub use self::error::Error;
 
 /// Send the confirmation the spec promises before provisioning: it restates the
 /// immediate-supply request and the digital-content acknowledgement, quotes every
@@ -57,7 +61,7 @@ async fn confirm(
     token: &str,
     record: &Record,
     no_charge: bool,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let Some(to) = outside_address(record)? else {
         // Nothing to send yet: the mailbox does not exist. `approval_body` puts
         // this letter on the approval mail that reaches the new mailbox.
@@ -82,22 +86,22 @@ async fn confirm(
         // than an approval that provisions with the letter lost.
         live.confirmation_at = None;
         save_application(store, token, &live).await?;
-        return Err(Error::from(e));
+        return Err(Transitions::from(e));
     }
     Ok(())
 }
 
 /// Write the application record, handed to the handler's owner like every other
 /// record in `applications/`.
-async fn save_application(store: &Store, token: &str, record: &Record) -> Result<(), Error> {
-    let bytes = serde_json::to_vec_pretty(record).map_err(|source| Error::Json {
+async fn save_application(store: &Store, token: &str, record: &Record) -> Result<(), Transitions> {
+    let bytes = serde_json::to_vec_pretty(record).map_err(|source| Transitions::Json {
         context: "encode the record",
         source,
     })?;
     store
         .write_filed_application(token, &bytes)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// A filed application: one review email to the reviewer, carrying every answer,
@@ -109,29 +113,23 @@ pub async fn filed_application(
     journal: &Journal,
     key: &[u8],
     intent: Intent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     if intent.kind != "application" {
-        return Err(Error::Failed(format!(
-            "kind {:?} is not an application",
-            intent.kind
-        )));
+        return Err(Transitions::Review(Error::NotAnApplication {
+            kind: intent.kind.clone(),
+        }));
     }
     name_allowed(cfg, &intent.application.username).await?;
     let Some(token) = intent.application.status_token.as_deref() else {
-        return Err(Error::Failed(
-            "the status token is not 128 bits of Crockford".to_string(),
-        ));
+        return Err(Transitions::Review(Error::StatusTokenInvalid));
     };
     if !store::is_status_token(token) {
-        return Err(Error::Failed(
-            "the status token is not 128 bits of Crockford".to_string(),
-        ));
+        return Err(Transitions::Review(Error::StatusTokenInvalid));
     }
     if !RAILS.contains(&intent.rail.as_str()) {
-        return Err(Error::Failed(format!(
-            "the rail {:?} is not one of the four",
-            intent.rail
-        )));
+        return Err(Transitions::Review(Error::UnknownRail {
+            rail: intent.rail.clone(),
+        }));
     }
 
     // The links are signed from the record the approval will read, and the mail
@@ -204,7 +202,7 @@ pub async fn filed_application(
 /// Everything here comes from the record, not the intent, because the links are
 /// signed over the record: the reviewer must see exactly the field values the
 /// signature covers.
-fn review_body(cfg: &DrainConfig, key: &[u8], record: &Record) -> Result<String, Error> {
+fn review_body(cfg: &DrainConfig, key: &[u8], record: &Record) -> Result<String, Transitions> {
     let token = record.status_token.as_str();
     let mut out = String::new();
     out.push_str(&format!("Application {}\n", record.username));
@@ -318,14 +316,16 @@ pub async fn decision(
     journal: &Journal,
     key: &[u8],
     intent: DecisionIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     match intent.kind.as_str() {
         "approve" => approve(cfg, store, journal, key, &intent, false).await,
         "provision" => approve(cfg, store, journal, key, &intent, true).await,
         "decline" => decline(cfg, store, journal, key, &intent).await,
         // Unreachable after the kind match the seam makes, kept so the dispatch
         // is total.
-        other => Err(Error::Failed(format!("kind {other:?} is not a decision"))),
+        other => Err(Transitions::Review(Error::NotADecision {
+            kind: other.to_string(),
+        })),
     }
 }
 
@@ -340,7 +340,7 @@ async fn provision_member(
     username: &str,
     record: &Record,
     on_box: bool,
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     // The keyring first, before the builder makes the address live: the
     // encrypting LMTP fails closed without the member's key, so mail offered
     // between the two would bounce at the door.
@@ -385,18 +385,16 @@ async fn approve(
     key: &[u8],
     intent: &DecisionIntent,
     no_charge: bool,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let token = intent
         .application
         .status_token
         .as_deref()
-        .ok_or_else(|| Error::Failed("the decision names no status token".to_string()))?;
+        .ok_or_else(|| Transitions::Review(Error::DecisionNoStatusToken))?;
     let username = &intent.application.username;
     let record = application_record(store, token).await?;
     if record.username != *username {
-        return Err(Error::Failed(
-            "the intent's username is not the application's".to_string(),
-        ));
+        return Err(Transitions::Review(Error::IntentUsernameMismatch));
     }
     // A decision is single-use, and the journal is the only record of it the
     // handler cannot rewrite. This intent's own retry is recognised by the
@@ -433,9 +431,7 @@ async fn approve(
         &sign::decide_payload(&record, &intent.action),
         &intent.sig,
     ) {
-        return Err(Error::Failed(
-            "the decision intent's signature does not verify against this record".to_string(),
-        ));
+        return Err(Transitions::Review(Error::SignatureDoesNotVerify));
     }
 
     // A body's accounts are the address table's, not the applicant's: the person
@@ -460,10 +456,10 @@ async fn approve(
     let begun = journal.approval_started(token);
     if let Some(started) = begun.as_deref() {
         if started != record.username {
-            return Err(Error::Failed(format!(
-                "this application's approval began for {started}, not {}; the intent is left in place",
-                record.username
-            )));
+            return Err(Transitions::Review(Error::ApprovalBeganForOtherName {
+                started: started.to_string(),
+                username: record.username.clone(),
+            }));
         }
     }
     let retry = begun.is_some();
@@ -476,9 +472,9 @@ async fn approve(
             .as_ref()
             .is_some_and(|account| account.group.is_some())
     {
-        return Err(Error::Failed(format!(
-            "the account {username} belongs to a group, not to this application; the intent is left in place"
-        )));
+        return Err(Transitions::Review(Error::AccountBelongsToGroup {
+            username: username.clone(),
+        }));
     }
 
     // An account record that this application never began is a second
@@ -503,9 +499,10 @@ async fn approve(
     // this is the other gate that can create an account. Without it a person
     // could take a name a removal had just held.
     if let Some(until) = name_held(store, username).await? {
-        return Err(Error::Failed(format!(
-            "the username {username} is held until {until}, so it cannot be reused yet"
-        )));
+        return Err(Transitions::Review(Error::NameHeld {
+            username: username.clone(),
+            until,
+        }));
     }
 
     // The box is the oracle and the record only a fast path. A name already on
@@ -517,9 +514,9 @@ async fn approve(
     if existing.is_none() {
         on_box = account_on_box(cfg, username)?;
         if on_box && !retry {
-            return Err(Error::Failed(format!(
-                "the username {username} is already in use on this box and this application did not create it; the intent is left in place"
-            )));
+            return Err(Transitions::Review(Error::NameInUseOnBox {
+                username: username.clone(),
+            }));
         }
     }
 
@@ -536,22 +533,24 @@ async fn approve(
         // group path names one mailbox per key; here any other name would let a
         // filed application install a key into another member's keyring entry.
         if !key.mailbox.is_empty() && key.mailbox != *username {
-            return Err(Error::Failed(format!(
-                "the application's mail key names the mailbox {:?}, not the account {username}",
-                util::clean(&key.mailbox)
-            )));
+            return Err(Transitions::Review(Error::MailKeyNamesOtherMailbox {
+                mailbox: util::clean(&key.mailbox),
+                username: username.clone(),
+            }));
         }
         let checked = kyriakon_control_core::mail::pgp::public_key(&key.material)
-            .map_err(|e| Error::context("the application's mail key", e))?;
-        if let Some(why) = checked.refusal() {
-            return Err(Error::Failed(format!(
-                "the application's mail key cannot be used: {why}"
-            )));
+            .map_err(|e| Transitions::context("the application's mail key", e))?;
+        if let Some(verdict) = checked.refusal() {
+            return Err(Transitions::Review(Error::MailKeyUnusable {
+                source: Reason::KeyRefused {
+                    verdict: verdict.to_string(),
+                },
+            }));
         }
     }
     if let Some(key) = record.upload_key.as_ref() {
         kyriakon_control_core::mail::keycheck::openssh_public_key(&key.material)
-            .map_err(|e| Error::context("the application's upload key", e))?;
+            .map_err(|e| Transitions::context("the application's upload key", e))?;
     }
 
     // The confirmation the spec promises goes out before the journal's
@@ -769,7 +768,7 @@ async fn approve(
                 account.space_used = existing.space_used;
             }
             *current = Some(account);
-            Ok::<(), Error>(())
+            Ok::<(), Transitions>(())
         })
         .await?;
 
@@ -780,7 +779,7 @@ async fn approve(
             group: None,
             issued_at: now.clone(),
         };
-        let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Error::Json {
+        let bytes = serde_json::to_vec_pretty(&join).map_err(|source| Transitions::Json {
             context: "encode the token record",
             source,
         })?;
@@ -793,11 +792,13 @@ async fn approve(
 
     // The account's own copy of the application, inside the 90-day purge, with
     // the status link's own end written on it.
-    let mut app_copy: Value =
-        serde_json::from_str(&store.filed_application_text(token).await?.ok_or_else(|| {
-            Error::Failed("the application record vanished mid-approval".to_string())
-        })?)
-        .map_err(|e| Error::context("the application record does not parse", e))?;
+    let mut app_copy: Value = serde_json::from_str(
+        &store
+            .filed_application_text(token)
+            .await?
+            .ok_or_else(|| Transitions::Review(Error::ApplicationRecordVanishedMidApproval))?,
+    )
+    .map_err(|e| Transitions::context("the application record does not parse", e))?;
     // Seven days for a supplied account. A held one keeps the page until its
     // hold ends plus seven, because the page is where a member with no outside
     // address collects the password link after provisioning.
@@ -811,12 +812,12 @@ async fn approve(
     // back into the record it does read. A free approval carries none, which is
     // also why an undecided application never shows one.
     if let Some(block) = &account.payment {
-        app_copy["payment"] = serde_json::to_value(block).map_err(|source| Error::Json {
+        app_copy["payment"] = serde_json::to_value(block).map_err(|source| Transitions::Json {
             context: "encode the payment block",
             source,
         })?;
     }
-    let copy_bytes = serde_json::to_vec_pretty(&app_copy).map_err(|source| Error::Json {
+    let copy_bytes = serde_json::to_vec_pretty(&app_copy).map_err(|source| Transitions::Json {
         context: "encode the application copy",
         source,
     })?;
@@ -887,7 +888,7 @@ async fn approve(
     let live_link = account
         .password_link
         .as_ref()
-        .ok_or_else(|| Error::Failed("a supplied account has no password link".to_string()))?;
+        .ok_or_else(|| Transitions::Review(Error::NoPasswordLink))?;
     let password_until = live_link.until.clone();
     let password_link = sign::password_link(
         &cfg.base_url,
@@ -953,13 +954,16 @@ async fn approve_group(
     intent: &DecisionIntent,
     record: &Record,
     no_charge: bool,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let domain = record
         .domain
         .clone()
-        .ok_or_else(|| Error::Failed("the application names no domain".to_string()))?;
-    if let Some(why) = validate::domain(&domain) {
-        return Err(Error::Failed(format!("the domain {domain:?}: {why}")));
+        .ok_or_else(|| Transitions::Review(Error::ApplicationNoDomain))?;
+    if let Some(source) = validate::domain(&domain) {
+        return Err(Transitions::Review(Error::InvalidDomain {
+            domain: domain.clone(),
+            source,
+        }));
     }
     // The platform's own domain is not a body's to claim: its approval would
     // shadow the operator's addresses and its later removal would take the
@@ -979,9 +983,9 @@ async fn approve_group(
     // path's does.
     let existing_group = group_record(store, &domain).await?;
     if existing_group.is_some() && journal.approval_started(&record.status_token).is_none() {
-        return Err(Error::Failed(format!(
-            "the domain {domain} already has a group that this application did not make"
-        )));
+        return Err(Transitions::Review(Error::GroupExistsNotMade {
+            domain: domain.clone(),
+        }));
     }
     let (addresses, mailboxes) = group_addresses(record)?;
     let site_owner = site_owner(record, &mailboxes)?;
@@ -990,9 +994,9 @@ async fn approve_group(
     // applicant has to change.
     for mailbox in &mailboxes {
         if !record.mail_keys.iter().any(|k| &k.mailbox == mailbox) {
-            return Err(Error::Failed(format!(
-                "the mailbox {mailbox} has no mail key, so its mail would bounce"
-            )));
+            return Err(Transitions::Review(Error::MailboxNoMailKey {
+                mailbox: mailbox.clone(),
+            }));
         }
     }
     // The recipient is read before the journal and the intent for the same
@@ -1078,10 +1082,12 @@ async fn approve_group(
     // next pass would read, envelope included, so the payload the transition
     // acts on is the one the writer stamped.
     let text = store.intent_text(&filename).await?.ok_or_else(|| {
-        Error::Failed(format!("the intent this pass filed at {filename} is gone"))
+        Transitions::Review(Error::FiledIntentGone {
+            filename: filename.clone(),
+        })
     })?;
     let value: Value = serde_json::from_str(&text)
-        .map_err(|e| Error::context("the intent this pass filed does not parse", e))?;
+        .map_err(|e| Transitions::context("the intent this pass filed does not parse", e))?;
     let filed = kyriakon_control_core::intent::Intent::parse(&value)?;
     // The provision-group arm verifies or fails; it has no refusal of its own,
     // because the signature it checks is the one this pass just made. `run_intent`
@@ -1101,7 +1107,7 @@ async fn approve_group(
     // rail's own instructions and the date the money must arrive by.
     let written = group_record(store, &domain)
         .await?
-        .ok_or_else(|| Error::Failed("the group record vanished mid-approval".to_string()))?;
+        .ok_or_else(|| Transitions::Review(Error::GroupRecordVanishedMidApproval))?;
     // The handler renders the status page as `_onboard` and cannot read the
     // root-owned group record, so the block it shows is this copy in the
     // application record, as the person path writes the account's.
@@ -1119,13 +1125,8 @@ async fn approve_group(
     // A group on a cash rail has no Stripe link, and asking for one would fail
     // the approval of a body that never chose the card rail.
     let link = if written.payment.rail == "card" {
-        card_link(&cfg.stripe_group_payment_link, &record.status_token).map_err(|_| {
-            Error::Failed(
-                "stripe_group_payment_link is not configured, so a group card approval has no \
-                 link to send"
-                    .to_string(),
-            )
-        })?
+        card_link(&cfg.stripe_group_payment_link, &record.status_token)
+            .map_err(|source| Transitions::Review(Error::GroupCardLink { source }))?
     } else {
         None
     };
@@ -1156,13 +1157,16 @@ async fn approve_group(
     // same links rather than invalidating the ones already sent.
     let mut password_links: Vec<(String, String)> = Vec::new();
     for mailbox in &mailboxes {
-        let account = store
-            .account(mailbox)
-            .await?
-            .ok_or_else(|| Error::Failed(format!("the mailbox {mailbox} has no account record")))?;
-        let link = account
-            .password_link
-            .ok_or_else(|| Error::Failed(format!("the mailbox {mailbox} has no password link")))?;
+        let account = store.account(mailbox).await?.ok_or_else(|| {
+            Transitions::Review(Error::MailboxNoAccountRecord {
+                mailbox: mailbox.clone(),
+            })
+        })?;
+        let link = account.password_link.ok_or_else(|| {
+            Transitions::Review(Error::MailboxNoPasswordLink {
+                mailbox: mailbox.clone(),
+            })
+        })?;
         password_links.push((
             mailbox.clone(),
             sign::password_link(&cfg.base_url, key, &link.token, mailbox, &link.until)?,
@@ -1220,7 +1224,7 @@ pub async fn provision_held(
     store: &Store,
     journal: &Journal,
     key: &[u8],
-) -> Result<(), Error> {
+) -> Result<(), Transitions> {
     let today = OffsetDateTime::now_utc().date();
     for username in store.list("accounts").await? {
         let account = match store.account(&username).await {
@@ -1233,7 +1237,7 @@ pub async fn provision_held(
                     journal,
                     "account",
                     &username,
-                    &Error::from(e),
+                    &Transitions::from(e),
                 )
                 .await;
                 continue;
@@ -1249,7 +1253,7 @@ pub async fn provision_held(
                 journal,
                 "account",
                 &username,
-                &Error::Failed("a held account has no hold date".to_string()),
+                &Transitions::Review(Error::HeldAccountNoHoldDate),
             )
             .await;
             continue;
@@ -1261,7 +1265,9 @@ pub async fn provision_held(
                 journal,
                 "account",
                 &username,
-                &Error::Failed(format!("the hold date {hold:?} cannot be read")),
+                &Transitions::Review(Error::HoldDateUnreadable {
+                    hold: hold.to_string(),
+                }),
             )
             .await;
             continue;
@@ -1274,7 +1280,7 @@ pub async fn provision_held(
         // failed script cannot stop the payment, grace and bounce sweeps that
         // follow this one. The journal keeps "applying", so the next pass
         // retries the same account.
-        let outcome: Result<(), Error> = async {
+        let outcome: Result<(), Transitions> = async {
             let id = format!("provision-held-{username}");
             let application = ApplicationRef::account(username.clone());
             if !journal.has(&id, "applying") {
@@ -1298,17 +1304,17 @@ pub async fn provision_held(
                 .account_application_text(&username)
                 .await?
                 .ok_or_else(|| {
-                    Error::Failed(format!(
-                        "the held account {username} has no application copy to supply it from"
-                    ))
+                    Transitions::Review(Error::HeldAccountNoApplication {
+                        username: username.clone(),
+                    })
                 })?;
             let record: Record = serde_json::from_str(&text)
-                .map_err(|e| Error::context("the held account's application copy", e))?;
+                .map_err(|e| Transitions::context("the held account's application copy", e))?;
             if record.username != username {
-                return Err(Error::Failed(format!(
-                    "the approval copy under {username} names {}",
-                    record.username
-                )));
+                return Err(Transitions::Review(Error::ApprovalCopyNamesOther {
+                    username: username.clone(),
+                    named: record.username.clone(),
+                }));
             }
 
             provision_member(
@@ -1341,7 +1347,7 @@ pub async fn provision_held(
                         account.site_served = Some(hosted);
                         account.capsule_served = Some(hosted);
                     }
-                    Ok::<(), Error>(())
+                    Ok::<(), Transitions>(())
                 })
                 .await?;
 
@@ -1349,10 +1355,11 @@ pub async fn provision_held(
                 filed.password_link = Some(signed.clone());
                 filed.status_link_until = Some(util::after_days(7));
                 filed.stage = "approved: an account was made".to_string();
-                let bytes = serde_json::to_vec_pretty(&filed).map_err(|source| Error::Json {
-                    context: "encode the supplied application",
-                    source,
-                })?;
+                let bytes =
+                    serde_json::to_vec_pretty(&filed).map_err(|source| Transitions::Json {
+                        context: "encode the supplied application",
+                        source,
+                    })?;
                 store
                     .write_filed_application(&record.status_token, &bytes)
                     .await?;
@@ -1413,7 +1420,7 @@ pub async fn provision_held(
                             account.state = Standing::Active;
                         }
                     }
-                    Ok::<(), Error>(())
+                    Ok::<(), Transitions>(())
                 })
                 .await?;
             write_journal(
@@ -1446,18 +1453,16 @@ async fn decline(
     journal: &Journal,
     key: &[u8],
     intent: &DecisionIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let token = intent
         .application
         .status_token
         .as_deref()
-        .ok_or_else(|| Error::Failed("the decision names no status token".to_string()))?;
+        .ok_or_else(|| Transitions::Review(Error::DecisionNoStatusToken))?;
     let username = &intent.application.username;
     let record = application_record(store, token).await?;
     if record.username != *username {
-        return Err(Error::Failed(
-            "the intent's username is not the application's".to_string(),
-        ));
+        return Err(Transitions::Review(Error::IntentUsernameMismatch));
     }
     // A decision is single-use, and the journal is the only record of it the
     // handler cannot rewrite. This is also what refuses a decline over an
@@ -1493,9 +1498,7 @@ async fn decline(
         &sign::decide_payload(&record, &intent.action),
         &intent.sig,
     ) {
-        return Err(Error::Failed(
-            "the decision intent's signature does not verify against this record".to_string(),
-        ));
+        return Err(Transitions::Review(Error::SignatureDoesNotVerify));
     }
     // The address is validated before the journal line, so a record whose
     // address could inject a header is refused before anything is carried out.
@@ -1505,10 +1508,11 @@ async fn decline(
     // which answers for the week, is the channel the spec makes durable.
     let outside = match record.outside_address.as_deref() {
         Some(addr) => {
-            if let Some(why) = validate::address(addr) {
-                return Err(Error::Failed(format!(
-                    "the address outside the platform {addr:?}: {why}"
-                )));
+            if let Some(source) = validate::address(addr) {
+                return Err(Transitions::Review(Error::InvalidOutsideAddress {
+                    address: addr.to_string(),
+                    source,
+                }));
             }
             Some(addr.to_string())
         }
@@ -1562,7 +1566,7 @@ async fn decline(
 }
 
 /// Write the root-only review snapshot from the reviewed record.
-async fn snapshot_review(store: &Store, token: &str, record: &Record) -> Result<(), Error> {
+async fn snapshot_review(store: &Store, token: &str, record: &Record) -> Result<(), Transitions> {
     snapshot_review_payment(store, token, record, None).await
 }
 
@@ -1573,14 +1577,14 @@ async fn snapshot_review_payment(
     token: &str,
     record: &Record,
     payment: Option<&Payment>,
-) -> Result<(), Error> {
-    let mut value = serde_json::to_value(record).map_err(|source| Error::Json {
+) -> Result<(), Transitions> {
+    let mut value = serde_json::to_value(record).map_err(|source| Transitions::Json {
         context: "encode the reviewed application",
         source,
     })?;
     value["status_link_until"] = json!(util::after_days(7));
     if let Some(payment) = payment {
-        value["payment"] = serde_json::to_value(payment).map_err(|source| Error::Json {
+        value["payment"] = serde_json::to_value(payment).map_err(|source| Transitions::Json {
             context: "encode the payment block",
             source,
         })?;
@@ -1589,25 +1593,29 @@ async fn snapshot_review_payment(
 }
 
 /// Write a snapshot value, root-owned 0600, under `reviewed/`.
-async fn snapshot_review_value(store: &Store, token: &str, value: &Value) -> Result<(), Error> {
-    let bytes = serde_json::to_vec_pretty(value).map_err(|source| Error::Json {
+async fn snapshot_review_value(
+    store: &Store,
+    token: &str,
+    value: &Value,
+) -> Result<(), Transitions> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|source| Transitions::Json {
         context: "encode the reviewed application",
         source,
     })?;
     store
         .write_reviewed_application(token, &bytes)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 /// The application record a decision acts on, or an error naming what is
 /// missing. A decision intent for an application that is not on disk is refused
 /// rather than creating anything.
-async fn application_record(store: &Store, token: &str) -> Result<Record, Error> {
+async fn application_record(store: &Store, token: &str) -> Result<Record, Transitions> {
     store
         .application(token)
         .await?
-        .ok_or_else(|| Error::Failed("there is no application for this token".to_string()))
+        .ok_or_else(|| Transitions::Review(Error::NoApplicationForToken))
 }
 
 /// Write the decision onto the application record. `password_link` is written
@@ -1622,14 +1630,15 @@ async fn mark_decided(
     stage: &str,
     decided_at: &str,
     password_link: Option<String>,
-) -> Result<(), Error> {
-    let mut record = store.application(token).await?.ok_or_else(|| {
-        Error::Failed("the application record vanished before it could be decided".to_string())
-    })?;
+) -> Result<(), Transitions> {
+    let mut record = store
+        .application(token)
+        .await?
+        .ok_or_else(|| Transitions::Review(Error::ApplicationVanishedBeforeDecision))?;
     record.stage = stage.to_string();
     record.decided_at = Some(decided_at.to_string());
     record.password_link = password_link;
-    let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Error::Json {
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|source| Transitions::Json {
         context: "encode the record",
         source,
     })?;
@@ -1640,7 +1649,7 @@ async fn mark_decided(
     store
         .write_filed_application(token, &bytes)
         .await
-        .map_err(Error::from)
+        .map_err(Transitions::from)
 }
 
 fn decision_subject(what: &str, username: &str) -> String {
@@ -1830,23 +1839,22 @@ fn decision_body(
     no_charge: bool,
     payment: Option<&Payment>,
     application: Option<&str>,
-) -> Result<String, Error> {
+) -> Result<String, Transitions> {
     if no_charge {
         return Ok(format!(
             "Your application for {username} has been approved, with no charge.\n\n\
              There is nothing to pay and no payment window. The account does not lapse.\n"
         ));
     }
-    let payment = payment
-        .ok_or_else(|| Error::Failed("a charged approval has no payment block".to_string()))?;
+    let payment = payment.ok_or_else(|| Transitions::Review(Error::ChargedApprovalNoPayment))?;
     let token = payment
         .token_ref
         .as_deref()
-        .ok_or_else(|| Error::Failed("a charged approval has no token".to_string()))?;
+        .ok_or_else(|| Transitions::Review(Error::ChargedApprovalNoToken))?;
     let window = payment
         .window
         .as_ref()
-        .ok_or_else(|| Error::Failed("a charged approval has no window".to_string()))?;
+        .ok_or_else(|| Transitions::Review(Error::ChargedApprovalNoWindow))?;
     let card_link = if rail == "card" {
         card_link(&cfg.stripe_payment_link, application.unwrap_or(""))?
     } else {
@@ -1917,21 +1925,22 @@ pub async fn resend(
     cfg: &DrainConfig,
     store: &Store,
     intent: ResendIntent,
-) -> Result<Settlement, Error> {
+) -> Result<Settlement, Transitions> {
     let username = intent.username.as_str();
-    let account = store
-        .account(username)
-        .await?
-        .ok_or_else(|| Error::Failed(format!("no account for {username}")))?;
+    let account = store.account(username).await?.ok_or_else(|| {
+        Transitions::Review(Error::NoAccount {
+            username: username.to_string(),
+        })
+    })?;
     let Some(payment) = account.payment_state() else {
-        return Err(Error::Failed(format!(
-            "{username} was approved without charge, so there is no payment token to resend"
-        )));
+        return Err(Transitions::Review(Error::NoChargeNoToken {
+            username: username.to_string(),
+        }));
     };
     if payment.token_ref.as_deref() != Some(intent.token.as_str()) {
-        return Err(Error::Failed(format!(
-            "the token the resend names is not the one {username}'s account holds"
-        )));
+        return Err(Transitions::Review(Error::TokenMismatch {
+            username: username.to_string(),
+        }));
     }
     // The application the account was made from, from the account's own copy:
     // the journal line below names it, and it is where a record written before
@@ -1947,7 +1956,11 @@ pub async fn resend(
                 status_token,
             ))
         })
-        .ok_or_else(|| Error::Failed(format!("no application record for {username}")))?;
+        .ok_or_else(|| {
+            Transitions::Review(Error::NoApplicationRecord {
+                username: username.to_string(),
+            })
+        })?;
     // A card link is only minted for an identifier the webhook can still
     // resolve. The purge takes `applications/<id>.json` ninety days in while
     // the payment block keeps the identifier, and a link keyed to a record that
