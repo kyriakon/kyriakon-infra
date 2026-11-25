@@ -252,12 +252,12 @@ pub async fn verify(
             if !kyriakon_control_core::store::is_status_token(token) {
                 return Err(validation::Error::BadStatusToken.into());
             }
-            if let Some(why) =
+            if let Some(source) =
                 kyriakon_control_core::flow::validate::username_shape(&intent.application.username)
             {
                 return Err(validation::Error::InvalidUsername {
                     username: intent.application.username.clone(),
-                    why,
+                    source,
                 }
                 .into());
             }
@@ -281,21 +281,14 @@ pub async fn verify(
             // approval that installs it, which re-checks the signature against
             // that second read.
             let Some(record) = store.application(token).await? else {
-                return Err(validation::Error::NoApplication {
-                    token: token.to_string(),
-                }
-                .into());
+                return Err(validation::Error::NoApplication.into());
             };
             // The signature covers the record's username; the intent's is
             // handler-written. A decision intent naming another account than
             // the record it authorizes is refused here, before any transition
             // reads the record a second time.
             if intent.application.username != record.username {
-                return Err(validation::Error::ForeignApplication {
-                    username: intent.application.username.clone(),
-                    application: record.username.clone(),
-                }
-                .into());
+                return Err(validation::Error::ForeignApplication.into());
             }
             if !sign::verify(
                 key,
@@ -781,9 +774,9 @@ fn disposition(intent: &Intent) -> transitions::Disposition {
 /// store. `Err` carries the reason, worded for the journal.
 fn account_name(username: &str) -> Result<(), Error> {
     match kyriakon_control_core::flow::validate::username_shape(username) {
-        Some(why) => Err(validation::Error::InvalidUsername {
+        Some(source) => Err(validation::Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         }
         .into()),
         None => Ok(()),

@@ -8,6 +8,7 @@
 
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::validate;
+use kyriakon_control_core::flow::Reason;
 use kyriakon_control_core::store::{self, KeyRecord, Record, Store};
 use std::fmt;
 use std::os::unix::fs::PermissionsExt;
@@ -38,11 +39,11 @@ pub enum Error {
     /// mail.
     NoMailKey { username: String },
     /// A mail key's mailbox is not a name the box can serve.
-    MailKeyMailbox { localpart: String, why: String },
+    MailKeyMailbox { localpart: String, source: Reason },
     /// A mail key's material is empty.
     MailKeyEmpty { localpart: String },
     /// The address outside the platform does not pass the platform's rules.
-    OutsideAddress { address: String, why: String },
+    OutsideAddress { address: String, source: Reason },
     /// A key file could not be created, written or chmodded.
     Io {
         context: &'static str,
@@ -73,14 +74,14 @@ impl fmt::Display for Error {
                 "the application for {username} carries no mail key, so the account could not \
                  receive mail"
             ),
-            Error::MailKeyMailbox { localpart, why } => {
-                write!(f, "the mail key's mailbox {localpart:?}: {why}")
+            Error::MailKeyMailbox { localpart, source } => {
+                write!(f, "the mail key's mailbox {localpart:?}: {source}")
             }
             Error::MailKeyEmpty { localpart } => {
                 write!(f, "the mail key for {localpart} is empty")
             }
-            Error::OutsideAddress { address, why } => {
-                write!(f, "the address outside the platform {address:?}: {why}")
+            Error::OutsideAddress { address, source } => {
+                write!(f, "the address outside the platform {address:?}: {source}")
             }
             Error::Io {
                 context,
@@ -97,13 +98,14 @@ impl std::error::Error for Error {
         match self {
             Error::Spawn { source, .. } | Error::Io { source, .. } => Some(source),
             Error::Store(error) => Some(error),
+            Error::MailKeyMailbox { source, .. } | Error::OutsideAddress { source, .. } => {
+                Some(source)
+            }
             Error::Exited { .. }
             | Error::NoStdin { .. }
             | Error::EmptyKeyMaterial { .. }
             | Error::NoMailKey { .. }
-            | Error::MailKeyMailbox { .. }
-            | Error::MailKeyEmpty { .. }
-            | Error::OutsideAddress { .. } => None,
+            | Error::MailKeyEmpty { .. } => None,
         }
     }
 }
@@ -314,10 +316,10 @@ pub(super) async fn publish_mail_keys(
     })?;
     for key in keys {
         let localpart = mail_key_localpart(username, key);
-        if let Some(why) = validate::username_shape(localpart) {
+        if let Some(source) = validate::username_shape(localpart) {
             return Err(Error::MailKeyMailbox {
                 localpart: localpart.to_string(),
-                why,
+                source,
             });
         }
         let body = key.material.trim();
@@ -394,10 +396,10 @@ pub(super) async fn publish_mail_keys_publicly(
 pub(super) fn outside_address(record: &Record) -> Result<Option<String>, Error> {
     match record.outside_address.as_deref() {
         Some(addr) => {
-            if let Some(why) = validate::address(addr) {
+            if let Some(source) = validate::address(addr) {
                 return Err(Error::OutsideAddress {
                     address: addr.to_string(),
-                    why,
+                    source,
                 });
             }
             Ok(Some(addr.to_string()))

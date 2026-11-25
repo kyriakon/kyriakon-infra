@@ -81,12 +81,9 @@ fn run_mail_table(args: &[String]) -> Result<u8, Error> {
     let (verb, rest) = args
         .split_first()
         .ok_or(usage::Error::MailTableVerbMissing)?;
-    let (path, rest) =
-        rest.split_first()
-            .ok_or_else(|| usage::Error::MailTableArgumentMissing {
-                verb: verb.clone(),
-                argument: "table",
-            })?;
+    let (path, rest) = rest
+        .split_first()
+        .ok_or(usage::Error::MailTableArgumentMissing)?;
     let table = Table::at(path).map_err(Error::from)?;
     let changed = |change: kyriakon_control_core::mail::table::Change| {
         if change.changed {
@@ -97,24 +94,16 @@ fn run_mail_table(args: &[String]) -> Result<u8, Error> {
     };
     match verb.as_str() {
         "add" => {
-            let (name, rest) =
-                rest.split_first()
-                    .ok_or_else(|| usage::Error::MailTableArgumentMissing {
-                        verb: verb.clone(),
-                        argument: "name",
-                    })?;
+            let (name, rest) = rest
+                .split_first()
+                .ok_or(usage::Error::MailTableArgumentMissing)?;
             let value = rest.first().map(String::as_str);
             let change = table.ensure(name, value).map_err(Error::from)?;
             println!("{}", if change.added { "added" } else { "present" });
             Ok(0)
         }
         "set" => {
-            let line = rest
-                .first()
-                .ok_or_else(|| usage::Error::MailTableArgumentMissing {
-                    verb: verb.clone(),
-                    argument: "line",
-                })?;
+            let line = rest.first().ok_or(usage::Error::MailTableArgumentMissing)?;
             let change = table.set(line).map_err(Error::from)?;
             println!(
                 "{}",
@@ -129,12 +118,7 @@ fn run_mail_table(args: &[String]) -> Result<u8, Error> {
             Ok(0)
         }
         "check" => {
-            let line = rest
-                .first()
-                .ok_or_else(|| usage::Error::MailTableArgumentMissing {
-                    verb: verb.clone(),
-                    argument: "line",
-                })?;
+            let line = rest.first().ok_or(usage::Error::MailTableArgumentMissing)?;
             match table.check(line).map_err(Error::from)? {
                 Lookup::Absent => println!("absent"),
                 Lookup::Same => println!("same"),
@@ -143,55 +127,28 @@ fn run_mail_table(args: &[String]) -> Result<u8, Error> {
             Ok(0)
         }
         "drop" => {
-            let (how, rest) =
-                rest.split_first()
-                    .ok_or_else(|| usage::Error::MailTableArgumentMissing {
-                        verb: verb.clone(),
-                        argument: "how",
-                    })?;
-            let text = rest
-                .first()
-                .ok_or_else(|| usage::Error::MailTableArgumentMissing {
-                    verb: verb.clone(),
-                    argument: "text",
-                })?;
+            let (how, rest) = rest
+                .split_first()
+                .ok_or(usage::Error::MailTableArgumentMissing)?;
+            let text = rest.first().ok_or(usage::Error::MailTableArgumentMissing)?;
             let how = DropMode::parse(how).map_err(Error::from)?;
             Ok(changed(table.drop(how, text).map_err(Error::from)?))
         }
         "map-add" => {
-            let (key, rest) =
-                rest.split_first()
-                    .ok_or_else(|| usage::Error::MailTableArgumentMissing {
-                        verb: verb.clone(),
-                        argument: "key",
-                    })?;
-            let value = rest
-                .first()
-                .ok_or_else(|| usage::Error::MailTableArgumentMissing {
-                    verb: verb.clone(),
-                    argument: "value",
-                })?;
+            let (key, rest) = rest
+                .split_first()
+                .ok_or(usage::Error::MailTableArgumentMissing)?;
+            let value = rest.first().ok_or(usage::Error::MailTableArgumentMissing)?;
             Ok(changed(table.map_add(key, value).map_err(Error::from)?))
         }
         "regenerate" => {
-            let (passwd, rest) =
-                rest.split_first()
-                    .ok_or_else(|| usage::Error::MailTableArgumentMissing {
-                        verb: verb.clone(),
-                        argument: "passwd",
-                    })?;
-            let (virtuals, rest) =
-                rest.split_first()
-                    .ok_or_else(|| usage::Error::MailTableArgumentMissing {
-                        verb: verb.clone(),
-                        argument: "virtuals",
-                    })?;
-            let domain = rest
-                .first()
-                .ok_or_else(|| usage::Error::MailTableArgumentMissing {
-                    verb: verb.clone(),
-                    argument: "domain",
-                })?;
+            let (passwd, rest) = rest
+                .split_first()
+                .ok_or(usage::Error::MailTableArgumentMissing)?;
+            let (virtuals, rest) = rest
+                .split_first()
+                .ok_or(usage::Error::MailTableArgumentMissing)?;
+            let domain = rest.first().ok_or(usage::Error::MailTableArgumentMissing)?;
             let change = table
                 .regenerate_senders(Path::new(passwd), Path::new(virtuals), domain)
                 .map_err(Error::from)?;
@@ -205,7 +162,7 @@ fn run_mail_table(args: &[String]) -> Result<u8, Error> {
             );
             Ok(0)
         }
-        _ => Err(usage::Error::MailTableVerbUnknown { verb: verb.clone() }.into()),
+        _ => Err(usage::Error::MailTableVerbUnknown.into()),
     }
 }
 

@@ -10,6 +10,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use kyriakon_control_core::flow::Reason;
 use kyriakon_control_core::mail::Error as Mail;
 
 /// A group transition's failure. The fields are the values the sentence names,
@@ -18,7 +19,7 @@ use kyriakon_control_core::mail::Error as Mail;
 pub enum Error {
     // ---- the address table a body is made of ----
     /// The table is not a list of `localpart: own` and `localpart: alias target`.
-    AddressTable { why: String },
+    AddressTable { source: Reason },
     /// The table's line count does not match the account-name count.
     AddressNameCount { addresses: usize, names: usize },
     /// A line is not `localpart: own` or `localpart: alias localpart`.
@@ -50,9 +51,9 @@ pub enum Error {
     /// The name is already in use on the box, made by somebody else.
     NameInUseOnBox { mailbox: String },
     /// The username does not pass the platform's own name rules.
-    InvalidUsername { username: String, why: String },
+    InvalidUsername { username: String, source: Reason },
     /// The mailbox name does not pass the platform's own name rules.
-    InvalidMailbox { mailbox: String, why: String },
+    InvalidMailbox { mailbox: String, source: Reason },
 
     // ---- an intent of the wrong shape ----
     /// The file is not a `provision-group` intent.
@@ -68,13 +69,13 @@ pub enum Error {
     /// The platform's own domain cannot be read from `mail_domains`.
     NoPlatformDomain { path: String },
     /// The domain does not pass the platform's own domain rules.
-    InvalidDomain { domain: String, why: String },
+    InvalidDomain { domain: String, source: Reason },
     /// The intent names no mailbox, so there is nothing to make.
     NoMailboxToProvision,
     /// One mailbox is named more than once.
     MailboxNamedTwice { mailbox: String },
     /// The address does not pass the platform's own localpart rules.
-    InvalidAddress { address: String, why: String },
+    InvalidAddress { address: String, source: Reason },
     /// An address points at a mailbox the intent does not name.
     AddressPointsOutside {
         address: String,
@@ -98,7 +99,7 @@ pub enum Error {
     /// The key material is empty.
     MailKeyEmpty { mailbox: String },
     /// The shared check refuses the key.
-    MailKeyUnusable { mailbox: String, why: String },
+    MailKeyUnusable { mailbox: String, source: Reason },
     /// No fingerprint can be derived from the material.
     MailKeyNoFingerprint { mailbox: String },
 
@@ -143,7 +144,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::AddressTable { why } => write!(f, "the address table: {why}"),
+            Error::AddressTable { source } => write!(f, "the address table: {source}"),
             Error::AddressNameCount { addresses, names } => write!(
                 f,
                 "{addresses} addresses and {names} account names; there is one name per address"
@@ -193,11 +194,11 @@ impl fmt::Display for Error {
                     "the account name {mailbox} is already in use on this box"
                 )
             }
-            Error::InvalidUsername { username, why } => {
-                write!(f, "the username {username}: {why}")
+            Error::InvalidUsername { username, source } => {
+                write!(f, "the username {username}: {source}")
             }
-            Error::InvalidMailbox { mailbox, why } => {
-                write!(f, "the mailbox {mailbox:?}: {why}")
+            Error::InvalidMailbox { mailbox, source } => {
+                write!(f, "the mailbox {mailbox:?}: {source}")
             }
             Error::NotAGroupIntent { kind } => {
                 write!(f, "kind {kind:?} is not a group intent")
@@ -215,8 +216,8 @@ impl fmt::Display for Error {
                 f,
                 "{path} has no first line, so the platform's own domain is unknown"
             ),
-            Error::InvalidDomain { domain, why } => {
-                write!(f, "the domain {domain:?}: {why}")
+            Error::InvalidDomain { domain, source } => {
+                write!(f, "the domain {domain:?}: {source}")
             }
             Error::NoMailboxToProvision => {
                 f.write_str("the intent names no mailbox, so there is nothing to provision")
@@ -224,8 +225,8 @@ impl fmt::Display for Error {
             Error::MailboxNamedTwice { mailbox } => {
                 write!(f, "the mailbox {mailbox} is named twice")
             }
-            Error::InvalidAddress { address, why } => {
-                write!(f, "the address {address:?}: {why}")
+            Error::InvalidAddress { address, source } => {
+                write!(f, "the address {address:?}: {source}")
             }
             Error::AddressPointsOutside {
                 address,
@@ -259,8 +260,8 @@ impl fmt::Display for Error {
             Error::MailKeyEmpty { mailbox } => {
                 write!(f, "the mail key for {mailbox} is empty")
             }
-            Error::MailKeyUnusable { mailbox, why } => {
-                write!(f, "the mail key for {mailbox} cannot be used: {why}")
+            Error::MailKeyUnusable { mailbox, source } => {
+                write!(f, "the mail key for {mailbox} cannot be used: {source}")
             }
             Error::MailKeyNoFingerprint { mailbox } => write!(
                 f,
@@ -318,6 +319,12 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::MailKeyUnreadable { source, .. } => Some(source),
+            Error::AddressTable { source } => Some(source),
+            Error::InvalidUsername { source, .. }
+            | Error::InvalidMailbox { source, .. }
+            | Error::InvalidDomain { source, .. }
+            | Error::InvalidAddress { source, .. }
+            | Error::MailKeyUnusable { source, .. } => Some(source),
             Error::ReadPasswd { source, .. } => Some(source),
             Error::ApplicationUnreadable { source } => Some(source),
             Error::RemoveGroupDir { source, .. } => Some(source),

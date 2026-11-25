@@ -14,6 +14,7 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
+use crate::flow::Reason;
 use crate::store;
 
 #[derive(Debug)]
@@ -136,7 +137,7 @@ pub enum Error {
     /// A drop was given no text to match.
     EmptyDropText,
     /// The platform domain is not a domain.
-    PlatformDomain { why: String },
+    PlatformDomain { source: Reason },
     /// The passwd file could not be read.
     ReadPasswd { path: PathBuf, source: io::Error },
     /// The virtual table could not be read for the sender mapping.
@@ -318,7 +319,7 @@ impl fmt::Display for Error {
                 write!(f, "{} has {key} in the other shape already", path.display())
             }
             Error::EmptyDropText => f.write_str("the drop text is empty"),
-            Error::PlatformDomain { why } => write!(f, "the platform domain: {why}"),
+            Error::PlatformDomain { source } => write!(f, "the platform domain: {source}"),
             Error::ReadPasswd { path, source } => {
                 write!(f, "cannot read {}: {source}", path.display())
             }
@@ -417,6 +418,7 @@ impl std::error::Error for Error {
                 Some(source)
             }
             Error::HeadersUnreadable { source } => Some(source),
+            Error::PlatformDomain { source } => Some(source),
             _ => None,
         }
     }

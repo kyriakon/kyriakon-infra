@@ -20,12 +20,9 @@ pub enum Error {
     /// The `mail-table` command was given no verb.
     MailTableVerbMissing,
     /// A `mail-table` verb was given fewer arguments than it takes.
-    MailTableArgumentMissing {
-        verb: String,
-        argument: &'static str,
-    },
+    MailTableArgumentMissing,
     /// The `mail-table` command named a verb this binary does not know.
-    MailTableVerbUnknown { verb: String },
+    MailTableVerbUnknown,
 }
 
 impl fmt::Display for Error {
@@ -37,8 +34,8 @@ impl fmt::Display for Error {
                 "unknown argument {argument:?}; usage: kyriakon-control-drain [--config PATH]"
             ),
             Error::MailTableVerbMissing
-            | Error::MailTableArgumentMissing { .. }
-            | Error::MailTableVerbUnknown { .. } => f.write_str(MAIL_TABLE_USAGE),
+            | Error::MailTableArgumentMissing
+            | Error::MailTableVerbUnknown => f.write_str(MAIL_TABLE_USAGE),
         }
     }
 }

@@ -30,7 +30,7 @@ pub enum Error {
     /// A file reply line is neither `OK` nor `ERR`.
     NoFileAnswer { line: String },
     /// The handler refused the application in its own words.
-    HandlerRefusal { why: String },
+    HandlerRefusal { message: String },
     /// The socket could not be reached.
     Connect {
         what: &'static str,
@@ -68,7 +68,7 @@ impl fmt::Display for Error {
             Error::NoFileAnswer { line } => {
                 write!(f, "the file service sent no answer: {line:?}")
             }
-            Error::HandlerRefusal { why } => f.write_str(why),
+            Error::HandlerRefusal { message } => f.write_str(message),
             Error::Connect { what, path, source } => {
                 write!(f, "cannot reach the {what} at {}: {source}", path.display())
             }
@@ -206,9 +206,9 @@ pub fn parse_file_answer(line: &str) -> Result<String, Error> {
     let line = line.trim_end_matches(['\r', '\n']);
     if let Some(token) = line.strip_prefix("OK ") {
         Ok(token.to_string())
-    } else if let Some(why) = line.strip_prefix("ERR ") {
+    } else if let Some(message) = line.strip_prefix("ERR ") {
         Err(Error::HandlerRefusal {
-            why: why.to_string(),
+            message: message.to_string(),
         })
     } else {
         Err(Error::NoFileAnswer {

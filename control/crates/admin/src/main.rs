@@ -248,10 +248,10 @@ fn one_username(rest: &[String]) -> Result<&str, Error> {
         [_, username] => username.as_str(),
         _ => return Err(Error::Usage),
     };
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         });
     }
     Ok(username)
@@ -321,10 +321,10 @@ async fn export(cfg: &DrainConfig, store: &Store, args: &[String]) -> Result<(),
     if username.starts_with("--") {
         return Err(Error::Usage);
     }
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         });
     }
     let rest = &args[1..];

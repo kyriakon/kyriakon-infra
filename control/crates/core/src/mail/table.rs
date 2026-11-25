@@ -412,8 +412,8 @@ impl Table {
         virtuals: &Path,
         platform_domain: &str,
     ) -> Result<Change, Error> {
-        if let Some(why) = crate::flow::validate::domain(platform_domain) {
-            return Err(Error::PlatformDomain { why });
+        if let Some(source) = crate::flow::validate::domain(platform_domain) {
+            return Err(Error::PlatformDomain { source });
         }
         let domain = lower(platform_domain);
         let _lock = self.lock()?;
@@ -946,7 +946,11 @@ mod tests {
         let err = table
             .ensure("alice@kyriakon.net", Some("somebody-else"))
             .unwrap_err();
-        assert!(format!("{err}").contains("already maps"));
+        assert!(matches!(
+            err,
+            Error::AlreadyMapped { key, have, want, .. }
+                if key == "alice@kyriakon.net" && have == "alice" && want == "somebody-else"
+        ));
     }
 
     #[test]
@@ -1274,12 +1278,12 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_table_names_the_deploy() {
+    fn a_missing_table_is_reported_as_unreadable() {
         let fix = Fixture::new("missing");
         let table = Table::at(&fix.path("virtuals")).unwrap();
         let err = table
             .ensure("alice@kyriakon.net", Some("alice"))
             .unwrap_err();
-        assert!(format!("{err}").contains("deploy-mail.sh"));
+        assert!(matches!(err, Error::ReadTable { .. }));
     }
 }

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 
 use kyriakon_control_core::account::state::Standing;
+use kyriakon_control_core::flow::Reason;
 use time::error::Parse as TimeParse;
 
 use crate::transitions::Error as Transitions;
@@ -26,11 +27,11 @@ pub enum Error {
     /// The account record the transition needs is absent.
     AccountRecordMissing { username: String },
     /// A name is not a valid account name.
-    InvalidUsername { username: String, why: String },
+    InvalidUsername { username: String, source: Reason },
     /// A name is not a valid domain.
-    InvalidDomain { domain: String, why: String },
+    InvalidDomain { domain: String, source: Reason },
     /// An address is not a valid mail address.
-    InvalidAddress { address: String, why: String },
+    InvalidAddress { address: String, source: Reason },
 
     // ---- restarting a grace clock ----
     /// The account is in a standing with no grace clock to restart.
@@ -134,12 +135,12 @@ impl fmt::Display for Error {
             Error::AccountRecordMissing { username } => {
                 write!(f, "accounts/{username}/account.json is missing")
             }
-            Error::InvalidUsername { username, why } => {
-                write!(f, "the username {username:?}: {why}")
+            Error::InvalidUsername { username, source } => {
+                write!(f, "the username {username:?}: {source}")
             }
-            Error::InvalidDomain { domain, why } => write!(f, "the domain {domain:?}: {why}"),
-            Error::InvalidAddress { address, why } => {
-                write!(f, "the address {address:?}: {why}")
+            Error::InvalidDomain { domain, source } => write!(f, "the domain {domain:?}: {source}"),
+            Error::InvalidAddress { address, source } => {
+                write!(f, "the address {address:?}: {source}")
             }
             Error::NoGraceClock { username, standing } => write!(
                 f,
@@ -278,6 +279,9 @@ impl std::error::Error for Error {
             Error::RotationWindowUnparseable { source, .. } => Some(source),
             Error::RunResolver { source, .. } => Some(source),
             Error::ReadQuota { source, .. } => Some(source),
+            Error::InvalidUsername { source, .. }
+            | Error::InvalidDomain { source, .. }
+            | Error::InvalidAddress { source, .. } => Some(source),
             _ => None,
         }
     }

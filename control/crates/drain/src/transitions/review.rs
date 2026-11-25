@@ -19,6 +19,7 @@ use kyriakon_control_core::account::state::Standing;
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::questions;
 use kyriakon_control_core::flow::validate;
+use kyriakon_control_core::flow::Reason;
 use kyriakon_control_core::intent::{DecisionIntent, ResendIntent, DECISIONS, RAILS};
 use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::payments::rails::{card_link, rail_instructions};
@@ -539,9 +540,11 @@ async fn approve(
         }
         let checked = kyriakon_control_core::mail::pgp::public_key(&key.material)
             .map_err(|e| Transitions::context("the application's mail key", e))?;
-        if let Some(why) = checked.refusal() {
+        if let Some(verdict) = checked.refusal() {
             return Err(Transitions::Review(Error::MailKeyUnusable {
-                why: why.to_string(),
+                source: Reason::KeyRefused {
+                    verdict: verdict.to_string(),
+                },
             }));
         }
     }
@@ -956,10 +959,10 @@ async fn approve_group(
         .domain
         .clone()
         .ok_or_else(|| Transitions::Review(Error::ApplicationNoDomain))?;
-    if let Some(why) = validate::domain(&domain) {
+    if let Some(source) = validate::domain(&domain) {
         return Err(Transitions::Review(Error::InvalidDomain {
             domain: domain.clone(),
-            why,
+            source,
         }));
     }
     // The platform's own domain is not a body's to claim: its approval would
@@ -1505,10 +1508,10 @@ async fn decline(
     // which answers for the week, is the channel the spec makes durable.
     let outside = match record.outside_address.as_deref() {
         Some(addr) => {
-            if let Some(why) = validate::address(addr) {
+            if let Some(source) = validate::address(addr) {
                 return Err(Transitions::Review(Error::InvalidOutsideAddress {
                     address: addr.to_string(),
-                    why,
+                    source,
                 }));
             }
             Some(addr.to_string())

@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use kyriakon_control_core::account;
 use kyriakon_control_core::config;
+use kyriakon_control_core::flow::Reason;
 use kyriakon_control_core::intent;
 use kyriakon_control_core::mail;
 use kyriakon_control_core::store;
@@ -36,17 +37,20 @@ pub enum Error {
 
     // ---- a value a record or the command names ----
     /// A name is not a valid account name.
-    InvalidUsername { username: String, why: String },
+    InvalidUsername { username: String, source: Reason },
     /// A domain is not a valid domain.
-    InvalidDomain { domain: String, why: String },
+    InvalidDomain { domain: String, source: Reason },
     /// A mailbox name is not a valid account name.
-    InvalidMailbox { mailbox: String, why: String },
+    InvalidMailbox { mailbox: String, source: Reason },
     /// An address localpart is not a valid one.
-    InvalidAddress { address: String, why: String },
+    InvalidAddress { address: String, source: Reason },
     /// A site owner is not a valid account name.
-    InvalidSiteOwner { owner: String, why: String },
+    InvalidSiteOwner { owner: String, source: Reason },
     /// A pasted Monero address is not a subaddress.
-    InvalidMoneroAddress { address: String, why: String },
+    InvalidMoneroAddress {
+        address: String,
+        problem: &'static str,
+    },
     /// An address action the intent vocabulary does not know.
     UnknownAction { action: String },
 
@@ -78,7 +82,7 @@ pub enum Error {
     /// The mail key block does not parse.
     MailKeyInvalid { path: PathBuf, source: mail::Error },
     /// The mail key parses but does not meet the page's own conditions.
-    MailKeyRefused { mailbox: String, why: String },
+    MailKeyRefused { mailbox: String, source: Reason },
     /// The mail key carries no key packet.
     MailKeyNoPacket { path: PathBuf },
     /// A new mailbox was filed without its public key.
@@ -257,21 +261,21 @@ impl fmt::Display for Error {
             Error::Duplicate { flag } => write!(f, "{flag} is given twice"),
             Error::MissingFlag { flag } => write!(f, "--{flag} is needed"),
 
-            Error::InvalidUsername { username, why } => {
-                write!(f, "the username {username:?}: {why}")
+            Error::InvalidUsername { username, source } => {
+                write!(f, "the username {username:?}: {source}")
             }
-            Error::InvalidDomain { domain, why } => write!(f, "the domain {domain:?}: {why}"),
-            Error::InvalidMailbox { mailbox, why } => {
-                write!(f, "the mailbox {mailbox:?}: {why}")
+            Error::InvalidDomain { domain, source } => write!(f, "the domain {domain:?}: {source}"),
+            Error::InvalidMailbox { mailbox, source } => {
+                write!(f, "the mailbox {mailbox:?}: {source}")
             }
-            Error::InvalidAddress { address, why } => {
-                write!(f, "the address {address:?}: {why}")
+            Error::InvalidAddress { address, source } => {
+                write!(f, "the address {address:?}: {source}")
             }
-            Error::InvalidSiteOwner { owner, why } => {
-                write!(f, "the site owner {owner:?}: {why}")
+            Error::InvalidSiteOwner { owner, source } => {
+                write!(f, "the site owner {owner:?}: {source}")
             }
-            Error::InvalidMoneroAddress { address, why } => {
-                write!(f, "the address {address:?} {why}")
+            Error::InvalidMoneroAddress { address, problem } => {
+                write!(f, "the address {address:?} {problem}")
             }
             Error::UnknownAction { action } => write!(
                 f,
@@ -316,8 +320,8 @@ impl fmt::Display for Error {
             Error::MailKeyInvalid { path, source } => {
                 write!(f, "the mail key {}: {source}", path.display())
             }
-            Error::MailKeyRefused { mailbox, why } => {
-                write!(f, "the mail key for {mailbox} cannot be used: {why}")
+            Error::MailKeyRefused { mailbox, source } => {
+                write!(f, "the mail key for {mailbox} cannot be used: {source}")
             }
             Error::MailKeyNoPacket { path } => {
                 write!(f, "the mail key {}: it carries no key packet", path.display())
@@ -531,6 +535,12 @@ impl std::error::Error for Error {
             Error::AmountUnreadable { source } | Error::RateUnreadable { source } => Some(source),
             Error::RequestStateUnreadable { source, .. } => Some(source),
             Error::Store(error) => Some(error),
+            Error::InvalidUsername { source, .. }
+            | Error::InvalidDomain { source, .. }
+            | Error::InvalidMailbox { source, .. }
+            | Error::InvalidAddress { source, .. }
+            | Error::InvalidSiteOwner { source, .. }
+            | Error::MailKeyRefused { source, .. } => Some(source),
             Error::Config(error) => Some(error),
             Error::Core(error) => Some(error),
             Error::Drain(error) => Some(error),

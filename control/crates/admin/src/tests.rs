@@ -118,7 +118,9 @@ fn one_username_takes_exactly_one_valid_name() {
     assert!(one_username(&args(&["show", "alice", "extra"])).is_err());
     assert!(matches!(
         one_username(&args(&["show", "Alice"])).unwrap_err(),
-        Error::InvalidUsername { username, why } if username == "Alice" && why.contains("starts with")
+        Error::InvalidUsername { username, source }
+            if username == "Alice"
+                && matches!(source, kyriakon_control_core::flow::Reason::UsernameFirst)
     ));
 }
 
@@ -135,7 +137,9 @@ fn a_decision_takes_a_username_and_a_token() {
     assert!(application_args(&args(&["approve", "alice", token, "extra"])).is_err());
     assert!(matches!(
         application_args(&args(&["approve", "Alice", token])).unwrap_err(),
-        Error::InvalidUsername { username, why } if username == "Alice" && why.contains("starts with")
+        Error::InvalidUsername { username, source }
+            if username == "Alice"
+                && matches!(source, kyriakon_control_core::flow::Reason::UsernameFirst)
     ));
 }
 

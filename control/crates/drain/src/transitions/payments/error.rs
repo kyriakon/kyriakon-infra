@@ -8,6 +8,8 @@
 
 use std::fmt;
 
+use kyriakon_control_core::flow::Reason;
+
 /// A payments transition's failure. The fields are the values the sentence
 /// names, so a caller can read the state back without parsing the text.
 #[derive(Debug)]
@@ -15,7 +17,7 @@ pub enum Error {
     /// The configured price is not more than zero.
     PriceNotPositive { field: &'static str },
     /// The token's group domain does not pass the platform's domain rules.
-    GroupDomainInvalid { domain: String, why: String },
+    GroupDomainInvalid { domain: String, source: Reason },
     /// The credit names a rail that is not one this path accepts.
     CreditRailUnknown,
     /// The credit's token is not the shape of a payment token.
@@ -72,8 +74,8 @@ impl fmt::Display for Error {
             Error::PriceNotPositive { field } => {
                 write!(f, "the drain's configured {field} must be more than zero")
             }
-            Error::GroupDomainInvalid { domain, why } => {
-                write!(f, "the token's group domain {domain:?}: {why}")
+            Error::GroupDomainInvalid { domain, source } => {
+                write!(f, "the token's group domain {domain:?}: {source}")
             }
             Error::CreditRailUnknown => {
                 f.write_str("the credit names a rail that is not cash, cash-hand or monero")
@@ -145,6 +147,9 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        None
+        match self {
+            Error::GroupDomainInvalid { source, .. } => Some(source),
+            _ => None,
+        }
     }
 }

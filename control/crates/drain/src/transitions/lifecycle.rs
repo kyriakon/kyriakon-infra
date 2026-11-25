@@ -1478,10 +1478,10 @@ async fn suspension_final_notice(
 /// notice went to, then latches the stop the sweep reads. `notice resend`
 /// clears it.
 pub async fn stop_notice(store: &Store, username: &str) -> Result<store::NoticeStop, Transitions> {
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Transitions::Lifecycle(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         }));
     }
     if store.account(username).await?.is_none() {
@@ -1549,10 +1549,10 @@ pub async fn resend_notice(
     to: Option<&str>,
     group: Option<&str>,
 ) -> Result<(String, String), Transitions> {
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Transitions::Lifecycle(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         }));
     }
     let Some(account) = store.account(username).await? else {
@@ -1561,10 +1561,10 @@ pub async fn resend_notice(
         }));
     };
     if let Some(domain) = group {
-        if let Some(why) = validate::domain(domain) {
+        if let Some(source) = validate::domain(domain) {
             return Err(Transitions::Lifecycle(Error::InvalidDomain {
                 domain: domain.to_string(),
-                why,
+                source,
             }));
         }
         return resend_group(cfg, store, &account, username, domain, to).await;
@@ -1776,10 +1776,10 @@ async fn resend_group(
 fn resend_address(to: Option<&str>, account: &Account) -> Result<String, Transitions> {
     match to {
         Some(to) => {
-            if let Some(why) = validate::address(to) {
+            if let Some(source) = validate::address(to) {
                 return Err(Transitions::Lifecycle(Error::InvalidAddress {
                     address: to.to_string(),
-                    why,
+                    source,
                 }));
             }
             Ok(to.to_string())
@@ -1846,10 +1846,10 @@ pub async fn suspend(
     username: &str,
     reason: &str,
 ) -> Result<(), Transitions> {
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Transitions::Lifecycle(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         }));
     }
     let reason = reason.trim();
@@ -1959,10 +1959,10 @@ pub async fn resume(
     journal: &Journal,
     username: &str,
 ) -> Result<Resume, Transitions> {
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Transitions::Lifecycle(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         }));
     }
     let Some(account) = store.account(username).await? else {
@@ -2068,10 +2068,10 @@ pub async fn delete_account(
     journal: &Journal,
     username: &str,
 ) -> Result<(), Transitions> {
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Transitions::Lifecycle(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         }));
     }
     // The account record is read before the journal line so the answer can name

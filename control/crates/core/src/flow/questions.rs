@@ -451,8 +451,10 @@ required = true
             "body_account_names".to_string(),
             "secretary\nhall\nsecretary".to_string(),
         );
-        let why = account_names(&answers).unwrap_err().to_string();
-        assert!(why.contains("secretary") && why.contains("twice"), "{why}");
+        assert!(matches!(
+            account_names(&answers),
+            Err(Error::DuplicateAccountName { name }) if name == "secretary"
+        ));
     }
 
     #[test]

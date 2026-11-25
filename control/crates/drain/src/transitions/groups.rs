@@ -21,6 +21,7 @@ use kyriakon_control_core::account::state::Standing;
 use kyriakon_control_core::config::DrainConfig;
 use kyriakon_control_core::flow::questions;
 use kyriakon_control_core::flow::validate;
+use kyriakon_control_core::flow::Reason;
 use kyriakon_control_core::intent::ADDRESS_ACTIONS;
 use kyriakon_control_core::mail::notice;
 use kyriakon_control_core::mail::table::Table;
@@ -54,8 +55,8 @@ pub(super) fn group_addresses(
         .get("body_addresses")
         .map(String::as_str)
         .unwrap_or("");
-    if let Some(why) = validate::address_lines(text) {
-        return Err(Transitions::Groups(Error::AddressTable { why }));
+    if let Some(source) = validate::address_lines(text) {
+        return Err(Transitions::Groups(Error::AddressTable { source }));
     }
     let lines: Vec<&str> = text
         .lines()
@@ -257,10 +258,10 @@ pub async fn provision_group(
             kind: intent.kind.clone(),
         }));
     }
-    if let Some(why) = validate::domain(&intent.domain) {
+    if let Some(source) = validate::domain(&intent.domain) {
         return Err(Transitions::Groups(Error::InvalidDomain {
             domain: intent.domain.clone(),
-            why,
+            source,
         }));
     }
     if let Some(reason) = body_domain_refusal(cfg, &intent.domain).await? {
@@ -283,10 +284,10 @@ pub async fn provision_group(
         }
     }
     for address in &intent.addresses {
-        if let Some(why) = validate::address_localpart_shape(&address.address) {
+        if let Some(source) = validate::address_localpart_shape(&address.address) {
             return Err(Transitions::Groups(Error::InvalidAddress {
                 address: address.address.clone(),
-                why,
+                source,
             }));
         }
         if !intent.mailboxes.iter().any(|m| m == &address.mailbox) {
@@ -899,10 +900,12 @@ fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Transitions> {
     // The form and the rotation path refuse a key whose verdict is not "works";
     // the console is the same boundary, so an AEAD advert or an expiring subkey
     // cannot reach the keyring by this route.
-    if let Some(why) = checked.refusal() {
+    if let Some(verdict) = checked.refusal() {
         return Err(Transitions::Groups(Error::MailKeyUnusable {
             mailbox: intent.mailbox.clone(),
-            why: why.to_string(),
+            source: Reason::KeyRefused {
+                verdict: verdict.to_string(),
+            },
         }));
     }
     let mut key = key.clone();
@@ -940,10 +943,10 @@ pub async fn group_address(
             action: intent.action.clone(),
         }));
     }
-    if let Some(why) = validate::domain(&intent.domain) {
+    if let Some(source) = validate::domain(&intent.domain) {
         return Err(Transitions::Groups(Error::InvalidDomain {
             domain: intent.domain.clone(),
-            why,
+            source,
         }));
     }
     let Some(mut group) = group_record(store, &intent.domain).await? else {
@@ -954,17 +957,17 @@ pub async fn group_address(
             intent.domain
         )));
     };
-    if let Some(why) = validate::username_shape(&intent.mailbox) {
+    if let Some(source) = validate::username_shape(&intent.mailbox) {
         return Err(Transitions::Groups(Error::InvalidMailbox {
             mailbox: intent.mailbox.clone(),
-            why,
+            source,
         }));
     }
     if intent.action != "remove" {
-        if let Some(why) = validate::address_localpart_shape(&intent.address) {
+        if let Some(source) = validate::address_localpart_shape(&intent.address) {
             return Err(Transitions::Groups(Error::InvalidAddress {
                 address: intent.address.clone(),
-                why,
+                source,
             }));
         }
     }
@@ -1403,10 +1406,10 @@ pub async fn remove_group(
             kind: intent.kind.clone(),
         }));
     }
-    if let Some(why) = validate::domain(&intent.domain) {
+    if let Some(source) = validate::domain(&intent.domain) {
         return Err(Transitions::Groups(Error::InvalidDomain {
             domain: intent.domain.clone(),
-            why,
+            source,
         }));
     }
     if let Some(reason) = body_domain_refusal(cfg, &intent.domain).await? {
@@ -1557,9 +1560,9 @@ pub(super) async fn name_allowed(cfg: &DrainConfig, username: &str) -> Result<()
     let reserved = reserved_names(cfg).await?;
     match validate::username(username, &reserved) {
         None => Ok(()),
-        Some(why) => Err(Transitions::Groups(Error::InvalidUsername {
+        Some(source) => Err(Transitions::Groups(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         })),
     }
 }

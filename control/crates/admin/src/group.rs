@@ -13,10 +13,10 @@ pub(crate) async fn group(cfg: &DrainConfig, store: &Store, args: &[String]) -> 
     if verb != "remove" {
         return Err(Error::Usage);
     }
-    if let Some(why) = validate::domain(domain) {
+    if let Some(source) = validate::domain(domain) {
         return Err(Error::InvalidDomain {
             domain: domain.to_string(),
-            why,
+            source,
         });
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;

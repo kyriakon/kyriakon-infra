@@ -18,10 +18,10 @@ pub(crate) async fn token(cfg: &DrainConfig, store: &Store, args: &[String]) -> 
         [verb, username] if verb == "resend" => (verb.as_str(), username.as_str()),
         _ => return Err(Error::Usage),
     };
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         });
     }
     let account = store

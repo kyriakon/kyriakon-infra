@@ -232,10 +232,10 @@ async fn read_all(store: &Store, username: &str) -> Result<Vec<RequestLine>, Err
 
 /// Append one request line and return it, so the caller can print the due date.
 pub async fn record(store: &Store, request: NewRequest<'_>) -> Result<RequestLine, Error> {
-    if let Some(why) = validate::username_shape(request.username) {
+    if let Some(source) = validate::username_shape(request.username) {
         return Err(Error::UsernameShape {
             username: request.username.to_string(),
-            why,
+            source: Box::new(source),
         });
     }
     if !KINDS.contains(&request.kind) {

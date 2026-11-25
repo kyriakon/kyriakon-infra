@@ -8,4 +8,4 @@ pub mod questions;
 pub mod rate;
 pub mod validate;
 
-pub use error::Error;
+pub use error::{Error, Reason};

@@ -2,6 +2,7 @@
 
 use crate::Error;
 use crate::*;
+use kyriakon_control_core::flow::Reason;
 
 /// The flags one address change takes, after every check that needs no key and
 /// no store. A removal names its mailbox and nothing else, so an `--address`
@@ -37,10 +38,10 @@ pub(crate) fn address_args(args: &[String]) -> Result<AddressArgs, Error> {
         ],
     )?;
     let domain = need(&flags, "domain")?;
-    if let Some(why) = validate::domain(domain) {
+    if let Some(source) = validate::domain(domain) {
         return Err(Error::InvalidDomain {
             domain: domain.to_string(),
-            why,
+            source,
         });
     }
     let action = need(&flags, "action")?;
@@ -50,10 +51,10 @@ pub(crate) fn address_args(args: &[String]) -> Result<AddressArgs, Error> {
         });
     }
     let mailbox = need(&flags, "mailbox")?;
-    if let Some(why) = validate::username_shape(mailbox) {
+    if let Some(source) = validate::username_shape(mailbox) {
         return Err(Error::InvalidMailbox {
             mailbox: mailbox.to_string(),
-            why,
+            source,
         });
     }
     let address = flags.get("address").map(String::as_str).unwrap_or("");
@@ -78,19 +79,19 @@ pub(crate) fn address_args(args: &[String]) -> Result<AddressArgs, Error> {
         if address.is_empty() {
             return Err(Error::AddressMissing);
         }
-        if let Some(why) = validate::address_localpart_shape(address) {
+        if let Some(source) = validate::address_localpart_shape(address) {
             return Err(Error::InvalidAddress {
                 address: address.to_string(),
-                why,
+                source,
             });
         }
     }
     let site_owner = flags.get("site-owner").cloned();
     if let Some(owner) = &site_owner {
-        if let Some(why) = validate::username_shape(owner) {
+        if let Some(source) = validate::username_shape(owner) {
             return Err(Error::InvalidSiteOwner {
                 owner: owner.clone(),
-                why,
+                source,
             });
         }
     }
@@ -139,10 +140,12 @@ pub(crate) async fn address(
                 path: path.clone().into(),
                 source,
             })?;
-            if let Some(why) = checked.refusal() {
+            if let Some(verdict) = checked.refusal() {
                 return Err(Error::MailKeyRefused {
                     mailbox: mailbox.to_string(),
-                    why: why.to_string(),
+                    source: Reason::KeyRefused {
+                        verdict: verdict.to_string(),
+                    },
                 });
             }
             let address = format!("{mailbox}@kyriakon.net");

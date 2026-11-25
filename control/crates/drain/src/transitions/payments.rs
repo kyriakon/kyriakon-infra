@@ -158,10 +158,10 @@ async fn credit_group(
     domain: &str,
     attributed_item: Option<&str>,
 ) -> Result<Settlement, Transitions> {
-    if let Some(why) = validate::domain(domain) {
+    if let Some(source) = validate::domain(domain) {
         return Err(Transitions::Payments(Error::GroupDomainInvalid {
             domain: domain.to_string(),
-            why,
+            source,
         }));
     }
     let Some(mut group) = group_record(store, domain).await? else {

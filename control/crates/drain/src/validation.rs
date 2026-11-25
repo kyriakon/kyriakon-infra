@@ -8,24 +8,23 @@
 
 use std::fmt;
 
+use kyriakon_control_core::flow::Reason;
+
 /// An intent the drain will not carry out as filed.
 #[derive(Debug)]
 pub enum Error {
     /// The intent's status token is absent or not the 128-bit shape.
     BadStatusToken,
     /// The username does not pass the platform's own name rules.
-    InvalidUsername { username: String, why: String },
+    InvalidUsername { username: String, source: Reason },
     /// The intent's kind is not one of the decision kinds.
     NotADecision { kind: String },
     /// The action is not the one the intent's kind carries.
     ActionMismatch { action: String, kind: String },
     /// No application record exists for the token the decision names.
-    NoApplication { token: String },
+    NoApplication,
     /// The decision's username is not the application record's.
-    ForeignApplication {
-        username: String,
-        application: String,
-    },
+    ForeignApplication,
     /// A signed intent's signature does not verify. `what` is the intent's own
     /// name for itself, such as `the token resend's`.
     SignatureInvalid { what: &'static str },
@@ -45,15 +44,15 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::BadStatusToken => f.write_str("the status token is not 128 bits of Crockford"),
-            Error::InvalidUsername { username, why } => {
-                write!(f, "the username {username:?}: {why}")
+            Error::InvalidUsername { username, source } => {
+                write!(f, "the username {username:?}: {source}")
             }
             Error::NotADecision { kind } => write!(f, "kind {kind:?} is not a decision"),
             Error::ActionMismatch { action, kind } => {
                 write!(f, "the action {action:?} does not match the kind {kind:?}")
             }
-            Error::NoApplication { .. } => f.write_str("there is no application for this token"),
-            Error::ForeignApplication { .. } => {
+            Error::NoApplication => f.write_str("there is no application for this token"),
+            Error::ForeignApplication => {
                 f.write_str("the intent's username is not the application's")
             }
             Error::SignatureInvalid { what } => {
@@ -74,4 +73,11 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::InvalidUsername { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}

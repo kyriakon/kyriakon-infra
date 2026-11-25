@@ -386,7 +386,7 @@ async fn written(
         Some(token) => crate::payments::ledger::Ledger::open(store)
             .raw_lines_for(token)
             .await
-            .map_err(|error| Error::Ledger(Box::new(crate::Error::from(error))))?,
+            .map_err(|source| Error::Ledger(Box::new(source)))?,
         None => Vec::new(),
     };
     docs.push((
@@ -589,10 +589,10 @@ fn write_tree(
 /// notice. Returns the bundle's path relative to the chroot, which is the shape
 /// the request record's `bundle` field carries.
 pub async fn deliver(cfg: &DrainConfig, store: &Store, username: &str) -> Result<String, Error> {
-    if let Some(why) = crate::flow::validate::username_shape(username) {
+    if let Some(source) = crate::flow::validate::username_shape(username) {
         return Err(Error::UsernameShape {
             username: username.to_string(),
-            why,
+            source: Box::new(source),
         });
     }
     let now = OffsetDateTime::now_utc();
@@ -627,7 +627,7 @@ pub async fn deliver(cfg: &DrainConfig, store: &Store, username: &str) -> Result
         &answer,
     )
     .await
-    .map_err(|error| Error::Notice(Box::new(crate::Error::from(error))))?;
+    .map_err(|source| Error::Notice(Box::new(source)))?;
     Ok(format!("export/{name}/"))
 }
 
@@ -671,10 +671,10 @@ pub async fn deliver_by_mail(
     store: &Store,
     username: &str,
 ) -> Result<String, Error> {
-    if let Some(why) = crate::flow::validate::username_shape(username) {
+    if let Some(source) = crate::flow::validate::username_shape(username) {
         return Err(Error::UsernameShape {
             username: username.to_string(),
-            why,
+            source: Box::new(source),
         });
     }
     let key = keycheck::keyring_file(&cfg.keyring_dir, username);
@@ -688,7 +688,7 @@ pub async fn deliver_by_mail(
     let (account, answer, docs) = written(cfg, store, username, now, true).await?;
     let armored = pgp::encrypt_to_cert(&cfg.gpg, &key, bundle_text(&docs).as_bytes())
         .await
-        .map_err(|error| Error::Encrypt(Box::new(crate::Error::from(error))))?;
+        .map_err(|source| Error::Encrypt(Box::new(source)))?;
     let filename = format!("export-{}.txt.asc", stamp(now));
     let to = account.notice_address();
     notice::send_account_notice_attachment(
@@ -703,7 +703,7 @@ pub async fn deliver_by_mail(
         &armored,
     )
     .await
-    .map_err(|error| Error::Notice(Box::new(crate::Error::from(error))))?;
+    .map_err(|source| Error::Notice(Box::new(source)))?;
     Ok(format!("mailed encrypted to the key in {}", key.display()))
 }
 

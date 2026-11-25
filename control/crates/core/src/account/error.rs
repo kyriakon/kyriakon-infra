@@ -10,6 +10,9 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use crate::flow::Reason;
+use crate::mail;
+use crate::payments;
 use crate::store;
 
 #[derive(Debug)]
@@ -17,14 +20,15 @@ pub enum Error {
     /// The store failed while reading or writing an account record.
     Store(store::Error),
     /// The payment ledger failed; the wrapped payments error is forwarded
-    /// unchanged. Boxed because `core::Error` wraps this enum.
-    Ledger(Box<crate::Error>),
+    /// unchanged. Boxed because the wrappers that hold this enum would
+    /// otherwise carry the payments enum inline.
+    Ledger(Box<payments::Error>),
     /// The ready notice could not be sent; the wrapped mail error is forwarded
-    /// unchanged. Boxed because `core::Error` wraps this enum.
-    Notice(Box<crate::Error>),
+    /// unchanged. Boxed for the same size reason as [`Error::Ledger`].
+    Notice(Box<mail::Error>),
     /// The bundle could not be encrypted; the wrapped mail error is forwarded
-    /// unchanged. Boxed because `core::Error` wraps this enum.
-    Encrypt(Box<crate::Error>),
+    /// unchanged. Boxed for the same size reason as [`Error::Ledger`].
+    Encrypt(Box<mail::Error>),
 
     // ---- the DNS recipe a body publishes ----
     /// A value the deploy should have substituted is empty.
@@ -101,8 +105,12 @@ pub enum Error {
         path: PathBuf,
         source: io::Error,
     },
-    /// The username does not fit the platform's shape.
-    UsernameShape { username: String, why: String },
+    /// The username does not fit the platform's shape. Boxed because the
+    /// wrappers that hold this enum would otherwise carry the reason inline.
+    UsernameShape {
+        username: String,
+        source: Box<Reason>,
+    },
     /// A member has no published key to mail an export to.
     NoMailKey { username: String, path: PathBuf },
 
@@ -206,7 +214,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Store(error) => error.fmt(f),
-            Error::Ledger(error) | Error::Notice(error) | Error::Encrypt(error) => error.fmt(f),
+            Error::Ledger(error) => error.fmt(f),
+            Error::Notice(error) => error.fmt(f),
+            Error::Encrypt(error) => error.fmt(f),
             Error::EmptyRecipeValue { name } => {
                 write!(f, "the DNS recipe's {name} is empty")
             }
@@ -312,8 +322,8 @@ impl fmt::Display for Error {
                 "no mail key for {username} at {}: {source}; the account's own key belongs in the export",
                 path.display()
             ),
-            Error::UsernameShape { username, why } => {
-                write!(f, "the username {username:?}: {why}")
+            Error::UsernameShape { username, source } => {
+                write!(f, "the username {username:?}: {source}")
             }
             Error::NoMailKey { username, path } => write!(
                 f,
@@ -440,7 +450,10 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Store(error) => Some(error),
-            Error::Ledger(error) | Error::Notice(error) | Error::Encrypt(error) => Some(error),
+            Error::Ledger(error) => Some(error.as_ref()),
+            Error::Notice(error) => Some(error.as_ref()),
+            Error::Encrypt(error) => Some(error.as_ref()),
+            Error::UsernameShape { source, .. } => Some(source.as_ref()),
             Error::HashPassword { source } => Some(source),
             Error::ReadPasswd { source, .. }
             | Error::ReadPath { source, .. }

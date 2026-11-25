@@ -20,10 +20,10 @@ pub(crate) async fn payment_block(
     store: &Store,
     username: &str,
 ) -> Result<(String, store::Payment), Error> {
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         });
     }
     let account = store

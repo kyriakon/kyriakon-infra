@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+use kyriakon_control_core::flow::Reason;
 use kyriakon_control_core::payments::Error as Payments;
 
 #[derive(Debug)]
@@ -44,7 +45,7 @@ pub enum Error {
     /// A mail key names a mailbox other than the account being approved.
     MailKeyNamesOtherMailbox { mailbox: String, username: String },
     /// A mail key is not usable as a key.
-    MailKeyUnusable { why: String },
+    MailKeyUnusable { source: Reason },
 
     // ---- the record an approval acts on ----
     /// The application record is gone after the approval began.
@@ -54,7 +55,7 @@ pub enum Error {
     /// A body's application names no domain.
     ApplicationNoDomain,
     /// A body's domain is not a domain.
-    InvalidDomain { domain: String, why: String },
+    InvalidDomain { domain: String, source: Reason },
     /// A group already exists that this application did not make.
     GroupExistsNotMade { domain: String },
     /// A group mailbox has no mail key, so its mail would bounce.
@@ -84,7 +85,7 @@ pub enum Error {
 
     // ---- a decline ----
     /// The address outside the platform is not a mail address.
-    InvalidOutsideAddress { address: String, why: String },
+    InvalidOutsideAddress { address: String, source: Reason },
 
     // ---- the record a verb names ----
     /// No application exists for the token.
@@ -155,16 +156,16 @@ impl fmt::Display for Error {
                 "the application's mail key names the mailbox {mailbox:?}, not the account \
                  {username}"
             ),
-            Error::MailKeyUnusable { why } => {
-                write!(f, "the application's mail key cannot be used: {why}")
+            Error::MailKeyUnusable { source } => {
+                write!(f, "the application's mail key cannot be used: {source}")
             }
             Error::ApplicationRecordVanishedMidApproval => {
                 f.write_str("the application record vanished mid-approval")
             }
             Error::NoPasswordLink => f.write_str("a supplied account has no password link"),
             Error::ApplicationNoDomain => f.write_str("the application names no domain"),
-            Error::InvalidDomain { domain, why } => {
-                write!(f, "the domain {domain:?}: {why}")
+            Error::InvalidDomain { domain, source } => {
+                write!(f, "the domain {domain:?}: {source}")
             }
             Error::GroupExistsNotMade { domain } => write!(
                 f,
@@ -201,8 +202,8 @@ impl fmt::Display for Error {
             Error::ApprovalCopyNamesOther { username, named } => {
                 write!(f, "the approval copy under {username} names {named}")
             }
-            Error::InvalidOutsideAddress { address, why } => {
-                write!(f, "the address outside the platform {address:?}: {why}")
+            Error::InvalidOutsideAddress { address, source } => {
+                write!(f, "the address outside the platform {address:?}: {source}")
             }
             Error::NoApplicationForToken => f.write_str("there is no application for this token"),
             Error::ApplicationVanishedBeforeDecision => {
@@ -233,6 +234,9 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::GroupCardLink { source } => Some(source),
+            Error::MailKeyUnusable { source }
+            | Error::InvalidDomain { source, .. }
+            | Error::InvalidOutsideAddress { source, .. } => Some(source),
             _ => None,
         }
     }

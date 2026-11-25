@@ -18,16 +18,16 @@ pub(crate) async fn monero(store: &Store, args: &[String]) -> Result<(), Error> 
         [verb, username, address] if verb == "address" => (username.as_str(), address.as_str()),
         _ => return Err(Error::Usage),
     };
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         });
     }
-    if let Some(why) = monero_address_shape(address) {
+    if let Some(problem) = monero_address_shape(address) {
         return Err(Error::InvalidMoneroAddress {
             address: address.to_string(),
-            why: why.to_string(),
+            problem,
         });
     }
     let account = store

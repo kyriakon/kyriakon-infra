@@ -24,10 +24,10 @@ pub(crate) async fn password(
     if action != "reset" {
         return Err(Error::Usage);
     }
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         });
     }
     let key = sign::read_key(std::path::Path::new(&cfg.approval_key))?;
@@ -165,10 +165,10 @@ pub(crate) async fn suspend(
         [username, args @ ..] => (username.as_str(), args),
         _ => return Err(Error::Usage),
     };
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         });
     }
     let flags = flags(args, &["reason"])?;

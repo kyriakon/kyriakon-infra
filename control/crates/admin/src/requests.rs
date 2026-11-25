@@ -70,10 +70,10 @@ pub(crate) async fn request_verify(
 ) -> Result<(), Error> {
     let flags = flags(args, &["username", "message", "signature"])?;
     let username = need(&flags, "username")?;
-    if let Some(why) = validate::username_shape(username) {
+    if let Some(source) = validate::username_shape(username) {
         return Err(Error::InvalidUsername {
             username: username.to_string(),
-            why,
+            source,
         });
     }
     let account = store
