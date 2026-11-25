@@ -2333,7 +2333,9 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                Error::Core(kyriakon_control_core::Error::ParseLine { line: 2, .. })
+                Error::Core(kyriakon_control_core::Error::Payments(
+                    kyriakon_control_core::payments::Error::ParseLine { line: 2, .. }
+                ))
             ),
             "{error}"
         );
