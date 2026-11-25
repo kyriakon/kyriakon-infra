@@ -216,10 +216,10 @@ fn parent_of(path: &str) -> Result<&str, Transitions> {
 
 #[cfg(target_os = "openbsd")]
 fn temp_dir() -> Result<String, Transitions> {
-    std::env::temp_dir()
+    Ok(std::env::temp_dir()
         .to_str()
         .map(str::to_string)
-        .ok_or(Error::TempDirNotUtf8)?
+        .ok_or(Error::TempDirNotUtf8)?)
 }
 
 /// Every read path the pass opens after `restrict` returns, checked once the
