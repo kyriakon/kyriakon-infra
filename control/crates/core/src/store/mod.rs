@@ -322,10 +322,32 @@ impl Store {
         self.typed_record(&format!("reviewed/{token}.json")).await
     }
 
-    /// Write the root-only review snapshot. A retry leaves an existing snapshot
-    /// alone unless it is the approval's own update, which the caller signals by
-    /// writing the payment-bearing copy itself.
+    /// Write the root-only review snapshot, once. A retry leaves an existing
+    /// snapshot alone; replacing it is [`Store::update_reviewed_application`]'s
+    /// and only root's own copy may do it.
     pub async fn write_reviewed_application(&self, token: &str, bytes: &[u8]) -> Result<(), Error> {
+        check_name(token)?;
+        self.ensure_dir("reviewed").await?;
+        let name = format!("{token}.json");
+        if self
+            .record_bytes(&format!("reviewed/{name}"))
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.write_record("reviewed", &name, bytes).await
+    }
+
+    /// Replace the root-only review snapshot. The approval adds the payment
+    /// block the webhook pass resolves a card payment through, and the purge
+    /// strips the answers from the snapshot it already holds; neither builds it
+    /// from a handler-owned record.
+    pub async fn update_reviewed_application(
+        &self,
+        token: &str,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
         check_name(token)?;
         self.ensure_dir("reviewed").await?;
         self.write_record("reviewed", &format!("{token}.json"), bytes)

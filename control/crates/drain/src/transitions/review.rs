@@ -1595,7 +1595,7 @@ async fn snapshot_review_value(store: &Store, token: &str, value: &Value) -> Res
         source,
     })?;
     store
-        .write_reviewed_application(token, &bytes)
+        .update_reviewed_application(token, &bytes)
         .await
         .map_err(Error::from)
 }
