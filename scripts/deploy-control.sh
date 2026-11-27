@@ -430,12 +430,13 @@ STUB
 	if stat -f '%Lp' "$work" >/dev/null 2>&1; then
 		sockdir=$work/onboard-portal
 		install -d -m 2770 "$sockdir"
-		if [ "$(stat -f '%Lp' "$sockdir")" = 2770 ]; then
-			# The part the line above cannot show: a re-deploy over a directory
-			# an older run left 2770 has to end 2750.
+		if [ "$(stat -f '%Sp' "$sockdir")" = "drwxrws---" ]; then
+			# %Sp shows the set-group-id bit that %Lp hides, so this is the
+			# part the grep above cannot show: a re-deploy over a directory an
+			# older run left 2770 has to end 2750.
 			install -d -m 2750 "$sockdir"
 			check "install -d re-modes an existing socket directory to 2750" \
-				"$(stat -f '%Lp' "$sockdir")" 2750
+				"$(stat -f '%Sp' "$sockdir")" "drwxr-s---"
 		else
 			printf 'self-test: this platform does not keep the set-group-id bit, so the install -d re-mode check is skipped\n'
 		fi
@@ -1041,7 +1042,9 @@ for pair in "www:$httpd_socket_path" "_gmid:$gemini_socket_path" \
 	dir=$(dirname "${pair#*:}")
 	install -d -o "$onboard_user" -g "$group" -m 2750 "$dir"
 	[ -g "$dir" ] || die "$dir is not set-group-id, so the socket in it would not carry $group"
-	[ "$(stat -f '%Su %Sg %Lp' "$dir")" = "$onboard_user $group 2750" ] \
+	# OpenBSD's stat(1) %Lp omits the setuid, setgid and sticky bits, so a 2750
+	# directory reads 750; the -g test above is the set-group-id half.
+	[ "$(stat -f '%Su %Sg %Lp' "$dir")" = "$onboard_user $group 750" ] \
 		|| die "$dir is not $onboard_user:$group mode 2750"
 	printf '%s (%s, 2750)
 ' "$dir" "$group"

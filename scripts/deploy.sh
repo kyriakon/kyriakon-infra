@@ -418,6 +418,12 @@ main() {
 	if [ "${1:-}" = --self-test ]; then
 		self_test
 	fi
+	# The plan's manifest queries are lib.sh's, and the live path needs the same
+	# source the self-test takes; without it every manifest_* call is a missing
+	# command. Sourced after the self-test branch so lib.sh's own self_test does
+	# not replace this script's.
+	# shellcheck disable=SC1091 # lib.sh resolves at runtime from this script's dir
+	. "$script_dir/lib.sh"
 	check_only=no
 	record_only=no
 	all_scripts=no
