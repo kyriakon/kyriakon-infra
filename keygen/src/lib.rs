@@ -1,9 +1,12 @@
-// Shared core for the key generator spike, kyriakon-infra#185.
+// The member key tools: generate a mail key, and check a submitted public key
+// against the three conditions that break delivery.
 //
-// The same logic serves two callers: the CLI in src/main.rs, and the browser page that
-// loads this as a WebAssembly module. Nothing here touches the filesystem or the network,
-// and the clock is passed in rather than read, because SystemTime::now() panics on
-// wasm32-unknown-unknown, so a page has to supply the time itself.
+// The same logic serves three callers: the CLI in src/main.rs, the browser page
+// that loads this as a WebAssembly module, and `keygen-check`, which the control
+// plane runs as a process so it does not link the OpenPGP crate. Nothing here
+// touches the filesystem or the network, and the clock is passed in rather than
+// read, because SystemTime::now() panics on wasm32-unknown-unknown, so a page
+// has to supply the time itself.
 //
 // The three conditions the check reports, each with the mechanism behind it:
 //  - no encryption-capable subkey, so there is nothing to encrypt to and mail is refused
@@ -14,7 +17,8 @@
 //    at the date without a word; the clock only decides whether it says "expires" or
 //    "expired". Revocation is flagged too.
 //
-// Still a spike. No error types worth the name, no tests beyond the self-check below.
+// The check is the half the control plane uses; the generator is the CLI's and
+// the page's. `generate` is the feature that separates them.
 
 use pgp::composed::{Deserializable, SignedPublicKey};
 #[cfg(feature = "generate")]
@@ -37,7 +41,7 @@ use rand::thread_rng;
 use smallvec::smallvec;
 
 #[cfg(feature = "generate")]
-pub const DEFAULT_USER_ID: &str = "Spike Member <spike@example.invalid>";
+pub const DEFAULT_USER_ID: &str = "Keygen Member <keygen@example.invalid>";
 
 #[cfg(feature = "generate")]
 pub struct Generated {

@@ -5,12 +5,7 @@ use kyriakon_control_core::store::GroupIntent;
 /// One of the key-check fixtures, by file name, for a key whose verdict is the
 /// point of the test.
 fn fixture(name: &str) -> String {
-    std::fs::read_to_string(
-        repo_root()
-            .join("docs/planning/prototypes/keygen-spike/fixtures")
-            .join(name),
-    )
-    .unwrap()
+    std::fs::read_to_string(repo_root().join("keygen/fixtures").join(name)).unwrap()
 }
 
 /// A free account that gave an address outside the platform has its yearly note

@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       # One target's crash must not cancel the others: a crash file is the whole
-      # point, and seven small jobs cost less than one flaky sequence.
+      # point, and eight small jobs cost less than one flaky sequence.
       fail-fast: false
       matrix:
         include:
@@ -46,6 +46,8 @@ jobs:
             target: fromcheck
           - crate: mailparse
             target: mailparse
+          - crate: keygen
+            target: key
     steps:
       - uses: actions/checkout@v4
         with:

@@ -116,6 +116,9 @@ member-git-shell.sh	/usr/local/libexec	-		mail	-	active
 # for the install, while deploy.sh also plans the mail restart for a source
 # change because the running filter keeps the old code until smtpd restarts.
 kyriakon-fromcheck	/usr/local/libexec	-		control	filter-fromcheck	active
+# The key check helper core runs as a process, so the control plane does not
+# build pgp. Built from keygen/ and installed under the name core invokes.
+keygen-check	/usr/local/libexec	-		control	-	active
 # deploy-control.sh installs lib.sh and its modules beside the login checker,
 # which sources them; their route is what keeps deploy-mail.sh from taking them.
 lib.sh	/usr/local/libexec	-		control	lib.sh	active

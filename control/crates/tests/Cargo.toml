@@ -10,7 +10,7 @@ path = "tests/drain.rs"
 
 [dev-dependencies]
 askama.workspace = true
-kyriakon-control-core = { path = "../core" }
+kyriakon-control-core = { path = "../core", features = ["test-fixtures"] }
 kyriakon-control-drain = { path = "../drain" }
 kyriakon-control-handler = { path = "../handler" }
 kyriakon-control-tui = { path = "../tui" }

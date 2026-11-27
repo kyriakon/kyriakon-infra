@@ -376,7 +376,7 @@ async fn a_duplicate_account_name_is_refused_at_the_form() {
 async fn a_persons_key_is_checked_against_the_username() {
     let (app, _dir) = handler("person-uid").await;
     let key = std::fs::read_to_string(format!(
-        "{}/../../../docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc",
+        "{}/../../../keygen/fixtures/generated-clean.asc",
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap();

@@ -11,8 +11,8 @@
 #     runs the scripts under it. CONTEXT.md records the trap, from a script
 #     that passed its self-test on a workstation and died on the box's
 #     `typeset -a`.
-#   * The deps job audits all seven committed lockfiles against RustSec, and
-#     runs cargo deny against deny.toml for the three shipping build roots.
+#   * The deps job audits all eight committed lockfiles against RustSec, and
+#     runs cargo deny against deny.toml for the four shipping build roots.
 #     It refuses a version with a published advisory outside the two the config
 #     records as unreachable, an unknown licence and a source that is not
 #     crates.io. What it cannot see is a backdoored upstream release nobody has
@@ -58,7 +58,13 @@ jobs:
       # builds its own targets, not the plain binaries, so build them first.
       - name: build binaries
         run: cargo build --manifest-path control/Cargo.toml --workspace
+      # The key check is a process in its own build root. Build it here and
+      # hand the tests its path, so the test process does not shell out to cargo.
+      - name: build key check helper
+        run: cargo build --manifest-path keygen/Cargo.toml --no-default-features --bin keygen-check
       - name: test
+        env:
+          KYRIAKON_KEYGEN_CHECK: ${{ github.workspace }}/keygen/target/debug/keygen-check
         run: cargo test --manifest-path control/Cargo.toml
       # Warnings are errors: the crate is clean at this bar today, so a new one
       # fails the check rather than scrolling past.
@@ -91,14 +97,8 @@ jobs:
           }
           boundary kyriakon-control-handler kyriakon-control-drain
           boundary kyriakon-control-tui kyriakon-control-handler
-      # The handler links the prototype crate's check, so its fixtures, format
-      # and lint run here; no other job in this file sees that crate.
-      - name: key check fixtures
-        run: cargo test --manifest-path docs/planning/prototypes/keygen-spike/Cargo.toml
-      - name: key check fmt
-        run: cargo fmt --manifest-path docs/planning/prototypes/keygen-spike/Cargo.toml --check
-      - name: key check clippy
-        run: cargo clippy --manifest-path docs/planning/prototypes/keygen-spike/Cargo.toml --all-targets -- -D warnings
+      # The handler runs the key check as a process, so the helper's own build
+      # root has its own job below; nothing from that crate is linked here.
 
   # The other crate in the tree, and the one the mail path depends on: the
   # encrypting LMTP the keyring is published for. It had tests before this file
@@ -154,8 +154,30 @@ jobs:
       - name: clippy
         run: cargo clippy --manifest-path mailparse/Cargo.toml --all-targets -- -D warnings
 
+  # The member key tools, a separate build root like mailparse: the control
+  # plane runs keygen-check as a process, so no pgp crate reaches a control
+  # binary. The check-only build is the one the deploy installs; the default
+  # build is the generator and the browser half.
+  keygen:
+    name: keygen crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: toolchain
+        run: rustc --version && cargo --version
+      - name: fmt
+        run: cargo fmt --manifest-path keygen/Cargo.toml --check
+      - name: test
+        run: cargo test --manifest-path keygen/Cargo.toml
+      - name: clippy
+        run: cargo clippy --manifest-path keygen/Cargo.toml --all-targets -- -D warnings
+      - name: check-only build
+        run: cargo build --manifest-path keygen/Cargo.toml --no-default-features --bin keygen-check
+
   # What would actually ship, plus every tree that builds it: `cargo audit`
-  # reads all seven committed lockfiles, and `cargo deny` checks the three
+  # reads all eight committed lockfiles, and `cargo deny` checks the four
   # shipping build roots against this repository's own policy in deny.toml. The
   # encryptor has no dependencies today and commits a lockfile anyway, so the
   # first one it gains is scanned on the pull request that adds it.
@@ -180,21 +202,22 @@ jobs:
       # --file, so the check is against the lockfile the repository commits. A
       # lockfile regenerated from a different manifest would otherwise be the
       # thing audited, and it would be the wrong one. Every committed lockfile
-      # is named, including the three fuzz trees and the keygen-spike prototype,
-      # so no build root carries an advisory the shipping scan misses. The two
-      # ignored advisories are in .cargo/audit.toml, which cargo audit reads
-      # from this directory.
+      # is named, including the four fuzz trees and the keygen crate, so no
+      # build root carries an advisory the shipping scan misses. The two ignored
+      # advisories are in .cargo/audit.toml, which cargo audit reads from this
+      # directory.
       - name: cargo audit
         run: |
           cargo audit --file control/Cargo.lock
           cargo audit --file kyriakon-encrypt/Cargo.lock
           cargo audit --file mailparse/Cargo.lock
+          cargo audit --file keygen/Cargo.lock
           cargo audit --file control/fuzz/Cargo.lock
           cargo audit --file kyriakon-encrypt/fuzz/Cargo.lock
           cargo audit --file mailparse/fuzz/Cargo.lock
-          cargo audit --file docs/planning/prototypes/keygen-spike/Cargo.lock
+          cargo audit --file keygen/fuzz/Cargo.lock
       # deny.toml carries the licence allowlist and the source policy; see its
-      # own header. It runs against the three shipping build roots, because the
+      # own header. It runs against the four shipping build roots, because the
       # fuzz trees add libfuzzer-sys under the NCSA licence and none of their
       # code ships. Advisories are checked here as well, because a duplicate
       # version allowed to warn must not be the one carrying the advisory.
@@ -203,6 +226,7 @@ jobs:
           cargo deny --manifest-path control/Cargo.toml check
           cargo deny --manifest-path kyriakon-encrypt/Cargo.toml check
           cargo deny --manifest-path mailparse/Cargo.toml check
+          cargo deny --manifest-path keygen/Cargo.toml check
 
   shell:
     name: shell scripts

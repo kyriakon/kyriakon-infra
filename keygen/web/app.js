@@ -1,4 +1,4 @@
-import init, { generate, check } from "./pkg/keygen_spike.js";
+import init, { generate, check } from "./pkg/keygen.js";
 
 const $ = (id) => document.getElementById(id);
 const nowSecs = () => Math.floor(Date.now() / 1000);

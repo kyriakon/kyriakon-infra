@@ -1,5 +1,5 @@
-// The five fixtures the ticket names, checked through the same function the CLI
-// and the page's WASM export call. The generator's key is clean, and each gpg
+// The fixtures the check is measured against, through the same function the
+// CLI, `keygen-check` and the page's WASM export call. The generator's key is clean, and each gpg
 // key isolates one of the conditions: the AEAD advert (subpacket 34), no
 // encryption-capable subkey, an expired encryption subkey, and a primary key
 // that expires in the future.
@@ -21,7 +21,7 @@
 //                                primary never expires and only the encryption subkey does (2040-01-01).
 // The long-paste fixture is gpg rsa4096 with an encryption subkey, 3216 bytes.
 
-use keygen_spike::check_public_key;
+use keygen::check_public_key;
 
 const NOW: u64 = 1_800_000_000;
 

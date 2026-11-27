@@ -493,9 +493,8 @@ pub(crate) fn body_answers() -> Vec<(&'static str, &'static str)> {
 
 /// A real clean key from the generator, because the shared check parses the
 /// block in full: the old two-packet stub passed only the structural reading.
-pub(crate) const GOOD_KEY: &str = include_str!(
-    "../../../../../docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc"
-);
+pub(crate) const GOOD_KEY: &str =
+    include_str!("../../../../../keygen/fixtures/generated-clean.asc");
 
 /// The body of a form post, percent-encoded the way a browser sends one.
 pub(crate) fn encoded(pairs: &[(&str, &str)]) -> String {

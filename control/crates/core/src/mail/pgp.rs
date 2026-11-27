@@ -16,9 +16,14 @@
 //! large export cannot fill a pipe while gpg fills the other (#929), and it
 //! kills the child at a hard deadline.
 
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha1::{Digest, Sha1};
@@ -36,6 +41,14 @@ const SIGNED_END: &str = "-----END PGP SIGNATURE-----";
 /// How long one gpg run may take. A key or a message is small; a run that hangs
 /// must not hold the single-flight drain open forever.
 const GPG_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The installed check helper. A test build overrides this with the debug
+/// binary; nothing else may point it at a different program.
+const KEYGEN_CHECK: &str = "/usr/local/libexec/keygen-check";
+
+/// The helper parses one key and exits. A parser that hangs on one key must not
+/// hold the request open.
+const KEYGEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub struct Checked {
@@ -301,17 +314,163 @@ pub fn findings(value: &str) -> Result<Vec<String>, Error> {
     inspected_findings(value).map(|(findings, _)| findings)
 }
 
-/// The crate's findings, and whether it read the block at all. A parser that
-/// cannot read a well-framed block is a gap in this check, not a verdict on the
-/// key: the advisory proceeds and names a reader.
+/// The keygen crate's findings, and whether it read the block at all. A parser
+/// that cannot read a well-framed block is a gap in this check, not a verdict on
+/// the key: the advisory proceeds and names a reader.
 fn inspected_findings(value: &str) -> Result<(Vec<String>, bool), Error> {
     let cert = inspect_single_cert(value)?;
-    Ok(
-        match keygen_spike::check_public_key(&cert.material, now_secs()) {
-            Ok(findings) => (findings, true),
-            Err(_) => (vec![UNINSPECTED.to_string()], false),
-        },
-    )
+    Ok(match keygen_check(&cert.material, now_secs()) {
+        Ok(KeygenVerdict::Parsed(findings)) => (findings, true),
+        Ok(KeygenVerdict::Uninspected) | Err(_) => (vec![UNINSPECTED.to_string()], false),
+    })
+}
+
+/// The helper's answer, with the parser gap kept distinct from a clean key.
+enum KeygenVerdict {
+    Parsed(Vec<String>),
+    Uninspected,
+}
+
+/// Run `keygen-check` for one key. The helper is a separate build root so the
+/// control plane does not link `pgp`; every failure here is the uninspected
+/// advisory at the caller, never a refusal on a key the platform did not read.
+fn keygen_check(material: &str, now: u64) -> Result<KeygenVerdict, Error> {
+    let program = keygen_check_program();
+    let mut child = std::process::Command::new(&program)
+        .arg("--now-secs")
+        .arg(now.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| Error::RunKeygenCheck {
+            program: program.clone(),
+            source,
+        })?;
+
+    // The helper is ours, but a parser that hangs must not hold the request.
+    // The child is not reaped until `wait_with_output`, so the pid cannot have
+    // been reused when the watchdog kills it.
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let (done, waiting) = mpsc::channel::<()>();
+    let pid = child.id();
+    let flag = Arc::clone(&timed_out);
+    let watchdog = thread::spawn(move || {
+        if waiting.recv_timeout(KEYGEN_TIMEOUT).is_err() {
+            flag.store(true, Ordering::SeqCst);
+            // SAFETY: pid is the live, unreaped child we spawned above.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+    });
+
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = done.send(());
+        let _ = watchdog.join();
+        return Err(Error::KeygenCheckProtocol {
+            program: program.clone(),
+        });
+    };
+    let material = material.to_string();
+    let writer = thread::spawn(move || {
+        stdin.write_all(material.as_bytes())?;
+        stdin.flush()
+    });
+
+    let output = child.wait_with_output();
+    let _ = done.send(());
+    let _ = watchdog.join();
+    let written = writer.join().map_err(|_| Error::KeygenCheckProtocol {
+        program: program.clone(),
+    })?;
+    let output = output.map_err(|source| Error::WaitKeygenCheck {
+        program: program.clone(),
+        source,
+    })?;
+    if timed_out.load(Ordering::SeqCst) {
+        return Err(Error::KeygenCheckTimedOut {
+            program,
+            seconds: KEYGEN_TIMEOUT.as_secs(),
+        });
+    }
+    if !output.status.success() {
+        return Err(Error::KeygenCheckExited {
+            program,
+            status: output.status,
+        });
+    }
+    written.map_err(|source| Error::WriteKeygenCheck {
+        program: program.clone(),
+        source,
+    })?;
+    parse_keygen_output(&program, &output.stdout)
+}
+
+fn keygen_check_program() -> String {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    let _ = keygen_check_test_binary();
+    std::env::var("KYRIAKON_KEYGEN_CHECK").unwrap_or_else(|_| KEYGEN_CHECK.to_string())
+}
+
+/// The check protocol: `ok` and one finding per line, or `uninspected`.
+fn parse_keygen_output(program: &str, stdout: &[u8]) -> Result<KeygenVerdict, Error> {
+    let text = std::str::from_utf8(stdout).map_err(|_| Error::KeygenCheckProtocol {
+        program: program.to_string(),
+    })?;
+    let mut lines = text.lines();
+    match lines.next() {
+        Some("ok") => Ok(KeygenVerdict::Parsed(
+            lines
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )),
+        Some("uninspected") => Ok(KeygenVerdict::Uninspected),
+        _ => Err(Error::KeygenCheckProtocol {
+            program: program.to_string(),
+        }),
+    }
+}
+
+/// Build the helper from its own build root and point the process at it. Test
+/// builds and the acceptance suite call this; a service build never compiles it.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn keygen_check_test_binary() -> PathBuf {
+    use std::sync::LazyLock;
+
+    static PATH: LazyLock<PathBuf> = LazyLock::new(|| {
+        if let Some(program) = std::env::var_os("KYRIAKON_KEYGEN_CHECK") {
+            return PathBuf::from(program);
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let manifest = root.join("keygen/Cargo.toml");
+        let binary = root.join("keygen/target/debug/keygen-check");
+        // A test run must not shell out to cargo once the helper exists: the
+        // outer `cargo test` is the one that builds it, and a nested build on a
+        // fresh clone is the slow path, not the loop.
+        if binary.is_file() {
+            return binary;
+        }
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let status = std::process::Command::new(cargo)
+            .args([
+                "build",
+                "--quiet",
+                "--no-default-features",
+                "--bin",
+                "keygen-check",
+                "--manifest-path",
+            ])
+            .arg(&manifest)
+            .status()
+            .expect("cargo builds keygen-check");
+        assert!(status.success(), "cargo build keygen-check failed");
+        binary
+    });
+    let path = PATH.clone();
+    std::env::set_var("KYRIAKON_KEYGEN_CHECK", &path);
+    path
 }
 
 /// The advisory a well-framed block gets when the crate cannot parse it. It is

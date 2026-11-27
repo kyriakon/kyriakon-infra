@@ -1,8 +1,8 @@
 # What the key generator can and cannot do, measured
 
 For ticket #185. The crate is `pgp` 0.20.0, which is rpgp. The toolchain is rustc 1.97.1
-and gpg 2.5.24 on arm64 macOS. The spike that produced this is committed beside this note
-at `docs/planning/prototypes/keygen-spike/`, and every command below is one that was run.
+and gpg 2.5.24 on arm64 macOS. The crate that produced this is committed at `keygen/`,
+and every command below is one that was run.
 
 ## The five questions the ticket asked
 

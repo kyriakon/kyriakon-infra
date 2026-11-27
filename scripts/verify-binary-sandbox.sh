@@ -58,8 +58,8 @@ encrypt_bin=${KYRIAKON_ENCRYPT_BIN:-$repo/kyriakon-encrypt/target/release/kyriak
 probe_bin=${KYRIAKON_SANDBOX_PROBE:-$control_target/release/examples/sandbox-probe}
 
 # The nested test key: a public key with an encryption subkey, from the
-# keygen-spike fixtures the other Rust tests share. Its private half is nowhere.
-fixture_key=$repo/docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc
+# keygen fixtures the other Rust tests share. Its private half is nowhere.
+fixture_key=$repo/keygen/fixtures/generated-clean.asc
 catalogue_src=$repo/openbsd/etc/onboard/catalogue.toml
 reserved_src=$repo/reserved-usernames.txt
 config_src=$repo/openbsd/etc/onboard/onboard.toml

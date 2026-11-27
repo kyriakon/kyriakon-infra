@@ -4,8 +4,9 @@
 # The release's front door, installed from this repository: the store under
 # /var/db/onboard, the six programs built from control/. Five go to
 # /usr/local/sbin (the handler, the member content responder, the root drain,
-# kyriakon-admin and the portal) and the From-header filter to
-# /usr/local/libexec/filter-fromcheck, the handler's config at /etc/onboard/onboard.toml,
+# kyriakon-admin and the portal), the From-header filter to
+# /usr/local/libexec/filter-fromcheck, and the key check helper built from
+# keygen/ to /usr/local/libexec/keygen-check, the handler's config at /etc/onboard/onboard.toml,
 # the responder's at /etc/onboard/static.toml, and the drain's own root-only config
 # at /etc/kyriakon/onboard/drain.toml, the first and last with the deployed release
 # substituted, and the two rc.d units. Every step is idempotent, so a rebuild, or a
@@ -550,7 +551,7 @@ onboard_user='_onboard'
 
 # Every source this installs, checked before anything on the box is changed, so a
 # half-copied checkout fails here rather than after the store has been written.
-for f in control/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/drain.toml \
+for f in control/Cargo.toml keygen/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/drain.toml \
 	openbsd/etc/onboard/static.toml control/questions.toml \
 	openbsd/etc/rc.d/kyriakon_control openbsd/etc/rc.d/kyriakon_control_static \
 	scripts/control-store.sh scripts/render-docs.sh \
@@ -595,6 +596,10 @@ say "build"
 # jq for the publish path, and gmid for the capsule socket directory.
 need_packages "$repo_dir/openbsd/packages.tsv" deploy-control.sh
 cargo build --release --manifest-path "$repo_dir/control/Cargo.toml"
+# The helper is its own build root so the control programs do not link pgp. It
+# is built without the generator feature, so no rand or smallvec reaches it.
+cargo build --release --manifest-path "$repo_dir/keygen/Cargo.toml" \
+	--no-default-features --bin keygen-check
 # The handler, the member content responder, the root drain, kyriakon-admin, the
 # portal and the From-header filter are one workspace and six programs: a build
 # that produced some of them but not the others is half a service. The portal is
@@ -605,6 +610,8 @@ for b in kyriakon-control kyriakon-control-static kyriakon-control-drain kyriako
 	[ -x "$repo_dir/control/target/release/$b" ] \
 		|| die "the build produced no binary at control/target/release/$b"
 done
+[ -x "$repo_dir/keygen/target/release/keygen-check" ] \
+	|| die "the build produced no binary at keygen/target/release/keygen-check"
 
 say "install"
 install -d -m 0755 -o root -g wheel /etc/onboard
@@ -693,6 +700,13 @@ fromcheck_name=$(manifest_installed_name "$install_set" kyriakon-fromcheck /usr/
 [ -n "$fromcheck_name" ] || die "$install_set names no kyriakon-fromcheck for /usr/local/libexec"
 install -m 0755 "$repo_dir/control/target/release/kyriakon-fromcheck" \
 	"/usr/local/libexec/$fromcheck_name"
+# The key check helper core runs for a submitted key. Its name is the manifest
+# row's, so the path core compiles in and the deploy installs cannot drift.
+keygen_check_name=$(manifest_installed_name "$install_set" keygen-check /usr/local/libexec) \
+	|| die "cannot read $install_set"
+[ -n "$keygen_check_name" ] || die "$install_set names no keygen-check for /usr/local/libexec"
+install -m 0755 "$repo_dir/keygen/target/release/keygen-check" \
+	"/usr/local/libexec/$keygen_check_name"
 
 # The login proofs: one file per admitted login, named by a random token, written
 # by the checker as root and read back by the drain. Root-owned 0700 is the whole

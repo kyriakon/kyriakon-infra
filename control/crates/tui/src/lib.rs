@@ -1942,9 +1942,7 @@ mod tests {
     // the shared check actually parses. The old two-packet stub passed this
     // module's structural check only, which is exactly the duplication the
     // shared crate removed.
-    const KEY_BLOCK: &str = include_str!(
-        "../../../../docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc"
-    );
+    const KEY_BLOCK: &str = include_str!("../../../../keygen/fixtures/generated-clean.asc");
 
     fn key_lines() -> Vec<String> {
         KEY_BLOCK.lines().map(str::to_string).collect()
@@ -2100,8 +2098,7 @@ mod tests {
     fn a_key_that_cannot_deliver_is_refused() {
         let rows = rows(None);
         let at = apply_row();
-        let aead =
-            include_str!("../../../../docs/planning/prototypes/keygen-spike/fixtures/gpg-aead.asc");
+        let aead = include_str!("../../../../keygen/fixtures/gpg-aead.asc");
         let mut script = scripts(&person_lines_with(at, aead, &[""]));
         let mut files = Files::default();
         let (_left, seen) =
@@ -2118,9 +2115,7 @@ mod tests {
     fn a_key_longer_than_the_capsule_limit_is_accepted() {
         let rows = rows(None);
         let at = apply_row();
-        let long = include_str!(
-            "../../../../docs/planning/prototypes/keygen-spike/fixtures/gpg-rsa-long.asc"
-        );
+        let long = include_str!("../../../../keygen/fixtures/gpg-rsa-long.asc");
         assert!(long.len() > 1024, "the fixture is not a long paste");
         let mut script = scripts(&person_lines_with(at, long, &[]));
         let mut files = Files::default();

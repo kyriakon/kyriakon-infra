@@ -1,4 +1,4 @@
-# Dependency policy for the three Cargo trees here, run by the `deps` job
+# Dependency policy for the four Cargo trees here, run by the `deps` job
 # in .github/workflows/checks.yml alongside `cargo audit`.
 #
 # A licence, a source or an advisory outside this file fails the job, so adding
@@ -11,11 +11,11 @@
 # version only warns, because the lockfile pins what was reviewed and cargo
 # refuses to select a yank on its own.
 yanked = "warn"
-# Two advisories reach the control tree through `pgp` 0.20, which
-# docs/planning/prototypes/keygen-spike uses to read public certificates and to
-# generate keys locally. Both advisories are about secret-key operations and
-# neither is reachable here. .cargo/audit.toml carries the same two IDs, so
-# `cargo audit` and this file agree.
+# Two advisories reach the keygen tree through `pgp` 0.20, which `keygen` uses
+# to read public certificates and to generate keys locally. Both advisories are
+# about secret-key operations and neither is reachable here. .cargo/audit.toml
+# carries the same two IDs, so `cargo audit` and this file agree. The control
+# tree no longer carries either: it runs `keygen-check` as a process.
 ignore = [
   # rsa 0.9.10: the Marvin attack times PKCS#1 v1.5 decryption against the
   # private key. Nothing here decrypts; the key check reads public packets and
@@ -65,7 +65,7 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
 ]
 exceptions = []
-# The workspace crates and keygen-spike carry no licence field: they are paths
+# The workspace crates and keygen carry no licence field: they are paths
 # inside this repository, workspace `publish = false`, and nobody receives them
 # as a package.
 [licenses.private]
