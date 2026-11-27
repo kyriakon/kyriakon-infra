@@ -47,14 +47,15 @@ install_set="$script_dir/install-set.tsv"
 # shellcheck disable=SC1091 # resolves at runtime from this script's directory
 . "$script_dir/lib.sh"
 
-# titan_listening <port>: true when stdin is a sockstat -ln listing with a row
-# naming the handler on that port. sockstat prints the kernel process name, the
-# binary's basename truncated to fifteen characters, not the rc.d unit name
-# (kyriakon_control). A self-test feeds a synthetic row, which is the only way
-# to exercise this without a running box.
+# titan_listening <port>: true when stdin is an fstat -n listing with a row
+# naming the handler on that port. fstat names the process holding the socket,
+# which netstat cannot, and prints the local address last. The kernel process
+# name is the binary's basename, not the rc.d unit name (kyriakon_control). A
+# self-test feeds a synthetic row, which is the only way to exercise this
+# without a running box.
 titan_listening() {
 	awk -v p=":$1" '
-		($2 == "kyriakon-control" || $2 == "kyriakon-contro") && $6 ~ (p "$") { found = 1 }
+		($2 == "kyriakon-control" || $2 == "kyriakon-contro") && $(NF) ~ (p "$") { found = 1 }
 		END { exit !found }'
 }
 
@@ -443,21 +444,22 @@ STUB
 	else
 		printf 'self-test: stat -f is absent, so the install -d re-mode check is skipped\n'
 	fi
-	# The Titan listener's sockstat row names the binary, not the rc.d unit. The
-	# kernel truncates kyriakon-control to fifteen characters, and the check must
-	# accept both; the unit spelling it used to demand never appears there.
-	printf '_onboard kyriakon-control 1234 3 tcp 127.0.0.1:7081 *:*\n' |
+	# The Titan listener's fstat row names the binary, not the rc.d unit, and
+	# carries the local address last. The kernel truncates kyriakon-control to
+	# fifteen characters, and the check must accept both; the unit spelling it
+	# used to demand never appears there.
+	printf '_onboard kyriakon-control 1234 12* internet stream tcp 0x0 127.0.0.1:7081\n' |
 		titan_listening 7081 ||
 		{ printf 'self-test: the full process name did not match the titan port\n' >&2; exit 1; }
-	printf '_onboard kyriakon-contro 1234 3 tcp 127.0.0.1:7081 *:*\n' |
+	printf '_onboard kyriakon-contro 1234 12* internet stream tcp 0x0 127.0.0.1:7081\n' |
 		titan_listening 7081 ||
 		{ printf 'self-test: the truncated process name did not match the titan port\n' >&2; exit 1; }
-	if printf '_onboard kyriakon_control 1234 3 tcp 127.0.0.1:7081 *:*\n' |
+	if printf '_onboard kyriakon_control 1234 12* internet stream tcp 0x0 127.0.0.1:7081\n' |
 		titan_listening 7081; then
 		printf 'self-test: the rc.d unit name was accepted as the process\n' >&2
 		exit 1
 	fi
-	if printf '_onboard kyriakon-control 1234 3 tcp 127.0.0.1:7080 *:*\n' |
+	if printf '_onboard kyriakon-control 1234 12* internet stream tcp 0x0 127.0.0.1:7080\n' |
 		titan_listening 7081; then
 		printf 'self-test: another port was accepted as the titan listener\n' >&2
 		exit 1
@@ -1089,14 +1091,9 @@ case "$titan_port" in
 	die "/etc/onboard/onboard.toml has no port in titan_listener: '$titan_listener'"
 	;;
 esac
-# sockstat names the process that holds the socket, which netstat cannot: a
-# row ending in the port proves only that something listens there. The family
-# follows the configured address so an IPv6 listener is not read as missing.
-family=-4
-case "${titan_listener%:*}" in
-*:*) family=-6 ;;
-esac
-sockstat "$family" -ln | titan_listening "$titan_port" \
+# fstat names the process that holds the socket, which netstat cannot: a row
+# ending in the port proves only that something listens there.
+fstat -n | titan_listening "$titan_port" \
 	|| die "kyriakon-control is not listening on titan_listener $titan_listener"
 printf 'titan: %s\n' "$titan_listener"
 
