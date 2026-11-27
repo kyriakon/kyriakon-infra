@@ -161,8 +161,8 @@ address as its first attempt: `209.85.216.74` connected at 10:49 and again at
 13:07, which promoted the address and let the delivery in at 14:38.
 
 The fix is the `nospamd` table in the man page's fragment, which sends inbound
-SMTP from listed networks straight to smtpd. `openbsd/etc/nospamd` holds
-Microsoft's published outbound ranges and the deploy installs it; the two pf
+SMTP from listed networks straight to smtpd. `openbsd/etc/nospamd` holds the
+published outbound ranges listed below and the deploy installs it; the two pf
 rules that read it are the second fragment `pf-apply.sh` adds. Refresh the list
 from the same source, which is Microsoft's own SPF record:
 
@@ -174,7 +174,7 @@ with a pool, since each retry arrives on a different one.
 
 ### What is in the list, and where each entry came from
 
-Four providers, each taken from its own mailing SPF rather than from memory:
+Five providers, each taken from its own mailing SPF rather than from memory:
 
 	Microsoft (Outlook.com, Exchange Online)
 	  dig +short TXT spf.protection.outlook.com
@@ -184,6 +184,8 @@ Four providers, each taken from its own mailing SPF rather than from memory:
 	  dig +short TXT github.com
 	Mandrill (Mailchimp transactional; join.com's signup mail)
 	  dig +short TXT spf.mandrillapp.com
+	Stripe (e.stripe.com, receipts and account notices)
+	  dig +short TXT e.stripe.com
 
 Microsoft's entries are its mail relays. Google's `74.125.0.0/16` and
 `209.85.128.0/17` are its mail range and not its cloud, which is the distinction
@@ -220,6 +222,16 @@ and the twelve prefixes above are the whole of it. The tradeoff is accepted: the
 same ranges carry Mailchimp marketing mail, so greylisting no longer filters that
 provider. The block can be removed again if `abuse-monitor.sh`'s greylist and
 trapped counts show the pool being used against this box.
+
+Stripe was added on 2026-11-27, after a Stripe message did not arrive.
+`e.stripe.com` and `info.stripe.com` each publish one sending address,
+`192.28.155.32/32` with `-all`, whose PTR is `bounce.e.stripe.com`. The address is
+the whole of both records, so this entry is a host rather than a pool. `stripe.com`
+and `mail.stripe.com` also authorize Mandrill's `198.2.180.60`, which the Mandrill
+block already covers, plus Salesforce, Zendesk, Greenhouse and Qualtrics.
+`bounce.stripe.com` points at Amazon SES. Those stay out for the reason GitHub's
+SendGrid, Salesforce and Zendesk entries did: they carry marketing or support
+mail, or they are a shared cloud pool.
 
 
 ## Verifying
