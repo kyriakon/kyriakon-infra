@@ -275,6 +275,7 @@ impl Fix {
              rates_fetch = \"{}\"\n\
              public_root = \"{}\"\n\
              gpg = \"gpg\"\n\
+             keygen_check = \"{}\"\n\
              proof_dir = \"{}\"\n",
             fix.path("store"),
             fix.path("reserved"),
@@ -299,6 +300,7 @@ impl Fix {
             fix.dir.display(),
             fix.path("bin/curl"),
             fix.path("home/www"),
+            kyriakon_control_core::mail::pgp::keygen_check_program(),
             fix.path("proofs"),
         );
         std::fs::write(fix.path("drain.toml"), cfg).unwrap();

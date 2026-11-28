@@ -58,9 +58,9 @@ encrypt_bin=${KYRIAKON_ENCRYPT_BIN:-$repo/kyriakon-encrypt/target/release/kyriak
 probe_bin=${KYRIAKON_SANDBOX_PROBE:-$control_target/release/examples/sandbox-probe}
 keygen_check=${KYRIAKON_KEYGEN_CHECK:-/usr/local/libexec/keygen-check}
 case $keygen_check in /*) ;; *) keygen_check=$PWD/$keygen_check ;; esac
-# The handler and terminal resolve the helper at startup; give them the path
-# this script validated rather than letting a fixture build run inside the veil.
-export KYRIAKON_KEYGEN_CHECK=$keygen_check
+# The handler and terminal read the helper from their config and unveil that
+# path, so the generated config names the binary this script checked rather than
+# relying on an environment variable a release build does not consult.
 
 # The nested test key: a public key with an encryption subkey, from the
 # keygen fixtures the other Rust tests share. Its private half is nowhere.
@@ -187,6 +187,7 @@ handler_config() {
 		-e "s|^gemini_socket = .*|gemini_socket = \"$tree/run/gemini.sock\"|" \
 		-e "s|^portal_socket = .*|portal_socket = \"$tree/run/portal.sock\"|" \
 		-e "s|^titan_listener = .*|titan_listener = \"127.0.0.1:0\"|" \
+		-e "s|^keygen_check = .*|keygen_check = \"$keygen_check\"|" \
 		"$config_src"
 }
 
@@ -326,6 +327,38 @@ EOF
 	status=0
 	wait "$spid" 2>/dev/null || status=$?
 	assert_signal_only "$status" "static"
+
+	# keygen-check's own contract under pledge("stdio", NULL), run directly
+	# rather than through a daemon: a helper that is missing, or a promise that
+	# kills it, fails here by name instead of every key silently becoming the
+	# uninspected advisory. The clock is an argument so the fixtures' age cannot
+	# decide a verdict.
+	if ! "$keygen_check" --now-secs 1800000000 < "$fixture_key" \
+		> "$tree/logs/keygen-clean" 2>&1; then
+		fail "keygen-check refused the clean fixture"
+	fi
+	grep -qx 'ok' "$tree/logs/keygen-clean" ||
+		fail "keygen-check printed no clean verdict"
+	if ! "$keygen_check" --now-secs 1800000000 < "$refused_key" \
+		> "$tree/logs/keygen-refused" 2>&1; then
+		fail "keygen-check refused the signing-only fixture"
+	fi
+	grep -qx 'ok' "$tree/logs/keygen-refused" ||
+		fail "keygen-check did not parse the signing-only fixture"
+	grep -q 'no encryption-capable subkey' "$tree/logs/keygen-refused" ||
+		fail "keygen-check reported no finding for the signing-only fixture"
+	printf 'not a key\n' |
+		"$keygen_check" --now-secs 1800000000 > "$tree/logs/keygen-malformed" 2>&1 ||
+		fail "keygen-check did not exit 0 on a malformed block"
+	grep -qx 'uninspected' "$tree/logs/keygen-malformed" ||
+		fail "keygen-check did not answer uninspected"
+	if head -c 1048577 /dev/zero | "$keygen_check" > "$tree/logs/keygen-large" 2>&1; then
+		fail "keygen-check accepted an input over 1 MiB"
+	else
+		code=$?
+	fi
+	[ "$code" -eq 2 ] ||
+		fail "an over-1 MiB input exited $code, not 2"
 
 	# 3. handler: bind four listeners, keep its view, and answer a portal read
 	# and three FastCGI requests. The capsule's `/apply` is unauthenticated and
@@ -528,6 +561,8 @@ self_test() {
 		"$(printf '%s\n' "$conf" | grep -cF "portal_socket = \"$tree/run/portal.sock\"")" 1
 	check "the handler config binds Titan on a loopback port" \
 		"$(printf '%s\n' "$conf" | grep -cF 'titan_listener = "127.0.0.1:0"')" 1
+	check "the handler config names the key checker this script checked" \
+		"$(printf '%s\n' "$conf" | grep -cF "keygen_check = \"$keygen_check\"")" 1
 	check "the static config names the fixture root" \
 		"$(static_config "$tree" | grep -cF "root = \"$tree/www\"")" 1
 

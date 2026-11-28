@@ -231,6 +231,11 @@ proof_dir = "/var/db/kyriakon/logins"
 # code.
 gpg = "/usr/local/bin/gpg"
 
+# The key checker: the same binary the handler runs, named here for the same
+# reason. The drain unveils this one path and runs it for every key it
+# revalidates before acting on an intent.
+keygen_check = "/usr/local/libexec/keygen-check"
+
 # Where the members' public trees live: the sftp chroot
 # `scripts/provision-member.sh` builds as <username>.kyriakon.net. The export
 # writes its bundle under that chroot so the member collects it over the sftp

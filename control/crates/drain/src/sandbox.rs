@@ -142,7 +142,12 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
     unveil(&cfg.sendmail, "x")?;
     // The OpenPGP binary `mail::pgp` runs for a key check or a signature.
     unveil(&cfg.gpg, "x")?;
-    sandbox::unveil_keygen_check().map_err(|source| Error::Unveil { source })?;
+    // The key checker, a separate build root run as a process so this half does
+    // not link the parser. Its spawn path and this unveiled path are one string,
+    // named before the list is locked; a configured parent directory that is
+    // missing fails startup rather than every check falling back to advisory.
+    kyriakon_control_core::mail::pgp::configure_keygen_check(&cfg.keygen_check);
+    unveil(&cfg.keygen_check, "x")?;
     // The resolver `check_group_dns` runs, which needs no entry of its own for
     // `/etc/resolv.conf`: it is a different process after `execve`.
     unveil(&cfg.resolver, "x")?;

@@ -21,6 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,10 +40,6 @@ const SIGNED_END: &str = "-----END PGP SIGNATURE-----";
 /// How long one gpg run may take. A key or a message is small; a run that hangs
 /// must not hold the single-flight drain open forever.
 const GPG_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Production releases do not consult the environment for an executable.
-#[cfg(not(any(test, feature = "test-fixtures")))]
-const KEYGEN_CHECK: &str = "/usr/local/libexec/keygen-check";
 
 /// The helper parses one key and exits. A parser that hangs on one key must not
 /// hold the request open.
@@ -472,7 +469,21 @@ fn run_keygen_check(
     })
 }
 
-/// The executable the sandbox unveils and the key check starts.
+/// The helper this process was configured with. A service has one config and so
+/// one helper; the same string is unveiled and spawned.
+static PROGRAM: OnceLock<String> = OnceLock::new();
+
+/// Name the helper for this process. Called from the binary's sandbox setup,
+/// before the veil is locked, so the path the veil admits and the path a spawn
+/// runs cannot disagree. A second call is ignored: the first is the process's.
+pub fn configure_keygen_check(path: &str) {
+    let _ = PROGRAM.set(path.to_string());
+}
+
+/// The executable the sandbox unveils and the key check starts. A test build
+/// names the helper it built; a service uses the configured path, falling back
+/// to the deployed one for a caller that never ran a sandbox (the console's
+/// unit tests).
 pub fn keygen_check_program() -> String {
     #[cfg(any(test, feature = "test-fixtures"))]
     {
@@ -480,13 +491,10 @@ pub fn keygen_check_program() -> String {
     }
     #[cfg(not(any(test, feature = "test-fixtures")))]
     {
-        #[cfg(debug_assertions)]
-        if let Ok(program) = std::env::var("KYRIAKON_KEYGEN_CHECK") {
-            if !program.is_empty() {
-                return program;
-            }
-        }
-        KEYGEN_CHECK.to_owned()
+        PROGRAM
+            .get()
+            .cloned()
+            .unwrap_or_else(|| crate::config::KEYGEN_CHECK.to_string())
     }
 }
 
@@ -1380,8 +1388,15 @@ mod tests {
         let path = home.path().join("check");
         std::fs::write(&path, "#!/bin/sh\nexit 3\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let failed = public_key_with(path.display().to_string(), CLEAN, 0, Duration::from_secs(2))
-            .expect("a helper that exits non-zero is not a framing refusal");
+        let failed = public_key_with(
+            path.display().to_string(),
+            CLEAN,
+            0,
+            // The service deadline, so a loaded machine cannot turn a fast exit
+            // into the timeout this test is not about.
+            KEYGEN_TIMEOUT,
+        )
+        .expect("a helper that exits non-zero is not a framing refusal");
         assert!(!failed.inspected);
         assert!(failed.refusal().is_none());
         assert!(

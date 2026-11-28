@@ -473,6 +473,7 @@ mod tests {
             rate_endpoint: "https://rates.example.invalid/simple/price".to_string(),
             rates_fetch: "/usr/bin/true".to_string(),
             gpg: "/usr/bin/true".to_string(),
+            keygen_check: crate::config::KEYGEN_CHECK.to_string(),
             proof_dir: dir.join("logins").to_str().unwrap().to_string(),
             public_root: "/home/www".to_string(),
         }

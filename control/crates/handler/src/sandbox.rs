@@ -29,12 +29,18 @@ use kyriakon_control_core::sandbox;
 const PROMISES: &str = "stdio rpath wpath cpath fattr flock unix inet proc exec";
 
 pub fn restrict(cfg: &Config) -> Result<(), sandbox::Error> {
+    // The helper's spawned path and its unveiled path must be one string, so the
+    // process is told the configured one before the list is locked.
+    kyriakon_control_core::mail::pgp::configure_keygen_check(&cfg.keygen_check);
     sandbox::unveil(&cfg.store_root, "rwc")?;
     sandbox::unveil("/dev/urandom", "r")?;
     sandbox::unveil("/dev/null", "rw")?;
     sandbox::unveil(session::DOAS, "x")?;
     sandbox::unveil(session::AUTHCHECK, "x")?;
-    sandbox::unveil_keygen_check()?;
+    // The key checker every key answer runs as a process. Execute only: it
+    // opens no path of ours, and a configured parent directory that is missing
+    // fails here rather than as a silent advisory at the first submission.
+    sandbox::unveil(&cfg.keygen_check, "x")?;
     sandbox::lock()?;
     sandbox::probe(&cfg.store_root)?;
     sandbox::probe("/dev/urandom")?;

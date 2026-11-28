@@ -79,6 +79,7 @@ pub(crate) fn handler_config(dir: &Path) -> config::Config {
         stripe_payment_link: "https://buy.stripe.com/test_example".to_string(),
         stripe_group_payment_link: "https://buy.stripe.com/test_group_example".to_string(),
         proof_dir: dir.join("proofs").to_str().unwrap().to_string(),
+        keygen_check: config::KEYGEN_CHECK.to_string(),
     }
 }
 
