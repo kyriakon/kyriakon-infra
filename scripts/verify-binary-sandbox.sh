@@ -352,7 +352,9 @@ EOF
 		fail "keygen-check did not exit 0 on a malformed block"
 	grep -qx 'uninspected' "$tree/logs/keygen-malformed" ||
 		fail "keygen-check did not answer uninspected"
-	if head -c 1048577 /dev/zero | "$keygen_check" > "$tree/logs/keygen-large" 2>&1; then
+	# dd rather than `head -c`: OpenBSD's head has no -c.
+	if dd if=/dev/zero bs=1024 count=1025 2>/dev/null | "$keygen_check" \
+		> "$tree/logs/keygen-large" 2>&1; then
 		fail "keygen-check accepted an input over 1 MiB"
 	else
 		code=$?
