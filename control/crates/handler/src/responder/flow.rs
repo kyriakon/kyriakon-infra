@@ -127,7 +127,7 @@ pub(super) fn own_origin(request: &Request, reaches: Reaches) -> bool {
 /// posts it, and the terminal's completed application is checked with it before
 /// the handler files anything, so the two cannot disagree about what is
 /// acceptable.
-pub(super) fn application_problems(
+pub(super) async fn application_problems(
     app: &App,
     form: &BTreeMap<String, String>,
 ) -> (Vec<String>, BTreeMap<String, Vec<keycheck::Inspected>>) {
@@ -147,7 +147,7 @@ pub(super) fn application_problems(
         if q.rule == Rule::MailKey {
             // One inspection serves both the refusal and, when the submission
             // files, the record: the key is not read twice.
-            let blocks = keycheck::inspect(&value);
+            let blocks = keycheck::inspect_async(&value).await;
             for why in mail_key_errors_from(q, &blocks, form) {
                 errors.push(format!("{}: {why}", q.prompt));
             }

@@ -67,6 +67,13 @@ pub trait StatusSource {
 /// A test drives the same trait with a form instead of a socket.
 pub trait Filing {
     fn file(&mut self, form: &BTreeMap<String, String>) -> Result<String, Error>;
+
+    /// Inspect one key answer through the portal, or `None` when this
+    /// front-end has no portal. `None` becomes the advisory, which still lets
+    /// the application file (ADR 0008).
+    fn check(&mut self, _material: &str) -> Option<pgp::Checked> {
+        None
+    }
 }
 
 /// The shared facts the applicant's flow reads: the crate's question list and
@@ -1042,8 +1049,25 @@ fn application(
             }
             Entered::Value(value) => {
                 // One inspection serves the refusal, the advisory and the
-                // record, so a key page runs the helper once.
-                let inspected = page.mailbox.is_some().then(|| keycheck::inspect(&value));
+                // record. The portal runs the helper: this process holds no
+                // exec promise, so a key check never becomes a local child. The
+                // framing and count rules are local, so only one block is sent.
+                let inspected = page
+                    .mailbox
+                    .is_some()
+                    .then(|| match pgp::blocks(&value).len() {
+                        0 => vec![keycheck::Inspected::not_armoured()],
+                        // The count rule trips before the entries are read.
+                        count if count > 1 => (0..count)
+                            .map(|_| keycheck::Inspected::not_armoured())
+                            .collect(),
+                        _ => {
+                            let checked = filing
+                                .check(&value)
+                                .unwrap_or_else(|| pgp::uninspected(&value));
+                            vec![keycheck::Inspected::Checked(checked)]
+                        }
+                    });
                 let blocks = inspected.as_deref();
                 if let Some(why) = flow_problem(
                     page,
@@ -1673,6 +1697,15 @@ mod tests {
         fn file(&mut self, form: &BTreeMap<String, String>) -> Result<String, Error> {
             self.forms.push(form.clone());
             Ok("abcdefghjkmnpqrstvwxyz0123".to_string())
+        }
+
+        /// These sessions exercise the page's refusal, so the scripted portal
+        /// runs the same inspection the handler would.
+        fn check(&mut self, material: &str) -> Option<pgp::Checked> {
+            match keycheck::inspect(material).into_iter().next() {
+                Some(keycheck::Inspected::Checked(checked)) => Some(checked),
+                _ => None,
+            }
         }
     }
 
@@ -2417,6 +2450,11 @@ mod tests {
                 _ => panic!("{id} did not read a value"),
             }
             assert!(script.spent(), "{id} left input unread");
+            // The reading rules are what this test measures, so the key pages
+            // get the advisory a portal-less front-end would pass; no helper
+            // runs in this crate's tests.
+            let checked = pgp::uninspected(&expected);
+            let inspected = [keycheck::Inspected::Checked(checked)];
             assert!(
                 flow_problem(
                     &page,
@@ -2424,7 +2462,7 @@ mod tests {
                     &reserved,
                     page.q.required,
                     &BTreeMap::new(),
-                    None
+                    Some(&inspected)
                 )
                 .is_none(),
                 "{id} was read but refused"

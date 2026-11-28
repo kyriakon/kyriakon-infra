@@ -54,11 +54,52 @@ async fn a_portal_status_read_is_rate_limited_by_address() {
     }
     let refused = portal_answer(&app, "203.0.113.10", TOKEN).await;
     assert_eq!(refused, ipc::Answer::Notice(SLOW_STATUS.to_string()));
+    // A key check shares the counter, so it cannot be used to amplify forks.
+    let checked = super::portal_check(&app, "203.0.113.10", "\"x\"").await;
+    assert_eq!(checked, ipc::CheckAnswer::Advisory(SLOW_STATUS.to_string()));
     // Another address still reads.
     assert!(matches!(
         portal_answer(&app, "203.0.113.11", TOKEN).await,
         ipc::Answer::Notice(_)
     ));
+}
+
+/// The terminal's key check is the same inspection the form runs, answerable in
+/// one line: clean, refused with the finding, or the advisory that proceeds.
+#[tokio::test]
+async fn the_portal_inspects_a_key_and_says_refused_or_clean() {
+    let (app, _dir) = handler("portal-check").await;
+    let clean = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../keygen/fixtures/generated-clean.asc"
+    ));
+    let refused = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../keygen/fixtures/gpg-no-encryption-subkey.asc"
+    ));
+    let body = |material: &str| serde_json::to_string(material).unwrap();
+
+    let answer = super::portal_check(&app, "203.0.113.10", &body(clean)).await;
+    assert_eq!(answer, ipc::CheckAnswer::Clean);
+
+    let answer = super::portal_check(&app, "203.0.113.10", &body(refused)).await;
+    assert!(
+        matches!(&answer, ipc::CheckAnswer::Refused(why) if why.contains("no encryption-capable subkey")),
+        "{answer:?}"
+    );
+    // The wire form is one line and parses back to the same answer.
+    assert_eq!(
+        ipc::CheckAnswer::parse(&answer.line()).unwrap(),
+        answer,
+        "the refusal survives its own wire form"
+    );
+
+    // Not a public key block at all is a refusal, not an advisory.
+    let answer = super::portal_check(&app, "203.0.113.10", &body("hello")).await;
+    assert!(
+        matches!(&answer, ipc::CheckAnswer::Refused(why) if why.contains("not")),
+        "{answer:?}"
+    );
 }
 
 /// The portal line is bounded on the wire: a request past the bound is refused

@@ -200,9 +200,12 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
         }
         _ => None,
     };
-    let inspected = peek
-        .filter(|&(_, key_page)| key_page && !incoming.query.is_empty())
-        .map(|_| keycheck::inspect(&capsule_value(&incoming.query)));
+    let inspected = match peek {
+        Some((_, true)) if !incoming.query.is_empty() => {
+            Some(keycheck::inspect_async(&capsule_value(&incoming.query)).await)
+        }
+        _ => None,
+    };
 
     let step = match app
         .store

@@ -96,6 +96,23 @@ impl Checked {
     pub fn helper_error(&self) -> Option<&Error> {
         self.helper_error.as_ref()
     }
+
+    /// The inspection a peer reported. The portal runs the helper in the
+    /// handler, so the terminal records that answer without a second run.
+    pub fn reported(
+        material: String,
+        fingerprint: String,
+        verdict: String,
+        inspected: bool,
+    ) -> Checked {
+        Checked {
+            material,
+            fingerprint,
+            verdict,
+            inspected,
+            helper_error: None,
+        }
+    }
 }
 
 /// One key as it will be installed: the block's own text and the fingerprint
@@ -199,23 +216,57 @@ where
     execute(command, stdin, gpg).await
 }
 
-async fn execute(
+/// What one bounded child produced. The status is kept rather than a bool
+/// because `keygen-check`'s failure names its exit status.
+struct Ran {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// The stdin write's outcome. gpg ignores it when the child failed, because
+    /// the exit status is the failure worth reporting.
+    written: Result<(), std::io::Error>,
+}
+
+/// Why a bounded child produced no result. Each caller maps this to its own
+/// error, because gpg and the key checker name the same states differently.
+enum Unrun {
+    Spawn(std::io::Error),
+    NoStdout,
+    NoStderr,
+    ReadOutput(std::io::Error),
+    ReadStderr(std::io::Error),
+    Wait(std::io::Error),
+    TimedOut,
+    TooMuchOutput,
+}
+
+/// One adapter for every child the control plane runs: stdin is written while
+/// stdout and stderr drain, a run past the deadline is killed, and an optional
+/// stdout cap stops a runaway helper. A capped child that overruns is killed
+/// before it is waited for, so a full pipe cannot turn the cap into a timeout.
+async fn run_bounded(
     mut command: Command,
     stdin: Option<&[u8]>,
-    gpg: &str,
-) -> Result<GpgOutput, Error> {
+    timeout: Duration,
+    cap: Option<usize>,
+    capture_stderr: bool,
+) -> Result<Ran, Unrun> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|source| Error::RunGpg {
-        program: gpg.to_string(),
-        source,
-    })?;
+    command.stderr(if capture_stderr {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = command.spawn().map_err(Unrun::Spawn)?;
     let mut child_stdin = child.stdin.take();
-    let mut stdout = child.stdout.take().ok_or(Error::GpgNoStdout)?;
-    let mut stderr = child.stderr.take().ok_or(Error::GpgNoStderr)?;
+    let mut stdout = child.stdout.take().ok_or(Unrun::NoStdout)?;
+    let stderr = child.stderr.take();
+    if capture_stderr && stderr.is_none() {
+        return Err(Unrun::NoStderr);
+    }
     let io = async move {
         let write = async move {
             if let Some(bytes) = stdin {
@@ -230,54 +281,101 @@ async fn execute(
         };
         let read_out = async move {
             let mut out = Vec::new();
-            stdout.read_to_end(&mut out).await?;
+            match cap {
+                Some(max) => {
+                    stdout.take(max as u64 + 1).read_to_end(&mut out).await?;
+                }
+                None => {
+                    stdout.read_to_end(&mut out).await?;
+                }
+            }
             Ok::<_, std::io::Error>(out)
         };
         let read_err = async move {
             let mut err = Vec::new();
-            stderr.read_to_end(&mut err).await?;
+            if let Some(mut pipe) = stderr {
+                pipe.read_to_end(&mut err).await?;
+            }
             Ok::<_, std::io::Error>(err)
         };
         tokio::join!(write, read_out, read_err)
     };
-    let deadline = tokio::time::Instant::now() + GPG_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
     let (written, out, err) = match tokio::time::timeout_at(deadline, io).await {
         Ok(result) => result,
         Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            return Err(timed_out(gpg));
+            return Err(Unrun::TimedOut);
         }
     };
+    let stdout = out.map_err(Unrun::ReadOutput)?;
+    let stderr = err.map_err(Unrun::ReadStderr)?;
+    if let Some(max) = cap {
+        if stdout.len() > max {
+            // The cap stopped the drain, so the child may be blocked on a full
+            // pipe: kill rather than wait for an exit that cannot come.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(Unrun::TooMuchOutput);
+        }
+    }
     let status = match tokio::time::timeout_at(deadline, child.wait()).await {
         Ok(Ok(status)) => status,
-        Ok(Err(source)) => {
-            return Err(Error::WaitGpg {
-                program: gpg.to_string(),
-                source,
-            })
-        }
+        Ok(Err(source)) => return Err(Unrun::Wait(source)),
         Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            return Err(timed_out(gpg));
+            return Err(Unrun::TimedOut);
         }
     };
-    let stdout = out.map_err(|source| Error::ReadGpgOutput {
-        program: gpg.to_string(),
-        source,
-    })?;
-    let stderr = err.map_err(|source| Error::ReadGpgError {
-        program: gpg.to_string(),
-        source,
-    })?;
-    if status.success() {
-        written.map_err(|source| Error::WriteGpg { source })?;
-    }
-    Ok(GpgOutput {
-        success: status.success(),
+    Ok(Ran {
+        status,
         stdout,
         stderr,
+        written,
+    })
+}
+
+async fn execute(command: Command, stdin: Option<&[u8]>, gpg: &str) -> Result<GpgOutput, Error> {
+    let ran = run_bounded(command, stdin, GPG_TIMEOUT, None, true)
+        .await
+        .map_err(|error| match error {
+            Unrun::Spawn(source) => Error::RunGpg {
+                program: gpg.to_string(),
+                source,
+            },
+            Unrun::NoStdout => Error::GpgNoStdout,
+            Unrun::NoStderr => Error::GpgNoStderr,
+            Unrun::ReadOutput(source) => Error::ReadGpgOutput {
+                program: gpg.to_string(),
+                source,
+            },
+            Unrun::ReadStderr(source) => Error::ReadGpgError {
+                program: gpg.to_string(),
+                source,
+            },
+            Unrun::Wait(source) => Error::WaitGpg {
+                program: gpg.to_string(),
+                source,
+            },
+            Unrun::TimedOut => timed_out(gpg),
+            // gpg runs uncapped, so this state cannot come from here.
+            Unrun::TooMuchOutput => Error::ReadGpgOutput {
+                program: gpg.to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the gpg run exceeded its output cap",
+                ),
+            },
+        })?;
+    if ran.status.success() {
+        ran.written.map_err(|source| Error::WriteGpg { source })?;
+    }
+    Ok(GpgOutput {
+        success: ran.status.success(),
+        stdout: ran.stdout,
+        stderr: ran.stderr,
     })
 }
 
@@ -328,6 +426,23 @@ pub fn public_key(value: &str) -> Result<Checked, Error> {
     public_key_with(keygen_check_program(), value, now_secs(), KEYGEN_TIMEOUT)
 }
 
+/// The same inspection, awaited. A daemon uses this so a ten-second helper does
+/// not hold a Tokio worker; the console and the tests use [`public_key`].
+pub async fn public_key_async(value: &str) -> Result<Checked, Error> {
+    let Cert {
+        material,
+        fingerprint,
+    } = inspect_single_cert(value)?;
+    let result = run_keygen_check_async(
+        keygen_check_program(),
+        &material,
+        now_secs(),
+        KEYGEN_TIMEOUT,
+    )
+    .await;
+    Ok(checked(material, fingerprint, result))
+}
+
 /// The one inspection, with the helper named. [`public_key`] names the deployed
 /// one; a test drives a helper that cannot answer, which is the path this keeps
 /// observable.
@@ -341,26 +456,32 @@ fn public_key_with(
         material,
         fingerprint,
     } = inspect_single_cert(value)?;
-    let (verdict, inspected, helper_error) =
-        match run_keygen_check(program, &material, now, timeout) {
-            Ok(KeygenVerdict::Parsed(findings)) if findings.is_empty() => {
-                ("works".to_string(), true, None)
-            }
-            Ok(KeygenVerdict::Parsed(findings)) => (findings.join("; "), true, None),
-            // The helper read the framing and could not read the key: a gap in
-            // the check, not a fault in this process, so there is nothing to log.
-            Ok(KeygenVerdict::Uninspected) => (UNINSPECTED.to_string(), false, None),
-            // A helper that could not answer is the same advisory to the
-            // applicant and a line in the daemon's log for the operator.
-            Err(err) => (UNINSPECTED.to_string(), false, Some(err)),
-        };
-    Ok(Checked {
+    let result = run_keygen_check(program, &material, now, timeout);
+    Ok(checked(material, fingerprint, result))
+}
+
+/// Shape the helper's answer into the one value a caller acts on. Both adapters
+/// share it, so the sync and async paths cannot disagree about a verdict.
+fn checked(material: String, fingerprint: String, result: Result<KeygenVerdict, Error>) -> Checked {
+    let (verdict, inspected, helper_error) = match result {
+        Ok(KeygenVerdict::Parsed(findings)) if findings.is_empty() => {
+            ("works".to_string(), true, None)
+        }
+        Ok(KeygenVerdict::Parsed(findings)) => (findings.join("; "), true, None),
+        // The helper read the framing and could not read the key: a gap in the
+        // check, not a fault in this process, so there is nothing to log.
+        Ok(KeygenVerdict::Uninspected) => (UNINSPECTED.to_string(), false, None),
+        // A helper that could not answer is the same advisory to the applicant
+        // and a line in the daemon's log for the operator.
+        Err(err) => (UNINSPECTED.to_string(), false, Some(err)),
+    };
+    Checked {
         material,
         fingerprint,
         verdict,
         inspected,
         helper_error,
-    })
+    }
 }
 
 /// The helper's answer, with the parser gap kept distinct from a clean key.
@@ -467,6 +588,70 @@ fn run_keygen_check(
     })
 }
 
+/// The awaited adapter for the daemons: the same input and output bounds as the
+/// sync one, without holding a Tokio worker for the helper's whole run.
+async fn run_keygen_check_async(
+    program: String,
+    material: &str,
+    now: u64,
+    timeout: Duration,
+) -> Result<KeygenVerdict, Error> {
+    if material.len() > MAX_KEYGEN_INPUT {
+        return Err(Error::KeygenCheckProtocol { program });
+    }
+    let mut command = Command::new(&program);
+    command.env_clear().arg("--now-secs").arg(now.to_string());
+    let ran = run_bounded(
+        command,
+        Some(material.as_bytes()),
+        timeout,
+        Some(MAX_KEYGEN_OUTPUT),
+        false,
+    )
+    .await
+    .map_err(|error| keygen_unrun(error, &program, timeout))?;
+    if !ran.status.success() {
+        return Err(Error::KeygenCheckExited {
+            program,
+            status: ran.status,
+        });
+    }
+    ran.written.map_err(|source| Error::WriteKeygenCheck {
+        program: program.clone(),
+        source,
+    })?;
+    parse_keygen_output(&program, &ran.stdout)
+}
+
+/// Name the helper's failure in the key-check error, which the sync adapter
+/// does inline. One mapping, so the two adapters cannot report a state
+/// differently.
+fn keygen_unrun(error: Unrun, program: &str, timeout: Duration) -> Error {
+    let protocol = || Error::KeygenCheckProtocol {
+        program: program.to_string(),
+    };
+    match error {
+        Unrun::Spawn(source) => Error::RunKeygenCheck {
+            program: program.to_string(),
+            source,
+        },
+        Unrun::NoStdout | Unrun::NoStderr | Unrun::ReadStderr(_) => protocol(),
+        Unrun::ReadOutput(source) => Error::ReadKeygenCheck {
+            program: program.to_string(),
+            source,
+        },
+        Unrun::Wait(source) => Error::WaitKeygenCheck {
+            program: program.to_string(),
+            source,
+        },
+        Unrun::TimedOut => Error::KeygenCheckTimedOut {
+            program: program.to_string(),
+            seconds: timeout.as_secs(),
+        },
+        Unrun::TooMuchOutput => protocol(),
+    }
+}
+
 /// The executable the sandbox unveils and the key check starts.
 pub fn keygen_check_program() -> String {
     #[cfg(any(test, feature = "test-fixtures"))]
@@ -549,6 +734,23 @@ fn keygen_check_test_binary() -> &'static Path {
 /// this one.
 const UNINSPECTED: &str = "The key could not be inspected automatically, so a person will \
      check it against the key on the box. The application can still be filed.";
+
+/// The advisory for a key this process could not inspect: what a front-end with
+/// no portal records, and what ADR 0008 lets file. No helper runs.
+pub fn uninspected(material: &str) -> Checked {
+    match inspect_single_cert(material) {
+        Ok(Cert {
+            material,
+            fingerprint,
+        }) => Checked::reported(material, fingerprint, UNINSPECTED.to_string(), false),
+        Err(_) => Checked::reported(
+            material.trim().to_string(),
+            String::new(),
+            UNINSPECTED.to_string(),
+            false,
+        ),
+    }
+}
 
 /// The User ID and user-attribute packets a key would publish, as warnings
 /// rather than refusals. The default identity is `<localpart>@kyriakon.net`
@@ -1288,6 +1490,31 @@ mod tests {
         std::fs::set_permissions(&flood, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(
             run_keygen_check(flood.display().to_string(), "", 0, KEYGEN_TIMEOUT),
+            Err(Error::KeygenCheckProtocol { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_awaited_helper_is_killed_at_its_deadline_and_capped() {
+        let home = ScratchHome::new().unwrap();
+        let slow = home.path().join("slow");
+        std::fs::write(&slow, "#!/bin/sh\nexec sleep 5\n").unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            run_keygen_check_async(slow.display().to_string(), "", 0, Duration::from_millis(50))
+                .await,
+            Err(Error::KeygenCheckTimedOut { .. })
+        ));
+
+        let flood = home.path().join("flood");
+        std::fs::write(
+            &flood,
+            "#!/bin/sh\ncat >/dev/null\necho ok\nhead -c 70000 /dev/zero | tr '\\0' x\necho\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&flood, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            run_keygen_check_async(flood.display().to_string(), "", 0, KEYGEN_TIMEOUT).await,
             Err(Error::KeygenCheckProtocol { .. })
         ));
     }

@@ -870,7 +870,7 @@ async fn close_mailbox(
 
 /// The mail key a new mailbox carries, checked before anything is written: the
 /// material must be there and must be the mailbox's own key.
-fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Transitions> {
+async fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Transitions> {
     let Some(key) = intent.mail_key.as_ref() else {
         return Err(Transitions::Groups(Error::MailboxNoMailKey {
             mailbox: intent.mailbox.clone(),
@@ -890,8 +890,9 @@ fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Transitions> {
     // The console carries whatever file the operator named. A private key, an
     // SSH key or a truncated block would reach the encryptor's keyring and
     // fail closed, so the shared check refuses it before the journal line.
-    let checked =
-        kyriakon_control_core::mail::pgp::public_key(&key.material).map_err(|source| {
+    let checked = kyriakon_control_core::mail::pgp::public_key_async(&key.material)
+        .await
+        .map_err(|source| {
             Transitions::Groups(Error::MailKeyUnreadable {
                 mailbox: intent.mailbox.clone(),
                 source,
@@ -1024,7 +1025,7 @@ pub async fn group_address(
             }
         }
         "add-mailbox" => {
-            address_key(&intent)?;
+            address_key(&intent).await?;
             if let Some(have) = &current {
                 if have != &intent.mailbox {
                     return Err(Transitions::Groups(Error::AddressPointsOther {
@@ -1056,7 +1057,7 @@ pub async fn group_address(
             }
         }
         "upgrade" => {
-            address_key(&intent)?;
+            address_key(&intent).await?;
             match &current {
                 None => {
                     return Err(Transitions::Groups(Error::NotAnAddressToUpgrade {
@@ -1151,7 +1152,7 @@ pub async fn group_address(
                     })
                     .await?;
             }
-            let key = address_key(&intent)?;
+            let key = address_key(&intent).await?;
             ensure_table_line(&cfg.virtuals, &entry, Some(&intent.mailbox))?;
             ensure_sender(&cfg.mail_from, &intent.mailbox, &entry)?;
             publish_mail_keys(cfg, &intent.mailbox, std::slice::from_ref(&key)).await?;
@@ -1184,7 +1185,7 @@ pub async fn group_address(
                     })
                     .await?;
             }
-            let key = address_key(&intent)?;
+            let key = address_key(&intent).await?;
             publish_mail_keys(cfg, &intent.mailbox, std::slice::from_ref(&key)).await?;
             if !account_on_box(cfg, &intent.mailbox)? {
                 run_script_tolerating(cfg, "add-user.sh", &[&intent.mailbox], "already exists")

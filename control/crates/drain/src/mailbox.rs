@@ -187,10 +187,10 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Transiti
     // Each key is inspected before the draft lock is taken: the helper may run
     // for ten seconds, and every other applicant's draft write waits on this
     // lock. The pairing with mailboxes still happens under the lock.
-    let inspected: Vec<_> = blocks
-        .iter()
-        .map(|(_, material)| pgp::public_key(material))
-        .collect();
+    let mut inspected = Vec::with_capacity(blocks.len());
+    for (_, material) in &blocks {
+        inspected.push(pgp::public_key_async(material).await);
+    }
     let mailed = match store
         .update_draft::<Mailed, kyriakon_control_core::store::Error>(&token, move |draft| {
             // The token in the Subject is the capability: smtpd authenticates

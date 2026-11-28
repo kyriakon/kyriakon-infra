@@ -232,7 +232,7 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
     // for ten seconds, and every other applicant's draft write waits on this
     // one. The locked read still decides which mailbox the upload fills.
     let inspected = match blocks.as_slice() {
-        [block] => Some(pgp::public_key(block)),
+        [block] => Some(pgp::public_key_async(block).await),
         _ => None,
     };
     let outcome = match app
