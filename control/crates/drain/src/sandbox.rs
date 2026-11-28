@@ -118,6 +118,11 @@ const PROMISES: &str = "stdio rpath wpath cpath fattr chown flock proc exec";
 /// error names the path (or `pledge`) and its errno text instead.
 #[cfg(target_os = "openbsd")]
 pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
+    // A box whose card rail is not configured yet has no signing secret, and
+    // `transitions::stripe` reports that rather than failing the pass. Stat it
+    // before the first unveil: after that a missing file and an unveiled one
+    // both answer `ENOENT`, so the probe below cannot tell them apart.
+    let webhook_secret = std::path::Path::new(&cfg.stripe_webhook_secret).exists();
     // The store root, read/written/created/removed: `Store::try_lock` in the
     // binary, `Journal::load` in `run`, and every transition record under it.
     unveil(&cfg.store_root, "rwc")?;
@@ -157,8 +162,11 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
     // Stripe's signing secret, read at the top of the webhook pass. The API key
     // and the keyring publish token are not here: the drain passes their paths
     // as argv to `stripe-api.sh` and `publish-mail-key.sh`, which read them
-    // after `execve` has dropped this process's unveils.
-    unveil(&cfg.stripe_webhook_secret, "r")?;
+    // after `execve` has dropped this process's unveils. A box without the
+    // secret is deployed rather than refused, so it has no rule and no probe.
+    if webhook_secret {
+        unveil(&cfg.stripe_webhook_secret, "r")?;
+    }
     // The five mail tables. Each is replaced through a sibling candidate and a
     // `<name>.lock` kernel-flock file, so the containing directory needs read,
     // write and create. The files themselves are covered by it.
@@ -197,6 +205,9 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
     // the pledge, so a missing entry is a startup failure that names the path
     // instead of a later `ENOENT` that a sweep reads as an empty spool.
     probe_pass_paths(cfg)?;
+    if webhook_secret {
+        probe(&cfg.stripe_webhook_secret)?;
+    }
 
     // The exec promise set is NULL on purpose: the scripts and helpers are
     // themselves OpenBSD programs with their own pledge or none, and forcing
@@ -250,7 +261,6 @@ fn probe_pass_paths(cfg: &DrainConfig) -> Result<(), Transitions> {
         cfg.reserved.as_str(),
         cfg.passwd.as_str(),
         cfg.approval_key.as_str(),
-        cfg.stripe_webhook_secret.as_str(),
         cfg.keyring_dir.as_str(),
         cfg.proof_dir.as_str(),
         cfg.mail_dir.as_str(),

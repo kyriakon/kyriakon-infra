@@ -53,7 +53,7 @@ impl fmt::Display for Error {
             Error::Lock { source } => write!(f, "unveil (lock): {source}"),
             Error::ProbeUncovered { path } => write!(
                 f,
-                "unveil {path} (probe): no rule covers this path after the list was locked"
+                "unveil {path} (probe): no rule covers this path after the list was locked, or the file does not exist"
             ),
             Error::Probe { path, source } => write!(f, "unveil {path} (probe): {source}"),
             Error::Pledge { source } => write!(f, "pledge: {source}"),
@@ -137,9 +137,9 @@ pub fn probe(path: &str) -> Result<(), Error> {
     })?;
     if unsafe { libc::access(c_path.as_ptr(), libc::R_OK) } == -1 {
         let source = std::io::Error::last_os_error();
-        // ENOENT here is not a missing file: the unveil that named this path
-        // would have failed on that. It is the shape of "no rule covers this
-        // path", which is the omission the probe exists to report.
+        // ENOENT is either "no rule covers this path" or a missing final
+        // component: unveil remembers a non-directory by name, so a missing
+        // file passes unveil and fails only here. The message names both.
         if source.raw_os_error() == Some(libc::ENOENT) {
             return Err(Error::ProbeUncovered {
                 path: path.to_string(),
