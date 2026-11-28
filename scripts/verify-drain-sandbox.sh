@@ -418,6 +418,18 @@ full_run() {
 	find "$tree/home/www/alice.kyriakon.net/export" -type f > "$work/export-files" 2>/dev/null
 	[ -s "$work/export-files" ] || fail "the export wrote no bundle under public_root"
 
+	# A box whose card rail is not configured has no webhook secret, and
+	# `transitions::stripe` reports that instead of failing the pass. The
+	# sandbox has to agree: unveil remembers a non-directory by name, so a
+	# missing secret passes unveil and would fail the probe. Point only this
+	# value at an absent file; the API key and publish token share the fixture.
+	sed -e "s|^stripe_webhook_secret = .*|stripe_webhook_secret = \"$work/no-webhook-secret\"|" \
+		"$work/drain.toml" > "$work/no-secret.toml"
+	if ! "$drain_bin" --config "$work/no-secret.toml" > "$work/no-secret-out" 2>&1; then
+		sed -n 1,40p "$work/no-secret-out" >&2
+		fail "the drain failed with no Stripe webhook secret"
+	fi
+
 	# A path whose parent does not exist fails at unveil, and the message names
 	# the path and the errno text: the operator can fix the config from cron mail.
 	sed -e "s|^store_root = .*|store_root = \"$work/no-such-parent/store\"|" \

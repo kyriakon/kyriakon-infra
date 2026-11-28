@@ -14,9 +14,11 @@
 //! each path the pass reads itself, configured or hardcoded, is probed, so an
 //! entry this list forgot fails the pass at startup with the path and its errno
 //! rather than surfacing later as an empty spool. Exec targets are not probed:
-//! `access(2)` is a read operation and an `x`-only rule refuses it. `unveil`
-//! fails on a target that does not exist, and a missing entry fails at `execve`.
+//! `access(2)` is a read operation and an `x`-only rule refuses it. A missing
+//! parent directory fails at `unveil`, and a missing entry fails at `execve`.
 //! A path only a child opens after `execve` is not probed for the same reason.
+//! The webhook secret is probed only when it exists: a box without one is a
+//! valid box, and `unveil` remembers a non-directory by name.
 //! The rate cache file is lazy (the first run creates it), so its directory is
 //! probed instead.
 
@@ -118,6 +120,11 @@ const PROMISES: &str = "stdio rpath wpath cpath fattr chown flock proc exec";
 /// error names the path (or `pledge`) and its errno text instead.
 #[cfg(target_os = "openbsd")]
 pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
+    // A box whose card rail is not configured yet has no signing secret, and
+    // `transitions::stripe` reports that rather than failing the pass. Stat it
+    // before the first unveil: after that a missing file and an unveiled one
+    // both answer `ENOENT`, so the probe below cannot tell them apart.
+    let webhook_secret_present = std::path::Path::new(&cfg.stripe_webhook_secret).exists();
     // The store root, read/written/created/removed: `Store::try_lock` in the
     // binary, `Journal::load` in `run`, and every transition record under it.
     unveil(&cfg.store_root, "rwc")?;
@@ -157,7 +164,9 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
     // Stripe's signing secret, read at the top of the webhook pass. The API key
     // and the keyring publish token are not here: the drain passes their paths
     // as argv to `stripe-api.sh` and `publish-mail-key.sh`, which read them
-    // after `execve` has dropped this process's unveils.
+    // after `execve` has dropped this process's unveils. This succeeds on a
+    // missing final component and fails on a missing directory, which keeps
+    // the startup diagnostic; only the probe is conditional.
     unveil(&cfg.stripe_webhook_secret, "r")?;
     // The five mail tables. Each is replaced through a sibling candidate and a
     // `<name>.lock` kernel-flock file, so the containing directory needs read,
@@ -197,6 +206,9 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
     // the pledge, so a missing entry is a startup failure that names the path
     // instead of a later `ENOENT` that a sweep reads as an empty spool.
     probe_pass_paths(cfg)?;
+    if webhook_secret_present {
+        probe(&cfg.stripe_webhook_secret)?;
+    }
 
     // The exec promise set is NULL on purpose: the scripts and helpers are
     // themselves OpenBSD programs with their own pledge or none, and forcing
@@ -240,9 +252,10 @@ fn temp_dir() -> Result<String, Transitions> {
         .ok_or(Error::TempDirNotUtf8)?)
 }
 
-/// Every read path the pass opens after `restrict` returns, checked once the
-/// list is locked. Kept separate from the unveil calls on purpose: a path listed
-/// here but not unveiled is exactly the omission this catches.
+/// Every always-present read path the pass opens after `restrict` returns,
+/// checked once the list is locked. Kept separate from the unveil calls on
+/// purpose: a path listed here but not unveiled is exactly the omission this
+/// catches. The webhook secret is the caller's, because its absence is valid.
 #[cfg(target_os = "openbsd")]
 fn probe_pass_paths(cfg: &DrainConfig) -> Result<(), Transitions> {
     for path in [
@@ -250,7 +263,6 @@ fn probe_pass_paths(cfg: &DrainConfig) -> Result<(), Transitions> {
         cfg.reserved.as_str(),
         cfg.passwd.as_str(),
         cfg.approval_key.as_str(),
-        cfg.stripe_webhook_secret.as_str(),
         cfg.keyring_dir.as_str(),
         cfg.proof_dir.as_str(),
         cfg.mail_dir.as_str(),
@@ -278,9 +290,8 @@ fn probe_pass_paths(cfg: &DrainConfig) -> Result<(), Transitions> {
     }
     // The exec targets are deliberately absent. `access(2)` is a read
     // operation, so it is refused by an `x`-only rule, and probing them would
-    // fail every pass. `unveil` itself already fails on a target that does not
-    // exist; a target whose entry is missing fails at `execve` with `ENOENT`,
-    // which the fixture catches for a configured script.
+    // fail every pass. A target whose entry is missing fails at `execve` with
+    // `ENOENT`, which the fixture catches for a configured script.
     Ok(())
 }
 
