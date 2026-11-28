@@ -116,7 +116,7 @@ fn a_signing_only_rsa_subkey_cannot_receive_mail() {
 
 #[cfg(feature = "generate")]
 #[test]
-fn signed_renewals_take_effect_at_their_creation_time_in_either_packet_order() {
+fn the_newest_signed_declaration_wins_in_either_packet_order() {
     use pgp::composed::{Deserializable, SignedSecretKey};
     use pgp::crypto::hash::HashAlgorithm;
     use pgp::packet::{
@@ -130,6 +130,7 @@ fn signed_renewals_take_effect_at_their_creation_time_in_either_packet_order() {
     let signer = &secret.primary_key;
     let mut cert = secret.to_public_key();
     let start = Timestamp::now().as_secs() + 1;
+    let now = u64::from(start + 3);
     let password = Password::empty();
     for (offset, lifetime, feature) in [(0, 86_400, 0x02), (1, 0, 0x08), (2, 0, 0x01)] {
         let config = |typ| {
@@ -167,24 +168,29 @@ fn signed_renewals_take_effect_at_their_creation_time_in_either_packet_order() {
                 .sign_subkey_binding(signer, &cert.primary_key, &password, &sub.key)
                 .unwrap(),
         );
-    }
-    for _ in 0..2 {
-        let armor = cert.to_armored_string(Default::default()).unwrap();
-        let check = |offset: u32| check_public_key(&armor, u64::from(start + offset)).unwrap();
-        let expiring = check(0);
-        assert_eq!(expiring.len(), 3, "{expiring:?}");
-        assert!(expiring.iter().any(|f| f.contains("OCB feature bit")));
-        assert!(expiring.iter().any(|f| f.contains("The key expires at")));
-        assert!(expiring.iter().any(|f| f.contains("subkey expires at")));
 
-        let renewed = check(1);
-        assert_eq!(renewed.len(), 1, "{renewed:?}");
-        assert!(renewed[0].contains("SEIPD v2 feature bit"));
-        let disabled = check(2);
-        assert_eq!(disabled.len(), 1, "{disabled:?}");
-        assert!(disabled[0].contains("no encryption-capable subkey"));
-
-        cert.details.users[0].signatures.reverse();
-        cert.public_subkeys[0].signatures.reverse();
+        for _ in 0..2 {
+            let armor = cert.to_armored_string(Default::default()).unwrap();
+            let findings = check_public_key(&armor, now).unwrap();
+            match offset {
+                0 => {
+                    assert_eq!(findings.len(), 3, "{findings:?}");
+                    assert!(findings.iter().any(|f| f.contains("OCB feature bit")));
+                    assert!(findings.iter().any(|f| f.contains("The key expires at")));
+                    assert!(findings.iter().any(|f| f.contains("subkey expires at")));
+                }
+                1 => {
+                    assert_eq!(findings.len(), 1, "{findings:?}");
+                    assert!(findings[0].contains("SEIPD v2 feature bit"));
+                }
+                2 => {
+                    assert_eq!(findings.len(), 1, "{findings:?}");
+                    assert!(findings[0].contains("no encryption-capable subkey"));
+                }
+                _ => unreachable!(),
+            }
+            cert.details.users[0].signatures.reverse();
+            cert.public_subkeys[0].signatures.reverse();
+        }
     }
 }

@@ -29,6 +29,7 @@ use pgp::composed::{
 use pgp::crypto::ecc_curve::ECCCurve;
 #[cfg(feature = "generate")]
 use pgp::crypto::hash::HashAlgorithm;
+use pgp::crypto::public_key::PublicKeyAlgorithm;
 #[cfg(feature = "generate")]
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::{Signature, SignatureType, SubpacketData};
@@ -130,6 +131,22 @@ fn binding_allows_encryption(sig: &Signature) -> bool {
     })
 }
 
+fn encryption_algorithm_usable(key: &pgp::packet::PublicSubkey) -> bool {
+    if key.version() == pgp::types::KeyVersion::V4 {
+        // GnuPG refuses the v6-only algorithms in a v4 certificate.
+        matches!(
+            key.algorithm(),
+            PublicKeyAlgorithm::RSA
+                | PublicKeyAlgorithm::RSAEncrypt
+                | PublicKeyAlgorithm::ElgamalEncrypt
+                | PublicKeyAlgorithm::Elgamal
+                | PublicKeyAlgorithm::ECDH
+        )
+    } else {
+        key.algorithm().can_encrypt()
+    }
+}
+
 fn current_signature(
     signatures: &[Signature],
     now: u64,
@@ -142,9 +159,7 @@ fn current_signature(
                 return false;
             };
             let lifetime = sig.signature_expiration_time().map_or(0, |d| d.as_secs());
-            created <= now
-                && (lifetime == 0 || created + u64::from(lifetime) > now)
-                && verified(sig)
+            (lifetime == 0 || created + u64::from(lifetime) > now) && verified(sig)
         })
         .max_by(|a, b| {
             a.created().cmp(&b.created()).then_with(|| {
@@ -273,6 +288,13 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
     }
 
     let created = key.primary_key.created_at().as_secs();
+    if u64::from(created) > now_secs {
+        findings.push(
+            "The key is dated in the future; check the clock on the machine that made it, \
+             or make a new key."
+                .into(),
+        );
+    }
     // Any expiry is a finding, not only one already past: approval's
     // key_problems refuses an expiring key and delivery stops at the date. The
     // clock only chooses the wording. A zero lifetime is OpenPGP's "never".
@@ -305,7 +327,11 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
     // subkey died years ago, which is a false clean in the direction that loses mail.
     let mut has_encryption_subkey = false;
     for sub in &key.public_subkeys {
-        if !sub.key.algorithm().can_encrypt() {
+        let sub_created = sub.key.created_at().as_secs();
+        if u64::from(sub_created) > now_secs {
+            continue;
+        }
+        if !encryption_algorithm_usable(&sub.key) {
             continue;
         }
         let Some(binding) = current_signature(&sub.signatures, now_secs, |sig| {
@@ -331,7 +357,7 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
         if let Some(lifetime) = binding.key_expiration_time().map(|d| d.as_secs())
             && lifetime != 0
         {
-            let expires_at = u64::from(sub.key.created_at().as_secs()) + u64::from(lifetime);
+            let expires_at = u64::from(sub_created) + u64::from(lifetime);
             findings.push(if expires_at <= now_secs {
                 format!(
                     "The encryption subkey expired at {expires_at} seconds since the epoch, \
