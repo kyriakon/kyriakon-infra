@@ -132,3 +132,9 @@ titan_listener = "127.0.0.1:7081"
 # CAPTCHA) are the spec's numbers and live in the handler, not here: they are not
 # a per-box tuning knob, and a config file that could raise them is a config file
 # that could remove the gate the counters exist to be.
+
+# The key checker the form, the account page and the capsule run as a process,
+# so the responder does not link the OpenPGP parser. `scripts/deploy-control.sh`
+# installs the binary from `keygen/`; the path is named because the veil locks to
+# this one entry and cron's PATH is not where a package's binary lives.
+keygen_check = "/usr/local/libexec/keygen-check"

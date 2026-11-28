@@ -275,6 +275,7 @@ impl Fix {
              rates_fetch = \"{}\"\n\
              public_root = \"{}\"\n\
              gpg = \"gpg\"\n\
+             keygen_check = \"{}\"\n\
              proof_dir = \"{}\"\n",
             fix.path("store"),
             fix.path("reserved"),
@@ -299,6 +300,7 @@ impl Fix {
             fix.dir.display(),
             fix.path("bin/curl"),
             fix.path("home/www"),
+            kyriakon_control_core::mail::pgp::keygen_check_program(),
             fix.path("proofs"),
         );
         std::fs::write(fix.path("drain.toml"), cfg).unwrap();
@@ -1318,10 +1320,6 @@ impl Fix {
     /// its printed alerts, its exit status and its pass lock.
     pub fn drain_binary(&self) -> Output {
         std::process::Command::new(drain_binary())
-            .env(
-                "KYRIAKON_KEYGEN_CHECK",
-                kyriakon_control_core::mail::pgp::keygen_check_program(),
-            )
             .arg("--config")
             .arg(self.config())
             .output()
@@ -1340,10 +1338,6 @@ impl Fix {
 
     pub fn ctl(&self, args: &[&str]) -> Output {
         std::process::Command::new(ctl_binary())
-            .env(
-                "KYRIAKON_KEYGEN_CHECK",
-                kyriakon_control_core::mail::pgp::keygen_check_program(),
-            )
             .arg("--config")
             .arg(self.config())
             .args(args)

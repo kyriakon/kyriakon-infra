@@ -27,7 +27,9 @@ pub fn restrict(cfg: &Config, state: &Path, tty: bool) -> Result<(), sandbox::Er
     sandbox::unveil("/dev/log", "w")?;
     // `Stdio::null` opens this when the portal runs `keygen-check` with stderr discarded.
     sandbox::unveil("/dev/null", "rw")?;
-    sandbox::unveil_keygen_check()?;
+    // The key checker, named before the list is locked so the spawn and the
+    // entry are one path.
+    sandbox::unveil_keygen_check(&cfg.keygen_check)?;
     sandbox::lock()?;
     sandbox::probe(&cfg.catalogue)?;
     sandbox::probe(&cfg.reserved)?;

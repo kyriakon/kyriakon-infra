@@ -21,6 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,10 +40,6 @@ const SIGNED_END: &str = "-----END PGP SIGNATURE-----";
 /// How long one gpg run may take. A key or a message is small; a run that hangs
 /// must not hold the single-flight drain open forever.
 const GPG_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Production releases do not consult the environment for an executable.
-#[cfg(not(any(test, feature = "test-fixtures")))]
-const KEYGEN_CHECK: &str = "/usr/local/libexec/keygen-check";
 
 /// The helper parses one key and exits. A parser that hangs on one key must not
 /// hold the request open.
@@ -472,21 +469,54 @@ fn run_keygen_check(
     })
 }
 
-/// The executable the sandbox unveils and the key check starts.
+/// The helper this process was configured with. A service has one config and so
+/// one helper; the same string is unveiled and spawned.
+static PROGRAM: OnceLock<String> = OnceLock::new();
+
+/// Latch one helper path into `cell`. A bare program name is refused: it is a
+/// relative path to `unveil(2)` but a name `Command::new` searches for, so the
+/// two can name different files. The same path is idempotent; a different one
+/// after the first is a configuration that contradicts itself, and a refused
+/// path never occupies the cell.
+fn claim(cell: &OnceLock<String>, path: &str) -> Result<(), Error> {
+    if !Path::new(path).is_absolute() {
+        return Err(Error::KeyCheckPathNotAbsolute {
+            path: path.to_string(),
+        });
+    }
+    match cell.get_or_init(|| path.to_string()).as_str() {
+        first if first == path => Ok(()),
+        first => Err(Error::KeyCheckPathChanged {
+            first: first.to_string(),
+            path: path.to_string(),
+        }),
+    }
+}
+
+/// Name the helper for this process. Called from the binary's sandbox setup,
+/// before the veil is locked, so the path the veil admits and the path a spawn
+/// runs cannot disagree. A second call with the same path is accepted; a
+/// different one is an error rather than a silent disagreement.
+pub fn configure_keygen_check(path: &str) -> Result<(), Error> {
+    claim(&PROGRAM, path)
+}
+
+/// The executable the sandbox unveils and the key check starts. A configured
+/// path wins in every build, so the unveil and the spawn read one string; a
+/// test build without one names the helper it built; a service without one
+/// falls back to the deployed path for a caller that never ran a sandbox (the
+/// console's unit tests).
 pub fn keygen_check_program() -> String {
+    if let Some(path) = PROGRAM.get() {
+        return path.clone();
+    }
     #[cfg(any(test, feature = "test-fixtures"))]
     {
         keygen_check_test_binary().to_string_lossy().into_owned()
     }
     #[cfg(not(any(test, feature = "test-fixtures")))]
     {
-        #[cfg(debug_assertions)]
-        if let Ok(program) = std::env::var("KYRIAKON_KEYGEN_CHECK") {
-            if !program.is_empty() {
-                return program;
-            }
-        }
-        KEYGEN_CHECK.to_owned()
+        crate::config::KEYGEN_CHECK.to_string()
     }
 }
 
@@ -1239,6 +1269,37 @@ mod tests {
     }
 
     #[test]
+    fn claim_latches_one_absolute_path_and_never_a_refused_one() {
+        let cell: OnceLock<String> = OnceLock::new();
+        assert!(matches!(
+            claim(&cell, "keygen-check"),
+            Err(Error::KeyCheckPathNotAbsolute { path }) if path == "keygen-check"
+        ));
+        assert!(matches!(
+            claim(&cell, ""),
+            Err(Error::KeyCheckPathNotAbsolute { path }) if path.is_empty()
+        ));
+        // Neither refusal may occupy the cell: the first real path still wins.
+        assert!(cell.get().is_none());
+        assert!(claim(&cell, "/usr/local/libexec/keygen-check").is_ok());
+        assert_eq!(
+            cell.get().map(String::as_str),
+            Some("/usr/local/libexec/keygen-check")
+        );
+        assert!(claim(&cell, "/usr/local/libexec/keygen-check").is_ok());
+        assert!(matches!(
+            claim(&cell, "/other/keygen-check"),
+            Err(Error::KeyCheckPathChanged { first, path })
+                if first == "/usr/local/libexec/keygen-check"
+                    && path == "/other/keygen-check"
+        ));
+        assert_eq!(
+            cell.get().map(String::as_str),
+            Some("/usr/local/libexec/keygen-check")
+        );
+    }
+
+    #[test]
     fn keygen_protocol_rejects_truncated_blank_and_trailing_output() {
         assert!(matches!(
             parse_keygen_output("check", b"ok"),
@@ -1380,8 +1441,15 @@ mod tests {
         let path = home.path().join("check");
         std::fs::write(&path, "#!/bin/sh\nexit 3\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let failed = public_key_with(path.display().to_string(), CLEAN, 0, Duration::from_secs(2))
-            .expect("a helper that exits non-zero is not a framing refusal");
+        let failed = public_key_with(
+            path.display().to_string(),
+            CLEAN,
+            0,
+            // The service deadline, so a loaded machine cannot turn a fast exit
+            // into the timeout this test is not about.
+            KEYGEN_TIMEOUT,
+        )
+        .expect("a helper that exits non-zero is not a framing refusal");
         assert!(!failed.inspected);
         assert!(failed.refusal().is_none());
         assert!(

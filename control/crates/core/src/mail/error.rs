@@ -89,6 +89,10 @@ pub enum Error {
     KeygenCheckExited { program: String, status: ExitStatus },
     /// keygen-check printed something that is not the check protocol.
     KeygenCheckProtocol { program: String },
+    /// The configured key checker is not an absolute path.
+    KeyCheckPathNotAbsolute { path: String },
+    /// The key checker was configured twice with different paths.
+    KeyCheckPathChanged { first: String, path: String },
 
     // ---- armour framing ----
     /// The material is not framed as an armoured public key block.
@@ -287,6 +291,13 @@ impl fmt::Display for Error {
             Error::KeygenCheckProtocol { program } => {
                 write!(f, "{program} did not print a check verdict")
             }
+            Error::KeyCheckPathNotAbsolute { path } => {
+                write!(f, "the key checker path {path:?} is not absolute")
+            }
+            Error::KeyCheckPathChanged { first, path } => write!(
+                f,
+                "the key checker is already {first:?}, so it cannot be reconfigured as {path:?}"
+            ),
             Error::NotArmoured => f.write_str("this is not an armoured PGP public key block"),
             Error::MultipleArmourBlocks => {
                 f.write_str("the material is more than one armoured key block; submit one key")

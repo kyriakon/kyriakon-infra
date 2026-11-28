@@ -61,8 +61,9 @@ drain_bin=${KYRIAKON_DRAIN_BIN:-$repo/control/target/release/kyriakon-control-dr
 admin_bin=${KYRIAKON_ADMIN_BIN:-$repo/control/target/release/kyriakon-admin}
 keygen_check=${KYRIAKON_KEYGEN_CHECK:-/usr/local/libexec/keygen-check}
 case $keygen_check in /*) ;; *) keygen_check=$PWD/$keygen_check ;; esac
-# The drain resolves the helper at startup; give it the path this script checked.
-export KYRIAKON_KEYGEN_CHECK=$keygen_check
+# The drain reads the helper from its config and unveils that path, so the
+# generated config names the binary this script checked rather than relying on
+# an environment variable a release build does not consult.
 config_src=$repo/openbsd/etc/onboard/drain.toml
 key_src=$repo/keygen/fixtures/generated-clean.asc
 refused_key=$repo/keygen/fixtures/gpg-no-encryption-subkey.asc
@@ -201,6 +202,7 @@ config_for() {
 		-e "s|^rates = .*|rates = \"$tree/store/rates/xmr-gbp.json\"|" \
 		-e "s|^rates_fetch = .*|rates_fetch = \"$tree/bin/curl\"|" \
 		-e "s|^gpg = .*|gpg = \"$tree/bin/gpg\"|" \
+		-e "s|^keygen_check = .*|keygen_check = \"$keygen_check\"|" \
 		-e "s|^proof_dir = .*|proof_dir = \"$tree/logins\"|" \
 		-e "s|^public_root = .*|public_root = \"$tree/home/www\"|" \
 		-e "s|^ipv4 = .*|ipv4 = \"192.0.2.10\"|" \
@@ -477,6 +479,8 @@ self_test() {
 		"$(printf '%s\n' "$conf" | grep -cF "approval_key = \"$tree/key\"")" 1
 	check "the config names the fixture's rate client" \
 		"$(printf '%s\n' "$conf" | grep -cF "rates_fetch = \"$tree/bin/curl\"")" 1
+	check "the config names the key checker this script checked" \
+		"$(printf '%s\n' "$conf" | grep -cF "keygen_check = \"$keygen_check\"")" 1
 
 	# A broken fixture must fail the check rather than the run.
 	rm "$tree/bin/sendmail"

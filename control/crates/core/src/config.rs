@@ -55,6 +55,11 @@ pub const HOST: &str = "signup.kyriakon.net";
 /// creates it.
 pub const PROOF_DIR: &str = "/var/db/kyriakon/logins";
 
+/// The key checker's deployed path, named once so the handler, the drain and
+/// the terminal cannot be pointed at three different helpers by a drifting
+/// default. `scripts/deploy-control.sh` installs it there.
+pub const KEYGEN_CHECK: &str = "/usr/local/libexec/keygen-check";
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -147,6 +152,14 @@ pub struct Config {
     /// itself. A value so a test points it at a temporary directory.
     #[serde(default = "proof_dir")]
     pub proof_dir: String,
+    /// The key checker: `keygen-check`, a separate build root the responder
+    /// runs as a process so it does not link the OpenPGP crate. Named here like
+    /// `gpg` in the drain's config, because the veil and cron's PATH are not
+    /// where a package's binary lives, and the OpenBSD verifier points it at
+    /// the build under test. Absent from a config written before it existed,
+    /// which reads the deployed path.
+    #[serde(default = "keygen_check")]
+    pub keygen_check: String,
 }
 
 impl Config {
@@ -167,6 +180,11 @@ impl Config {
 /// at different ones by a default that drifts.
 fn proof_dir() -> String {
     PROOF_DIR.to_string()
+}
+
+/// The deployed helper, for a config written before the value existed.
+fn keygen_check() -> String {
+    KEYGEN_CHECK.to_string()
 }
 
 /// The drain's own configuration, read once per run from
@@ -347,6 +365,13 @@ pub struct DrainConfig {
     /// runs, named here because cron's PATH is not where a package's binary
     /// lives and a test needs to point at it rather than inherit one.
     pub gpg: String,
+    /// The key checker: `keygen-check`, a separate build root run as a process
+    /// so this half does not link the OpenPGP crate. Named here like `gpg`,
+    /// because the veil and cron's PATH are not where a package's binary lives,
+    /// and the OpenBSD verifier points it at the build under test. Absent from
+    /// a config written before it existed, which reads the deployed path.
+    #[serde(default = "keygen_check")]
+    pub keygen_check: String,
     /// Where the members' public trees live: `/home/www` on the box, where
     /// `scripts/provision-member.sh` builds `<username>.kyriakon.net`. The
     /// export writes its bundle under that chroot, so the destination is a
@@ -379,7 +404,7 @@ impl DrainConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, DrainConfig, Error};
+    use super::{Config, DrainConfig, Error, KEYGEN_CHECK};
 
     #[test]
     fn parses_the_shipped_shape() {
@@ -414,6 +439,8 @@ mod tests {
         assert_eq!(c.gemini_socket, "/home/www/run/onboard/onboard.sock");
         assert_eq!(c.portal_socket, "/home/www/run/onboard-portal/portal.sock");
         assert_eq!(c.titan_listener, "127.0.0.1:7081");
+        // A config written before the value existed reads the deployed path.
+        assert_eq!(c.keygen_check, KEYGEN_CHECK);
     }
 
     /// The handler config the deploy installs, not a fixture that can agree with a
@@ -431,6 +458,7 @@ mod tests {
         );
         assert_eq!(handler.titan_listener, "127.0.0.1:7081");
         assert_eq!(handler.pages, "/var/db/onboard/pages");
+        assert_eq!(handler.keygen_check, KEYGEN_CHECK);
     }
 
     #[test]
@@ -511,6 +539,7 @@ mod tests {
              rates_fetch = \"/usr/local/bin/curl\"\n\
              gpg = \"/usr/local/bin/gpg\"\n";
         let c: DrainConfig = toml::from_str(text).unwrap();
+        assert_eq!(c.keygen_check, KEYGEN_CHECK);
         assert_eq!(c.price_gbp, "20.00");
         assert_eq!(c.group_price_gbp, "40.00");
         assert_eq!(c.scripts, "/root/bin");
@@ -528,6 +557,7 @@ mod tests {
     fn the_shipped_drain_config_parses() {
         let c: DrainConfig =
             toml::from_str(include_str!("../../../../openbsd/etc/onboard/drain.toml")).unwrap();
+        assert_eq!(c.keygen_check, KEYGEN_CHECK);
         assert_eq!(c.store_root, "/var/db/onboard");
         assert_eq!(c.reserved, "/var/db/onboard/reserved-usernames.txt");
         assert_eq!(c.scripts, "/usr/local/libexec/kyriakon/scripts");

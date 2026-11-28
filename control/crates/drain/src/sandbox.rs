@@ -51,6 +51,10 @@ pub enum Error {
     Pledge {
         source: kyriakon_control_core::sandbox::Error,
     },
+    /// The key checker's config cannot be the one this process runs.
+    KeyCheck {
+        source: kyriakon_control_core::sandbox::Error,
+    },
     /// A configured path has no directory to unveil.
     NoParent { path: String },
     /// The temp directory is not UTF-8.
@@ -63,7 +67,8 @@ impl fmt::Display for Error {
             Error::Unveil { source }
             | Error::Lock { source }
             | Error::Probe { source }
-            | Error::Pledge { source } => source.fmt(f),
+            | Error::Pledge { source }
+            | Error::KeyCheck { source } => source.fmt(f),
             Error::NoParent { path } => write!(f, "{path} has no directory to unveil"),
             Error::TempDirNotUtf8 => f.write_str("the temp directory is not UTF-8"),
         }
@@ -76,7 +81,8 @@ impl std::error::Error for Error {
             Error::Unveil { source }
             | Error::Lock { source }
             | Error::Probe { source }
-            | Error::Pledge { source } => Some(source),
+            | Error::Pledge { source }
+            | Error::KeyCheck { source } => Some(source),
             Error::NoParent { .. } | Error::TempDirNotUtf8 => None,
         }
     }
@@ -142,7 +148,10 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
     unveil(&cfg.sendmail, "x")?;
     // The OpenPGP binary `mail::pgp` runs for a key check or a signature.
     unveil(&cfg.gpg, "x")?;
-    sandbox::unveil_keygen_check().map_err(|source| Error::Unveil { source })?;
+    // The key checker, a separate build root run as a process so this half does
+    // not link the parser. The call names the spawn and unveils the same path.
+    sandbox::unveil_keygen_check(&cfg.keygen_check)
+        .map_err(|source| Transitions::from(Error::KeyCheck { source }))?;
     // The resolver `check_group_dns` runs, which needs no entry of its own for
     // `/etc/resolv.conf`: it is a different process after `execve`.
     unveil(&cfg.resolver, "x")?;
@@ -219,9 +228,12 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
 }
 
 /// The no-op for a workstation: the acceptance suite runs the real binaries on
-/// Linux and macOS, where neither system call exists.
+/// Linux and macOS, where neither system call exists. The helper is still named,
+/// because the suite runs `keygen-check` as a process here too.
 #[cfg(not(target_os = "openbsd"))]
-pub fn restrict(_cfg: &DrainConfig) -> Result<(), Transitions> {
+pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
+    kyriakon_control_core::sandbox::unveil_keygen_check(&cfg.keygen_check)
+        .map_err(|source| Transitions::from(Error::KeyCheck { source }))?;
     Ok(())
 }
 

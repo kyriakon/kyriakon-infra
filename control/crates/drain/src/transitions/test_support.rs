@@ -51,6 +51,7 @@ pub(crate) fn quota_config(dir: &std::path::Path) -> DrainConfig {
         rate_endpoint: "https://rates.example.invalid/simple/price".to_string(),
         rates_fetch: dir.join("bin/curl").to_str().unwrap().to_string(),
         gpg: "gpg".to_string(),
+        keygen_check: kyriakon_control_core::config::KEYGEN_CHECK.to_string(),
         proof_dir: dir.join("logins").to_str().unwrap().to_string(),
         public_root: dir.join("home/www").to_str().unwrap().to_string(),
     }

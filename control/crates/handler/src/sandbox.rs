@@ -34,7 +34,10 @@ pub fn restrict(cfg: &Config) -> Result<(), sandbox::Error> {
     sandbox::unveil("/dev/null", "rw")?;
     sandbox::unveil(session::DOAS, "x")?;
     sandbox::unveil(session::AUTHCHECK, "x")?;
-    sandbox::unveil_keygen_check()?;
+    // The key checker every key answer runs as a process. Execute only: it
+    // opens no path of ours. The call also names the spawn, so the entry and
+    // the child are one path.
+    sandbox::unveil_keygen_check(&cfg.keygen_check)?;
     sandbox::lock()?;
     sandbox::probe(&cfg.store_root)?;
     sandbox::probe("/dev/urandom")?;
