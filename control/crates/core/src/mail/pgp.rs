@@ -48,6 +48,12 @@ const KEYGEN_CHECK: &str = "/usr/local/libexec/keygen-check";
 /// hold the request open.
 const KEYGEN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Matches `keygen-check`'s stdin cap so oversized material fails without a spawn.
+const MAX_KEYGEN_INPUT: usize = 1 << 20;
+
+/// Real verdicts are a few hundred bytes; bound stdout against a runaway helper.
+const MAX_KEYGEN_OUTPUT: usize = 64 * 1024;
+
 #[derive(Debug)]
 pub struct Checked {
     /// "works" when the shared check finds nothing, or its findings joined with
@@ -342,12 +348,17 @@ fn run_keygen_check(
     now: u64,
     timeout: Duration,
 ) -> Result<KeygenVerdict, Error> {
+    if material.len() > MAX_KEYGEN_INPUT {
+        return Err(Error::KeygenCheckProtocol { program });
+    }
     let deadline = Instant::now() + timeout;
     let mut child = std::process::Command::new(&program)
+        .env_clear()
         .arg("--now-secs")
         .arg(now.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|source| Error::RunKeygenCheck {
             program: program.clone(),
@@ -355,7 +366,7 @@ fn run_keygen_check(
         })?;
 
     let mut stdin = child.stdin.take().expect("piped stdin");
-    let mut stdout = child.stdout.take().expect("piped stdout");
+    let stdout = child.stdout.take().expect("piped stdout");
     let expired = || Error::KeygenCheckTimedOut {
         program: program.clone(),
         seconds: timeout.as_secs(),
@@ -367,7 +378,10 @@ fn run_keygen_check(
             let written = stdin.write_all(material.as_bytes());
             drop(stdin);
             let mut output = Vec::new();
-            let read = stdout.read_to_end(&mut output).map(|_| output);
+            let read = stdout
+                .take(MAX_KEYGEN_OUTPUT as u64 + 1)
+                .read_to_end(&mut output)
+                .map(|_| output);
             let _ = send.send((written, read));
         });
         let result = (|| {
@@ -379,6 +393,11 @@ fn run_keygen_check(
                         program: program.clone(),
                     },
                 })?;
+            if matches!(&read, Ok(output) if output.len() > MAX_KEYGEN_OUTPUT) {
+                return Err(Error::KeygenCheckProtocol {
+                    program: program.clone(),
+                });
+            }
             // EOF can precede exit. Only this thread may signal or reap the child.
             loop {
                 if let Some(status) = child.try_wait().map_err(|source| Error::WaitKeygenCheck {
@@ -428,7 +447,9 @@ pub fn keygen_check_program() -> String {
     {
         #[cfg(debug_assertions)]
         if let Ok(program) = std::env::var("KYRIAKON_KEYGEN_CHECK") {
-            return program;
+            if !program.is_empty() {
+                return program;
+            }
         }
         KEYGEN_CHECK.to_owned()
     }
@@ -436,21 +457,27 @@ pub fn keygen_check_program() -> String {
 
 /// The check protocol: `ok` and one finding per line, or `uninspected`.
 fn parse_keygen_output(program: &str, stdout: &[u8]) -> Result<KeygenVerdict, Error> {
-    let text = std::str::from_utf8(stdout).map_err(|_| Error::KeygenCheckProtocol {
+    let protocol = || Error::KeygenCheckProtocol {
         program: program.to_string(),
-    })?;
-    let mut lines = text.lines();
+    };
+    let text = std::str::from_utf8(stdout).map_err(|_| protocol())?;
+    let Some(body) = text.strip_suffix('\n') else {
+        return Err(protocol());
+    };
+    let mut lines = body.split('\n');
     match lines.next() {
-        Some("ok") => Ok(KeygenVerdict::Parsed(
-            lines
-                .filter(|line| !line.is_empty())
-                .map(str::to_string)
-                .collect(),
-        )),
-        Some("uninspected") => Ok(KeygenVerdict::Uninspected),
-        _ => Err(Error::KeygenCheckProtocol {
-            program: program.to_string(),
-        }),
+        Some("ok") => {
+            let mut findings = Vec::new();
+            for line in lines {
+                if line.is_empty() {
+                    return Err(protocol());
+                }
+                findings.push(line.to_string());
+            }
+            Ok(KeygenVerdict::Parsed(findings))
+        }
+        Some("uninspected") if lines.next().is_none() => Ok(KeygenVerdict::Uninspected),
+        _ => Err(protocol()),
     }
 }
 
@@ -460,7 +487,7 @@ fn keygen_check_test_binary() -> &'static Path {
     use std::sync::LazyLock;
 
     static PATH: LazyLock<PathBuf> = LazyLock::new(|| {
-        if let Some(program) = std::env::var_os("KYRIAKON_KEYGEN_CHECK") {
+        if let Some(program) = std::env::var_os("KYRIAKON_KEYGEN_CHECK").filter(|v| !v.is_empty()) {
             return PathBuf::from(program);
         }
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
@@ -1173,6 +1200,58 @@ mod tests {
         assert!(matches!(
             run_keygen_check(path.display().to_string(), "", 0, Duration::from_millis(50)),
             Err(Error::KeygenCheckTimedOut { .. })
+        ));
+    }
+
+    #[test]
+    fn keygen_protocol_rejects_truncated_blank_and_trailing_output() {
+        assert!(matches!(
+            parse_keygen_output("check", b"ok"),
+            Err(Error::KeygenCheckProtocol { .. })
+        ));
+        assert!(matches!(
+            parse_keygen_output("check", b"ok\n\n"),
+            Err(Error::KeygenCheckProtocol { .. })
+        ));
+        assert!(matches!(
+            parse_keygen_output("check", b"uninspected\nextra\n"),
+            Err(Error::KeygenCheckProtocol { .. })
+        ));
+        assert!(matches!(
+            parse_keygen_output("check", b"ok\n"),
+            Ok(KeygenVerdict::Parsed(findings)) if findings.is_empty()
+        ));
+        assert!(matches!(
+            parse_keygen_output("check", b"uninspected\n"),
+            Ok(KeygenVerdict::Uninspected)
+        ));
+    }
+
+    #[test]
+    fn keygen_helper_gets_clean_env_and_bounded_stdout() {
+        let home = ScratchHome::new().unwrap();
+        let env_check = home.path().join("env-check");
+        std::fs::write(
+            &env_check,
+            "#!/bin/sh\ncat >/dev/null\nif [ -n \"${HOME:-}\" ]; then echo leak; else echo ok; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&env_check, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            run_keygen_check(env_check.display().to_string(), "", 0, Duration::from_secs(2)),
+            Ok(KeygenVerdict::Parsed(findings)) if findings.is_empty()
+        ));
+
+        let flood = home.path().join("flood");
+        std::fs::write(
+            &flood,
+            "#!/bin/sh\ncat >/dev/null\necho ok\nhead -c 70000 /dev/zero | tr '\\0' x\necho\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&flood, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            run_keygen_check(flood.display().to_string(), "", 0, Duration::from_secs(2)),
+            Err(Error::KeygenCheckProtocol { .. })
         ));
     }
 

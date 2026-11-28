@@ -194,3 +194,134 @@ fn the_newest_signed_declaration_wins_in_either_packet_order() {
         }
     }
 }
+
+#[cfg(feature = "generate")]
+#[test]
+fn same_second_aead_and_direct_zero_expiry_and_rotated_subkey_match_gpg() {
+    use pgp::composed::{Deserializable, SignedSecretKey};
+    use pgp::crypto::hash::HashAlgorithm;
+    use pgp::packet::{Features, SignatureConfig, SignatureType, Subpacket, SubpacketData};
+    use pgp::types::{Duration, KeyDetails, Password, Tag, Timestamp};
+
+    let generated = keygen::generate_key("ed25519", keygen::DEFAULT_USER_ID, None).unwrap();
+    let (secret, _) =
+        SignedSecretKey::from_armor_single(generated.secret_armor.as_bytes()).unwrap();
+    let signer = &secret.primary_key;
+    let password = Password::empty();
+    let start = Timestamp::now().as_secs() + 1;
+    let now = u64::from(start + 10);
+
+    // 1. Same-second UID signatures (one AEAD, one clean) must flag AEAD in either order.
+    let mut cert = secret.to_public_key();
+    for feature in [0x02u8, 0x01u8] {
+        let mut cfg = SignatureConfig::v4(
+            SignatureType::CertPositive,
+            signer.algorithm(),
+            HashAlgorithm::Sha256,
+        );
+        cfg.hashed_subpackets.push(
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(
+                start,
+            )))
+            .unwrap(),
+        );
+        cfg.hashed_subpackets.push(
+            Subpacket::regular(SubpacketData::Features(Features::from(&[feature][..]))).unwrap(),
+        );
+        let user = &mut cert.details.users[0];
+        user.signatures.push(
+            cfg.sign_certification(signer, &cert.primary_key, &password, Tag::UserId, &user.id)
+                .unwrap(),
+        );
+    }
+    for _ in 0..2 {
+        let armor = cert.to_armored_string(Default::default()).unwrap();
+        let findings = check_public_key(&armor, now).unwrap();
+        assert!(
+            findings.iter().any(|f| f.contains("OCB feature bit")),
+            "{findings:?}"
+        );
+        cert.details.users[0].signatures.reverse();
+    }
+
+    // 2. A direct-key signature with explicit lifetime 0 ("never") overrides a UID expiry.
+    let mut cert = secret.to_public_key();
+    let mut uid_cfg = SignatureConfig::v4(
+        SignatureType::CertPositive,
+        signer.algorithm(),
+        HashAlgorithm::Sha256,
+    );
+    uid_cfg.hashed_subpackets.push(
+        Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(
+            start,
+        )))
+        .unwrap(),
+    );
+    uid_cfg.hashed_subpackets.push(
+        Subpacket::regular(SubpacketData::KeyExpirationTime(Duration::from_secs(
+            86_400,
+        )))
+        .unwrap(),
+    );
+    let user = &mut cert.details.users[0];
+    user.signatures.push(
+        uid_cfg
+            .sign_certification(signer, &cert.primary_key, &password, Tag::UserId, &user.id)
+            .unwrap(),
+    );
+    let mut direct_cfg = SignatureConfig::v4(
+        SignatureType::Key,
+        signer.algorithm(),
+        HashAlgorithm::Sha256,
+    );
+    direct_cfg.hashed_subpackets.push(
+        Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(
+            start + 1,
+        )))
+        .unwrap(),
+    );
+    direct_cfg.hashed_subpackets.push(
+        Subpacket::regular(SubpacketData::KeyExpirationTime(Duration::from_secs(0))).unwrap(),
+    );
+    cert.details.direct_signatures.push(
+        direct_cfg
+            .sign_key(signer, &password, &cert.primary_key)
+            .unwrap(),
+    );
+    let armor = cert.to_armored_string(Default::default()).unwrap();
+    let findings = check_public_key(&armor, now).unwrap();
+    assert!(findings.is_empty(), "{findings:?}");
+
+    // 3. A revoked old encryption subkey beside a valid replacement is clean; alone it fails.
+    let mut cert = secret.to_public_key();
+    let replacement = cert.public_subkeys[0].clone();
+    let mut rev_cfg = SignatureConfig::v4(
+        SignatureType::SubkeyRevocation,
+        signer.algorithm(),
+        HashAlgorithm::Sha256,
+    );
+    rev_cfg.hashed_subpackets.push(
+        Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(
+            start,
+        )))
+        .unwrap(),
+    );
+    let rev_sig = rev_cfg
+        .sign_subkey_binding(
+            signer,
+            &cert.primary_key,
+            &password,
+            &cert.public_subkeys[0].key,
+        )
+        .unwrap();
+    cert.public_subkeys[0].signatures.push(rev_sig);
+    let revoked_only = cert.to_armored_string(Default::default()).unwrap();
+    let findings = check_public_key(&revoked_only, now).unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].contains("has been revoked"), "{findings:?}");
+
+    cert.public_subkeys.push(replacement);
+    let rotated = cert.to_armored_string(Default::default()).unwrap();
+    let findings = check_public_key(&rotated, now).unwrap();
+    assert!(findings.is_empty(), "{findings:?}");
+}

@@ -147,6 +147,52 @@ fn encryption_algorithm_usable(key: &pgp::packet::PublicSubkey) -> bool {
     }
 }
 
+fn signature_aead_findings(sig: &Signature) -> Vec<String> {
+    let mut found = Vec::new();
+    let Some(config) = sig.config() else {
+        return found;
+    };
+    for subpacket in config.hashed_subpackets() {
+        match &subpacket.data {
+            SubpacketData::PreferredAeadAlgorithms(list) => {
+                for (cipher, mode) in list.iter() {
+                    found.push(format!("{cipher:?} in {mode:?}"));
+                }
+            }
+            // The subpacket gpg actually writes is type 34, and rpgp 0.20 parses it
+            // as PreferredEncryptionModes rather than as PreferredAeadAlgorithms.
+            // A check that matches only the latter reports a false clean on a real
+            // gpg key, which is the dangerous direction for this warning.
+            SubpacketData::PreferredEncryptionModes(modes) => {
+                for mode in modes.iter() {
+                    found.push(format!("{mode:?} as an AEAD mode"));
+                }
+            }
+            // rPGP exposes SEIPDv2, but LibrePGP OCB (0x02) only via the wire flags.
+            SubpacketData::Features(features) => {
+                if Vec::from(features).first().is_some_and(|b| b & 0x02 != 0) {
+                    found.push("the OCB feature bit in the key's features".into());
+                }
+                if features.seipd_v2() {
+                    found.push("the SEIPD v2 feature bit in the key's features".into());
+                }
+            }
+            SubpacketData::Other(34, _) => {
+                found.push(
+                    "an AEAD ciphersuite subpacket (type 34) this build does not parse".into(),
+                );
+            }
+            SubpacketData::Other(22, _) => {
+                found.push(
+                    "an AEAD algorithms subpacket (type 22) this build does not parse".into(),
+                );
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
 fn current_signature(
     signatures: &[Signature],
     now: u64,
@@ -170,6 +216,7 @@ fn current_signature(
                         s.typ() == Some(SignatureType::CertRevocation),
                         s.typ() == Some(SignatureType::SubkeyBinding)
                             && !binding_allows_encryption(s),
+                        !signature_aead_findings(s).is_empty(),
                         expiry != 0,
                         std::cmp::Reverse(expiry),
                     )
@@ -220,48 +267,7 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
         {
             uid_expiry = uid_expiry.max(Some((sig.created(), std::cmp::Reverse(expiry))));
         }
-        if let Some(config) = sig.config() {
-            for subpacket in config.hashed_subpackets() {
-                match &subpacket.data {
-                    SubpacketData::PreferredAeadAlgorithms(list) => {
-                        for (cipher, mode) in list.iter() {
-                            aead.push(format!("{cipher:?} in {mode:?}"));
-                        }
-                    }
-                    // The subpacket gpg actually writes is type 34, and rpgp 0.20 parses it
-                    // as PreferredEncryptionModes rather than as PreferredAeadAlgorithms.
-                    // A check that matches only the latter reports a false clean on a real
-                    // gpg key, which is the dangerous direction for this warning.
-                    SubpacketData::PreferredEncryptionModes(modes) => {
-                        for mode in modes.iter() {
-                            aead.push(format!("{mode:?} as an AEAD mode"));
-                        }
-                    }
-                    // rPGP exposes SEIPDv2, but LibrePGP OCB (0x02) only via the wire flags.
-                    SubpacketData::Features(features) => {
-                        if Vec::from(features).first().is_some_and(|b| b & 0x02 != 0) {
-                            aead.push("the OCB feature bit in the key's features".into());
-                        }
-                        if features.seipd_v2() {
-                            aead.push("the SEIPD v2 feature bit in the key's features".into());
-                        }
-                    }
-                    SubpacketData::Other(34, _) => {
-                        aead.push(
-                            "an AEAD ciphersuite subpacket (type 34) this build does not parse"
-                                .into(),
-                        );
-                    }
-                    SubpacketData::Other(22, _) => {
-                        aead.push(
-                            "an AEAD algorithms subpacket (type 22) this build does not parse"
-                                .into(),
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        }
+        aead.extend(signature_aead_findings(sig));
     }
 
     if !has_self_signature || (primary.version() == pgp::types::KeyVersion::V6 && direct.is_none())
@@ -302,8 +308,8 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
     let expires_after = direct
         .and_then(Signature::key_expiration_time)
         .map(|d| d.as_secs())
-        .filter(|&d| d != 0)
-        .or_else(|| uid_expiry.map(|(_, expiry)| expiry.0));
+        .or_else(|| uid_expiry.map(|(_, expiry)| expiry.0))
+        .filter(|&d| d != 0);
     if let Some(lifetime) = expires_after {
         let expires_at = u64::from(created) + u64::from(lifetime);
         findings.push(if expires_at <= now_secs {
@@ -325,7 +331,8 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
     // A subkey carries its own expiry and its own revocation, in its binding signature.
     // Reading only the primary key's signatures reports a clean key whose encryption
     // subkey died years ago, which is a false clean in the direction that loses mail.
-    let mut has_encryption_subkey = false;
+    let mut has_live_encryption_subkey = false;
+    let mut revoked_subkeys = Vec::new();
     for sub in &key.public_subkeys {
         let sub_created = sub.key.created_at().as_secs();
         if u64::from(sub_created) > now_secs {
@@ -343,16 +350,14 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
         if !binding_allows_encryption(binding) {
             continue;
         }
-        has_encryption_subkey = true;
-        if sub.signatures.iter().any(|sig| {
+        let revoked = sub.signatures.iter().any(|sig| {
             sig.typ() == Some(SignatureType::SubkeyRevocation)
                 && sig.verify_subkey_binding(primary, &sub.key).is_ok()
-        }) {
-            findings.push(format!(
-                "The encryption subkey {:?} has been revoked, so mail cannot be encrypted to \
-                 it. Make a new key in Thunderbird or with gpg; a revoked subkey cannot receive mail.",
-                sub.key.fingerprint()
-            ));
+        });
+        if revoked {
+            revoked_subkeys.push(sub.key.fingerprint());
+        } else {
+            has_live_encryption_subkey = true;
         }
         if let Some(lifetime) = binding.key_expiration_time().map(|d| d.as_secs())
             && lifetime != 0
@@ -375,13 +380,22 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
         }
     }
 
-    if !has_encryption_subkey {
-        findings.push(
-            "There is no encryption-capable subkey, so mail to this member would be \
-             refused rather than delivered. Make a new key in Thunderbird or with gpg, which makes \
-             an encryption subkey beside the signing one."
-                .into(),
-        );
+    if !has_live_encryption_subkey {
+        if revoked_subkeys.is_empty() {
+            findings.push(
+                "There is no encryption-capable subkey, so mail to this member would be \
+                 refused rather than delivered. Make a new key in Thunderbird or with gpg, which makes \
+                 an encryption subkey beside the signing one."
+                    .into(),
+            );
+        } else {
+            for fingerprint in revoked_subkeys {
+                findings.push(format!(
+                    "The encryption subkey {fingerprint:?} has been revoked, so mail cannot be encrypted to \
+                     it. Make a new key in Thunderbird or with gpg; a revoked subkey cannot receive mail."
+                ));
+            }
+        }
     }
 
     Ok(findings)

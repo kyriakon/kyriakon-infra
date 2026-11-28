@@ -445,6 +445,8 @@ PERL
 		SERVER_NAME=signup.kyriakon.net CONTENT_TYPE=application/x-www-form-urlencoded \
 		HTTP_ORIGIN=https://signup.kyriakon.net "HTTP_COOKIE=$cookie" \
 		> "$tree/logs/key-reply" || fail "the key replacement request failed"
+	alive "$hpid" ||
+		fail "the handler died on the mail-key replacement request"
 	grep -aq 'no encryption-capable subkey' "$tree/logs/key-reply" ||
 		fail "the handler did not inspect the signing-only key"
 

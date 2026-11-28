@@ -50,7 +50,10 @@ $("chk").addEventListener("click", () => {
   out.innerHTML = "";
   const result = window.__keygen.check($("armor").value);
   if (!result.ok && result.error) {
-    out.innerHTML = `<li class="bad">${result.error}</li>`;
+    const li = document.createElement("li");
+    li.className = "bad";
+    li.textContent = result.error;
+    out.append(li);
     return;
   }
   if (result.findings.length === 0) {

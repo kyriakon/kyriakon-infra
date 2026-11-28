@@ -16,7 +16,7 @@
 //! The clock is an argument rather than read here, matching the library and
 //! keeping the verdict on the caller's clock.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,7 +25,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_INPUT: usize = 1 << 20;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: keygen-check [--now-secs <seconds>]");
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "usage: keygen-check [--now-secs <seconds>]"
+    );
     ExitCode::from(2)
 }
 
@@ -40,23 +43,38 @@ fn main() -> ExitCode {
     #[cfg(target_os = "openbsd")]
     // SAFETY: the promise list is NUL-terminated; there are no exec promises.
     if unsafe { libc::pledge(c"stdio".as_ptr(), std::ptr::null()) } == -1 {
-        eprintln!("keygen-check: pledge: {}", std::io::Error::last_os_error());
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "keygen-check: pledge: {}",
+            std::io::Error::last_os_error()
+        );
         return ExitCode::from(2);
     }
     let mut now = system_now();
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--now-secs" => match args.next().and_then(|v| v.parse().ok()) {
+        let Some(arg) = arg.to_str() else {
+            return usage();
+        };
+        match arg {
+            "--now-secs" => match args.next().and_then(|v| v.to_str()?.parse().ok()) {
                 Some(seconds) => now = seconds,
                 None => return usage(),
             },
             "--help" | "-h" => {
-                println!("usage: keygen-check [--now-secs <seconds>]");
+                let mut out = std::io::stdout().lock();
+                if writeln!(out, "usage: keygen-check [--now-secs <seconds>]").is_err()
+                    || out.flush().is_err()
+                {
+                    return ExitCode::from(2);
+                }
                 return ExitCode::SUCCESS;
             }
             other => {
-                eprintln!("keygen-check: unknown argument {other}");
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "keygen-check: unknown argument {other}"
+                );
                 return usage();
             }
         }
@@ -69,26 +87,35 @@ fn main() -> ExitCode {
         .take(MAX_INPUT as u64 + 1)
         .read_to_end(&mut input)
     {
-        eprintln!("keygen-check: cannot read stdin: {e}");
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "keygen-check: cannot read stdin: {e}"
+        );
         return ExitCode::from(2);
     }
     if input.len() > MAX_INPUT {
-        eprintln!("keygen-check: input is larger than {MAX_INPUT} bytes");
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "keygen-check: input is larger than {MAX_INPUT} bytes"
+        );
         return ExitCode::from(2);
     }
 
-    let Ok(text) = std::str::from_utf8(&input) else {
-        println!("uninspected");
-        return ExitCode::SUCCESS;
+    let mut out = std::io::stdout().lock();
+    let write_result = match std::str::from_utf8(&input) {
+        Err(_) => writeln!(out, "uninspected"),
+        Ok(text) => match keygen::check_public_key(text, now) {
+            Ok(findings) => writeln!(out, "ok").and_then(|()| {
+                for finding in findings {
+                    writeln!(out, "{finding}")?;
+                }
+                Ok(())
+            }),
+            Err(_) => writeln!(out, "uninspected"),
+        },
     };
-    match keygen::check_public_key(text, now) {
-        Ok(findings) => {
-            println!("ok");
-            for finding in findings {
-                println!("{finding}");
-            }
-        }
-        Err(_) => println!("uninspected"),
+    if write_result.is_err() || out.flush().is_err() {
+        return ExitCode::from(2);
     }
     ExitCode::SUCCESS
 }
