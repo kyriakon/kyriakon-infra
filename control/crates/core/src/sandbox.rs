@@ -107,6 +107,16 @@ pub fn unveil(_path: &str, _permissions: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Name the helper this process spawns, and unveil the same path. The spawn and
+/// the veil entry must be one string, so this is the only place either is set.
+/// A missing final basename is admitted by name on OpenBSD, which keeps the
+/// merge-to-deploy window working; a missing parent is a broken install and
+/// fails here rather than every check becoming the uninspected advisory.
+pub fn unveil_keygen_check(path: &str) -> Result<(), Error> {
+    crate::mail::pgp::configure_keygen_check(path);
+    unveil(path, "x")
+}
+
 /// Lock the list: after this no later unveil can widen the view and a path not
 /// named is invisible. Strongly recommended by `unveil(2)`.
 #[cfg(target_os = "openbsd")]

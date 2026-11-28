@@ -1320,10 +1320,6 @@ impl Fix {
     /// its printed alerts, its exit status and its pass lock.
     pub fn drain_binary(&self) -> Output {
         std::process::Command::new(drain_binary())
-            .env(
-                "KYRIAKON_KEYGEN_CHECK",
-                kyriakon_control_core::mail::pgp::keygen_check_program(),
-            )
             .arg("--config")
             .arg(self.config())
             .output()
@@ -1342,10 +1338,6 @@ impl Fix {
 
     pub fn ctl(&self, args: &[&str]) -> Output {
         std::process::Command::new(ctl_binary())
-            .env(
-                "KYRIAKON_KEYGEN_CHECK",
-                kyriakon_control_core::mail::pgp::keygen_check_program(),
-            )
             .arg("--config")
             .arg(self.config())
             .args(args)

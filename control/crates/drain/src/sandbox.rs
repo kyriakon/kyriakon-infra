@@ -143,11 +143,9 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
     // The OpenPGP binary `mail::pgp` runs for a key check or a signature.
     unveil(&cfg.gpg, "x")?;
     // The key checker, a separate build root run as a process so this half does
-    // not link the parser. Its spawn path and this unveiled path are one string,
-    // named before the list is locked; a configured parent directory that is
-    // missing fails startup rather than every check falling back to advisory.
-    kyriakon_control_core::mail::pgp::configure_keygen_check(&cfg.keygen_check);
-    unveil(&cfg.keygen_check, "x")?;
+    // not link the parser. The call names the spawn and unveils the same path.
+    sandbox::unveil_keygen_check(&cfg.keygen_check)
+        .map_err(|source| Transitions::from(Error::Unveil { source }))?;
     // The resolver `check_group_dns` runs, which needs no entry of its own for
     // `/etc/resolv.conf`: it is a different process after `execve`.
     unveil(&cfg.resolver, "x")?;
@@ -224,9 +222,11 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
 }
 
 /// The no-op for a workstation: the acceptance suite runs the real binaries on
-/// Linux and macOS, where neither system call exists.
+/// Linux and macOS, where neither system call exists. The helper is still named,
+/// because the suite runs `keygen-check` as a process here too.
 #[cfg(not(target_os = "openbsd"))]
-pub fn restrict(_cfg: &DrainConfig) -> Result<(), Transitions> {
+pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
+    kyriakon_control_core::mail::pgp::configure_keygen_check(&cfg.keygen_check);
     Ok(())
 }
 
