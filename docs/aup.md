@@ -57,7 +57,7 @@ This section states the operator's own views on current and proposed British and
 
 ### Our view of current speech restrictions
 
-We hold that current British and Scottish restrictions on speech infringe freedom of speech and the law of God. We comply with them only because the law requires it, and we read every such restriction as narrowly as it can honestly be read. Of the two jurisdictions, Scottish law reaches furthest into religious expression, and it is where the next expansion has been proposed: the Scottish stirring-up offence covers more characteristics than the English one, and the conversion-practices consultation discussed below is a Scottish proposal.
+We hold that current British and Scottish restrictions on speech infringe upon the law of God. We comply with them only because the law requires it, and we read every such restriction as narrowly as it can honestly be read. Of the two jurisdictions, Scottish law reaches furthest into religious expression, and it is where the next expansion has been proposed: the Scottish stirring-up offence covers more characteristics than the English one, and the conversion-practices consultation discussed below is a Scottish proposal.
 
 ### How we read the offences that bear on published speech
 
