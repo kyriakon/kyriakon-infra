@@ -41,7 +41,9 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use kyriakon_control_core::{config, flow::catalogue, flow::questions, flow::validate, ipc};
+use kyriakon_control_core::{
+    config, flow::catalogue, flow::questions, flow::validate, ipc, mail::pgp,
+};
 use kyriakon_control_tui as tui;
 use kyriakon_control_tui::Error;
 use kyriakon_control_tui::{sandbox, Departure, Filing, Input, Key, Mode, Word};
@@ -231,6 +233,31 @@ impl Filing for HandlerFile {
         self.filed = true;
         authlog("application filed");
         Ok(token)
+    }
+
+    /// The check runs in the handler, which already holds the exec promise and
+    /// the helper's unveil. A socket the handler does not answer is the
+    /// advisory, so the application still files (ADR 0008).
+    fn check(&mut self, material: &str) -> Option<pgp::Checked> {
+        let answer = ipc::check(Path::new(&self.socket), self.address.as_deref(), material).ok()?;
+        let (verdict, inspected) = match answer {
+            ipc::CheckAnswer::Clean => ("works".to_string(), true),
+            ipc::CheckAnswer::Refused(text) => (text, true),
+            ipc::CheckAnswer::Advisory(text) => (text, false),
+        };
+        // The one block the page asked for, so the record's fingerprint names
+        // exactly the material it stores.
+        let block = pgp::blocks(material)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| material.trim().to_string());
+        let fingerprint = pgp::fingerprint(&block).unwrap_or_default();
+        Some(pgp::Checked::reported(
+            block,
+            fingerprint,
+            verdict,
+            inspected,
+        ))
     }
 }
 

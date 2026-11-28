@@ -25,15 +25,15 @@ pub fn restrict(cfg: &Config, state: &Path, tty: bool) -> Result<(), sandbox::Er
     // `authlog` writes AUTH events through syslog, and syslog connects to this
     // socket. It is a write-only entry, so it is not probed.
     sandbox::unveil("/dev/log", "w")?;
-    // `Stdio::null` opens this when the portal runs `keygen-check` with stderr discarded.
-    sandbox::unveil("/dev/null", "rw")?;
-    sandbox::unveil_keygen_check()?;
     sandbox::lock()?;
     sandbox::probe(&cfg.catalogue)?;
     sandbox::probe(&cfg.reserved)?;
+    // No `proc` and no `exec`: the key check runs in the handler, over the
+    // portal socket this list already names. The terminal holds no program it
+    // may start, and its stderr is the applicant's own terminal.
     sandbox::pledge(if tty {
-        "stdio rpath wpath cpath flock unix proc exec tty"
+        "stdio rpath wpath cpath flock unix tty"
     } else {
-        "stdio rpath wpath cpath flock unix proc exec"
+        "stdio rpath wpath cpath flock unix"
     })
 }

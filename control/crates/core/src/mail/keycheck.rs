@@ -100,6 +100,13 @@ impl Inspected {
             Inspected::NotArmoured(_) => None,
         }
     }
+
+    /// A block a caller could not frame at all. The framing and count rules are
+    /// local and cheap, so a front-end that sends one block to a peer still
+    /// refuses an answer with none.
+    pub fn not_armoured() -> Inspected {
+        Inspected::NotArmoured(Error::NotArmoured)
+    }
 }
 
 /// Split a key answer into its blocks and inspect each once. One helper spawn
@@ -112,6 +119,19 @@ pub fn inspect(value: &str) -> Vec<Inspected> {
             Err(source) => Inspected::NotArmoured(source),
         })
         .collect()
+}
+
+/// Split a key answer into its blocks and inspect each once, awaited. One helper
+/// spawn per block, and no Tokio worker held across a helper's run.
+pub async fn inspect_async(value: &str) -> Vec<Inspected> {
+    let mut inspected = Vec::new();
+    for block in pgp::blocks(value) {
+        inspected.push(match pgp::public_key_async(&block).await {
+            Ok(checked) => Inspected::Checked(checked),
+            Err(source) => Inspected::NotArmoured(source),
+        });
+    }
+    inspected
 }
 
 /// The record for one inspected mail key, with the fingerprint and verdict the

@@ -9,9 +9,11 @@
 //! The protocol is a request line and a reply line, both bounded. A status read
 //! carries no answer. A filed application adds one line of JSON between them,
 //! because a key does not fit a line the way a token and a stage do, and that
-//! line is the answers. Either request carries no address but the one the portal
-//! took from `SSH_CONNECTION`, which the handler uses as the counter key and logs
-//! as the front-ends' own log line already does.
+//! line is the answers. A key check adds one JSON line too: the terminal holds
+//! no exec promise, so the handler runs the helper and the reply is the verdict
+//! it reached. Either request carries no address but the one the portal took
+//! from `SSH_CONNECTION`, which the handler uses as the counter key and logs as
+//! the front-ends' own log line already does.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -29,6 +31,8 @@ pub enum Error {
     NoAnswer { line: String },
     /// A file reply line is neither `OK` nor `ERR`.
     NoFileAnswer { line: String },
+    /// A key-check reply is none of `OK`, `REFUSED` or `WARN`.
+    NoCheckAnswer { line: String },
     /// The handler refused the application in its own words.
     HandlerRefusal { message: String },
     /// The socket could not be reached.
@@ -57,6 +61,10 @@ pub enum Error {
     ApplicationTooLarge { length: usize, max: usize },
     /// The file request could not be written.
     FileApplication { source: io::Error },
+    /// The key check could not be sent.
+    CheckKey { source: io::Error },
+    /// The key answer is over the protocol's bound.
+    KeyTooLarge { length: usize, max: usize },
 }
 
 impl fmt::Display for Error {
@@ -67,6 +75,9 @@ impl fmt::Display for Error {
             }
             Error::NoFileAnswer { line } => {
                 write!(f, "the file service sent no answer: {line:?}")
+            }
+            Error::NoCheckAnswer { line } => {
+                write!(f, "the key service sent no answer: {line:?}")
             }
             Error::HandlerRefusal { message } => f.write_str(message),
             Error::Connect { what, path, source } => {
@@ -94,6 +105,11 @@ impl fmt::Display for Error {
             Error::FileApplication { source } => {
                 write!(f, "cannot file the application: {source}")
             }
+            Error::CheckKey { source } => write!(f, "cannot check the key: {source}"),
+            Error::KeyTooLarge { length, max } => write!(
+                f,
+                "the key answer is too large to check ({length} bytes, the limit is {max})"
+            ),
         }
     }
 }
@@ -106,6 +122,7 @@ impl std::error::Error for Error {
             | Error::ReadAnswer { source, .. }
             | Error::Ask { source }
             | Error::FileApplication { source } => Some(source),
+            Error::CheckKey { source } => Some(source),
             Error::EncodeApplication { source } => Some(source),
             _ => None,
         }
@@ -212,6 +229,54 @@ pub fn parse_file_answer(line: &str) -> Result<String, Error> {
         })
     } else {
         Err(Error::NoFileAnswer {
+            line: line.to_string(),
+        })
+    }
+}
+
+/// The request line a key check opens with. The material follows as one JSON
+/// line, because a key does not fit a line the way an address does.
+pub fn check_request(address: Option<&str>) -> String {
+    format!("CHECK {}\n", address.unwrap_or("-"))
+}
+
+/// The address of a key-check request, or `None` when the line is not one.
+pub fn parse_check_request(line: &str) -> Option<&str> {
+    line.trim_end_matches('\n').strip_prefix("CHECK ")
+}
+
+/// The handler's answer to a key check: a clean key, an inspected refusal, or
+/// the advisory that lets the application proceed. The terminal shows the text,
+/// so it is cleaned before it leaves this module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckAnswer {
+    Clean,
+    Refused(String),
+    Advisory(String),
+}
+
+impl CheckAnswer {
+    /// The reply line. The text is flattened because the protocol is one line.
+    pub fn line(&self) -> String {
+        match self {
+            CheckAnswer::Clean => "OK\n".to_string(),
+            CheckAnswer::Refused(text) => format!("REFUSED {}\n", single_line(text)),
+            CheckAnswer::Advisory(text) => format!("WARN {}\n", single_line(text)),
+        }
+    }
+
+    pub fn parse(line: &str) -> Result<CheckAnswer, Error> {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line == "OK" {
+            return Ok(CheckAnswer::Clean);
+        }
+        if let Some(text) = line.strip_prefix("REFUSED ") {
+            return Ok(CheckAnswer::Refused(crate::util::clean(text)));
+        }
+        if let Some(text) = line.strip_prefix("WARN ") {
+            return Ok(CheckAnswer::Advisory(crate::util::clean(text)));
+        }
+        Err(Error::NoCheckAnswer {
             line: line.to_string(),
         })
     }
@@ -455,6 +520,29 @@ pub fn file(
     parse_file_answer(&reply(stream, "file service")?)
 }
 
+/// Ask the handler to inspect one key answer. A socket failure is the caller's
+/// to turn into the advisory: a portal that cannot reach the handler must not
+/// refuse a key it did not inspect (ADR 0008).
+pub fn check(socket: &Path, address: Option<&str>, material: &str) -> Result<CheckAnswer, Error> {
+    let body =
+        serde_json::to_string(material).map_err(|source| Error::EncodeApplication { source })?;
+    if body.len() >= MAX_BODY {
+        return Err(Error::KeyTooLarge {
+            length: body.len(),
+            max: MAX_BODY,
+        });
+    }
+    let stream = connect(socket, "key service")?;
+    let mut request = check_request(address);
+    request.push_str(&body);
+    request.push('\n');
+    (&stream)
+        .write_all(request.as_bytes())
+        .and_then(|()| (&stream).flush())
+        .map_err(|source| Error::CheckKey { source })?;
+    CheckAnswer::parse(&reply(stream, "key service")?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +582,33 @@ mod tests {
             "ERR one two\n",
             "a reply is one line"
         );
+    }
+
+    #[test]
+    fn a_check_request_and_answer_are_one_line() {
+        assert_eq!(
+            parse_check_request(&check_request(Some("203.0.113.9"))),
+            Some("203.0.113.9")
+        );
+        assert_eq!(parse_check_request("FILE -\n"), None);
+        assert_eq!(CheckAnswer::Clean.line(), "OK\n");
+        assert_eq!(CheckAnswer::parse("OK\n").unwrap(), CheckAnswer::Clean);
+
+        let refused = CheckAnswer::Refused("mail cannot be encrypted".to_string());
+        assert_eq!(refused.line(), "REFUSED mail cannot be encrypted\n");
+        assert_eq!(
+            CheckAnswer::parse("REFUSED mail cannot be encrypted\n").unwrap(),
+            refused
+        );
+
+        // A reply is one line and its text is cleaned: the terminal prints it.
+        let dirty = CheckAnswer::Refused("one\ntwo\u{7}".to_string());
+        assert_eq!(dirty.line(), "REFUSED one two\u{7}\n");
+        assert_eq!(
+            CheckAnswer::parse(&dirty.line()).unwrap(),
+            CheckAnswer::Refused("one two?".to_string())
+        );
+        assert!(CheckAnswer::parse("WHAT\n").is_err());
     }
 
     #[test]

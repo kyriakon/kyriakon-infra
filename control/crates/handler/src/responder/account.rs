@@ -716,7 +716,7 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
     match form.get("action").map(String::as_str) {
         Some("replace") => {
             let material = form.get("key").map(String::as_str).unwrap_or("").trim();
-            let checked = match pgp::public_key(material) {
+            let checked = match pgp::public_key_async(material).await {
                 Ok(checked) => checked,
                 Err(why) => return refused(&why.to_string()),
             };

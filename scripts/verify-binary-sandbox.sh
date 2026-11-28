@@ -33,8 +33,11 @@
 #     capsule and login are the two requests that take a store lock
 #     (`drafts/.lock` and `sessions/.<id>.lock`), so the handler still being
 #     alive after each is what proves its pledge carries `flock`.
-#   * tui: a plain-mode session reads its catalogue, takes its session lock, and
-#     exits on "q".
+#   * tui: a plain-mode session reads its catalogue, takes its session lock,
+#     reads a status and walks a key page whose refusal comes from the handler
+#     over `portal.sock`, then exits. The session holds no `proc` and no `exec`:
+#     a local helper spawn would abort it, so the refusal arriving at all is the
+#     evidence that the check is the handler's.
 #   * encrypt: encrypts a message through the real gpg, under the veil.
 #   * fromcheck: answers the protocol's `config|ready` registration.
 #
@@ -453,7 +456,9 @@ PERL
 	# 4. tui: a plain session reads its catalogue, takes its session lock, asks
 	# the handler for a status so the unix connect is exercised, and leaves. The
 	# start screen's word is "quit"; the menu's is "q", which this session never
-	# reaches. The handler is still up for the status read.
+	# reaches. The key walk below is the check over the portal: this process
+	# holds no proc and no exec, so a refusal reaching the screen means the
+	# handler ran the helper and the terminal did not.
 	printf 'status\n%s\n\nquit\n' "$status_token" |
 		"$tui_bin" --plain --config "$tree/handler.toml" --state "$tree/state" \
 		> "$tree/logs/tui" 2>&1 ||
@@ -472,7 +477,7 @@ PERL
 	} | "$tui_bin" --plain --config "$tree/handler.toml" --state "$tree/state" \
 		> "$tree/logs/tui-key" 2>&1 || fail "the terminal key session failed"
 	grep -q 'no encryption-capable subkey' "$tree/logs/tui-key" ||
-		fail "the terminal did not inspect the signing-only key"
+		fail "the terminal did not receive the handler's verdict over the portal"
 
 	kill "$hpid" 2>/dev/null || true
 	status=0

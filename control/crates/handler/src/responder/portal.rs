@@ -14,6 +14,7 @@ use tokio::net::UnixStream;
 
 use kyriakon_control_core::flow::rate;
 use kyriakon_control_core::ipc;
+use kyriakon_control_core::mail::pgp;
 use kyriakon_control_core::store;
 
 /// Answer to a portal status read past the per-address counter. It is the
@@ -65,6 +66,24 @@ pub(super) async fn portal_connection(stream: UnixStream, app: &App) -> Result<(
     let Some(line) = portal_line(&mut reader, ipc::MAX_LINE).await? else {
         return Ok(());
     };
+    if let Some(address) = ipc::parse_check_request(&line) {
+        let address = address.to_string();
+        let body = match portal_line(&mut reader, ipc::MAX_BODY).await {
+            Ok(Some(body)) => body,
+            // Answer rather than just closing: a session that lost the handler
+            // mid-way still gets the advisory and can file.
+            Ok(None) => return Err(Error::Refused(Refusal::PortalClosedBeforeApplication)),
+            Err(e) => {
+                let reply = ipc::CheckAnswer::Advisory(e.to_string());
+                return say(&mut writer, reply.line().as_bytes()).await;
+            }
+        };
+        let reply = portal_check(app, &address, &body).await;
+        // The route and the address are the log line; the verdict text may
+        // quote a User ID, so it is not logged.
+        kyriakon_control_core::util::log(&format!("kyriakon-control: portal /check {address}"));
+        return say(&mut writer, reply.line().as_bytes()).await;
+    }
     if let Some(address) = ipc::parse_file_request(&line) {
         let address = address.to_string();
         let body = match portal_line(&mut reader, ipc::MAX_BODY).await {
@@ -112,7 +131,7 @@ pub(super) async fn portal_file(app: &App, address: &str, body: &str) -> String 
         Ok(form) => form,
         Err(e) => return ipc::file_answer(None, &format!("the application: {e}")),
     };
-    let (errors, inspected) = application_problems(app, &form);
+    let (errors, inspected) = application_problems(app, &form).await;
     if !errors.is_empty() {
         return ipc::file_answer(None, &errors.join(" "));
     }
@@ -149,6 +168,38 @@ pub(super) async fn portal_file(app: &App, address: &str, body: &str) -> String 
         return ipc::file_answer(None, "Temporary failure. Try again in a moment.");
     }
     ipc::file_answer(Some(&token), "")
+}
+
+/// Inspect one key answer for the terminal. The terminal runs no helper and
+/// holds no exec promise; this is the same inspection the form and the account
+/// page use, over the portal's own socket.
+pub(super) async fn portal_check(app: &App, address: &str, body: &str) -> ipc::CheckAnswer {
+    // The same per-address counter as a status read: an unauthenticated SSH
+    // client must not use a check as a fork or CPU amplifier. A client past the
+    // limit gets the advisory, so its application still files (ADR 0008).
+    if !app.counter.allow_request(rate::key(None, Some(address))) {
+        return ipc::CheckAnswer::Advisory(SLOW_STATUS.to_string());
+    }
+    let material: String = match serde_json::from_str(body) {
+        Ok(material) => material,
+        Err(e) => return ipc::CheckAnswer::Advisory(format!("the key: {e}")),
+    };
+    match pgp::public_key_async(&material).await {
+        Ok(checked) => {
+            if let Some(err) = checked.helper_error() {
+                kyriakon_control_core::util::report(err, "keygen-check");
+            }
+            if let Some(why) = checked.refusal() {
+                ipc::CheckAnswer::Refused(why.to_string())
+            } else if let Some(why) = checked.advisory() {
+                ipc::CheckAnswer::Advisory(why.to_string())
+            } else {
+                ipc::CheckAnswer::Clean
+            }
+        }
+        // Not a public key block at all is the form's refusal, not an advisory.
+        Err(e) => ipc::CheckAnswer::Refused(e.to_string()),
+    }
 }
 
 /// The stage a token names, or the one notice an unknown, expired or

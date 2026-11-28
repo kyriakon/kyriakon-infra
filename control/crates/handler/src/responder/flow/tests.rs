@@ -337,7 +337,7 @@ async fn a_padded_monastic_answer_still_requires_the_blessing() {
         .collect();
     form.insert("orders".to_string(), "monk ".to_string());
     form.insert("blessing".to_string(), String::new());
-    let (errors, _) = application_problems(&app, &form);
+    let (errors, _) = application_problems(&app, &form).await;
     assert!(
         errors.iter().any(|e| e.contains("blessing")),
         "the monastic blessing is still required: {errors:?}"
@@ -384,7 +384,7 @@ async fn a_persons_key_is_checked_against_the_username() {
     form.insert("username".to_string(), "alice".to_string());
     form.insert("whose".to_string(), "person".to_string());
     form.insert("mail_key".to_string(), key);
-    let (_, inspected) = application_problems(&app, &form);
+    let (_, inspected) = application_problems(&app, &form).await;
     let mail_keys = mail_keys_from_form(&form, false, &inspected).unwrap();
     let record = build_record(&app, &form, false, TOKEN, "web", mail_keys);
     assert_eq!(record.mail_keys.len(), 1);

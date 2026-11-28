@@ -92,7 +92,7 @@ pub(super) async fn apply_web(app: &App, request: &Request, incoming: &Incoming)
     if !shown {
         return render_applicant(app, body, &form, &[]);
     }
-    let (errors, inspected) = application_problems(app, &form);
+    let (errors, inspected) = application_problems(app, &form).await;
     if !errors.is_empty() {
         let mut page = page::applicant(
             &app.questions,

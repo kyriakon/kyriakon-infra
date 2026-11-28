@@ -538,7 +538,8 @@ async fn approve(
                 username: username.clone(),
             }));
         }
-        let checked = kyriakon_control_core::mail::pgp::public_key(&key.material)
+        let checked = kyriakon_control_core::mail::pgp::public_key_async(&key.material)
+            .await
             .map_err(|e| Transitions::context("the application's mail key", e))?;
         if let Some(err) = checked.helper_error() {
             kyriakon_control_core::util::report(err, "keygen-check");

@@ -3043,8 +3043,11 @@ async fn apply_rotation(
     account: &mut Account,
     rotation: &store::Rotation,
 ) -> Result<(), Transitions> {
+    let checked = kyriakon_control_core::mail::pgp::public_key_async(&rotation.material)
+        .await
+        .map_err(|e| Transitions::context("the pending mail key", e))?;
     let key =
-        kyriakon_control_core::mail::keycheck::mail_key(String::new(), "", &rotation.material);
+        kyriakon_control_core::mail::keycheck::mail_key_from_checked(String::new(), "", &checked);
     if key.fingerprint != rotation.fingerprint {
         return Err(Transitions::Lifecycle(Error::FingerprintMismatch {
             pending: rotation.fingerprint.clone(),
@@ -3157,12 +3160,13 @@ pub async fn mail_key(
             ))
         }
         "replace" => {
-            let checked = match kyriakon_control_core::mail::pgp::public_key(&intent.material) {
-                Ok(checked) => checked,
-                Err(why) => {
-                    return Ok(Settlement::refused(format!("the mail key: {why}")));
-                }
-            };
+            let checked =
+                match kyriakon_control_core::mail::pgp::public_key_async(&intent.material).await {
+                    Ok(checked) => checked,
+                    Err(why) => {
+                        return Ok(Settlement::refused(format!("the mail key: {why}")));
+                    }
+                };
             if let Some(err) = checked.helper_error() {
                 kyriakon_control_core::util::report(err, "keygen-check");
             }
