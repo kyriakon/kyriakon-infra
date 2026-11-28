@@ -1041,9 +1041,18 @@ fn application(
                 continue;
             }
             Entered::Value(value) => {
-                if let Some(why) =
-                    flow_problem(page, &value, flow.reserved, required, &draft.answers)
-                {
+                // One inspection serves the refusal, the advisory and the
+                // record, so a key page runs the helper once.
+                let inspected = page.mailbox.is_some().then(|| keycheck::inspect(&value));
+                let blocks = inspected.as_deref();
+                if let Some(why) = flow_problem(
+                    page,
+                    &value,
+                    flow.reserved,
+                    required,
+                    &draft.answers,
+                    blocks,
+                ) {
                     put(out, &format!("\n{why}. Press Enter to try again.\n"))?;
                     input.word()?;
                     continue;
@@ -1053,12 +1062,13 @@ fn application(
                 // subkey finding is refused by flow_problem above. The advisory
                 // is a warning and the flow carries on, because the platform has
                 // no way to prove that key bad.
-                let warnings = if page.mailbox.is_some() {
-                    pgp::findings(&value).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                store_answer(page, &mut draft, value);
+                let warnings: Vec<String> = blocks
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|block| block.checked().and_then(pgp::Checked::advisory))
+                    .map(str::to_string)
+                    .collect();
+                store_answer(page, &mut draft, value, blocks);
                 index += 1;
                 if !warnings.is_empty() {
                     // The full mode paints the next screen over whatever is
@@ -1310,7 +1320,12 @@ fn prompt(page: &Page, index: usize, total: usize) -> String {
 
 /// Keep one answer. A mail-key page is stored against its mailbox rather than
 /// under the question's id, because one question asks once per mailbox.
-fn store_answer(page: &Page, draft: &mut draft::Draft, value: String) {
+fn store_answer(
+    page: &Page,
+    draft: &mut draft::Draft,
+    value: String,
+    inspected: Option<&[keycheck::Inspected]>,
+) {
     match &page.mailbox {
         Some(mailbox) => {
             let address = if mailbox.address.is_empty() {
@@ -1319,9 +1334,16 @@ fn store_answer(page: &Page, draft: &mut draft::Draft, value: String) {
                 mailbox.address.clone()
             };
             draft.mail_keys.retain(|k| k.mailbox != mailbox.name);
-            draft
-                .mail_keys
-                .push(keycheck::mail_key(mailbox.name.clone(), &address, &value));
+            let record = match inspected
+                .and_then(|blocks| blocks.first())
+                .and_then(keycheck::Inspected::checked)
+            {
+                Some(checked) => {
+                    keycheck::mail_key_from_checked(mailbox.name.clone(), &address, checked)
+                }
+                None => keycheck::mail_key(mailbox.name.clone(), &address, &value),
+            };
+            draft.mail_keys.push(record);
         }
         None => {
             draft.answers.insert(page.q.id.clone(), value);
@@ -2148,6 +2170,7 @@ mod tests {
             &reserved_names(),
             true,
             &BTreeMap::new(),
+            None,
         )
         .expect("a PGP block is not an upload key");
         assert!(why.contains("OpenSSH"), "{why}");
@@ -2400,7 +2423,8 @@ mod tests {
                     &expected,
                     &reserved,
                     page.q.required,
-                    &BTreeMap::new()
+                    &BTreeMap::new(),
+                    None
                 )
                 .is_none(),
                 "{id} was read but refused"

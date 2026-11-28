@@ -184,6 +184,13 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Transiti
     // The read, the checks and the save are one step under the draft lock: the
     // capsule advances the same record, and two unsynchronised writers would
     // lose one of the two.
+    // Each key is inspected before the draft lock is taken: the helper may run
+    // for ten seconds, and every other applicant's draft write waits on this
+    // lock. The pairing with mailboxes still happens under the lock.
+    let inspected: Vec<_> = blocks
+        .iter()
+        .map(|(_, material)| pgp::public_key(material))
+        .collect();
     let mailed = match store
         .update_draft::<Mailed, kyriakon_control_core::store::Error>(&token, move |draft| {
             // The token in the Subject is the capability: smtpd authenticates
@@ -223,8 +230,12 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Transiti
             // A mailed key takes the same refusal as the typed form: approval
             // would otherwise write the keyring and provision the account before
             // the publish gate refused, leaving the member half-created.
-            for (mailbox, material) in &keys {
-                if let Some(why) = kyriakon_control_core::flow::applicant::key_error(material) {
+            for (mailbox, index) in &keys {
+                let refusal = inspected.get(*index).and_then(|block| match block {
+                    Ok(checked) => checked.refusal().map(str::to_string),
+                    Err(source) => Some(source.to_string()),
+                });
+                if let Some(why) = refusal {
                     return Ok((
                         Mailed {
                             recorded,
@@ -267,7 +278,7 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Transiti
                 .get("body_domain")
                 .cloned()
                 .unwrap_or_default();
-            for (mailbox, material) in fresh {
+            for (mailbox, index) in fresh {
                 let address = if body {
                     if domain.is_empty() {
                         mailbox.clone()
@@ -277,9 +288,17 @@ async fn one(cfg: &DrainConfig, store: &Store, raw: &str) -> Result<(), Transiti
                 } else {
                     format!("{mailbox}@kyriakon.net")
                 };
-                draft
-                    .mail_keys
-                    .push(keycheck::mail_key(mailbox.clone(), &address, &material));
+                let Some(Ok(checked)) = inspected.get(index) else {
+                    // The refusal loop above returned for every block that was
+                    // not inspected, so this is unreachable; skip rather than
+                    // run the helper with the draft lock held.
+                    continue;
+                };
+                draft.mail_keys.push(keycheck::mail_key_from_checked(
+                    mailbox.clone(),
+                    &address,
+                    checked,
+                ));
             }
             let refused = refused.into_iter().map(|(mailbox, _)| mailbox).collect();
             Ok((
@@ -409,7 +428,7 @@ impl std::error::Error for Unlabelled {}
 fn assign(
     blocks: &[(Option<String>, String)],
     draft: &Draft,
-) -> Result<Vec<(String, String)>, Unlabelled> {
+) -> Result<Vec<(String, usize)>, Unlabelled> {
     let body = draft.answers.get("whose").map(String::as_str) == Some("body");
     let domain = draft
         .answers
@@ -435,12 +454,12 @@ fn assign(
     // drain takes the first block from the message body; a second block is not
     // something a single-mailbox applicant needs to label.
     if names.len() == 1 {
-        return Ok(vec![(names[0].clone(), blocks[0].1.clone())]);
+        return Ok(vec![(names[0].clone(), 0)]);
     }
 
-    let mut assigned: Vec<(String, String)> = Vec::new();
+    let mut assigned: Vec<(String, usize)> = Vec::new();
     let mut covered = vec![false; names.len()];
-    for (label, block) in blocks {
+    for (block_index, (label, _block)) in blocks.iter().enumerate() {
         let Some(label) = label.as_deref() else {
             continue;
         };
@@ -451,7 +470,7 @@ fn assign(
             .map(|(index, _)| index);
         if let Some(index) = index {
             covered[index] = true;
-            assigned.push((names[index].clone(), block.clone()));
+            assigned.push((names[index].clone(), block_index));
         }
     }
     if assigned.len() != blocks.len() {

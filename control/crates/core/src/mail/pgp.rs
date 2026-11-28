@@ -56,6 +56,12 @@ const MAX_KEYGEN_OUTPUT: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub struct Checked {
+    /// The one armoured block, as `inspect_single_cert` read it. A record built
+    /// from this inspection takes the material here rather than the raw answer,
+    /// so the fingerprint beside it names exactly these bytes.
+    pub material: String,
+    /// The primary-key fingerprint over `material`.
+    pub fingerprint: String,
     /// "works" when the shared check finds nothing, or its findings joined with
     /// "; " when one or more trips.
     pub verdict: String,
@@ -76,6 +82,12 @@ impl Checked {
     /// inspected or the check found nothing. The parser-gap advisory proceeds.
     pub fn refusal(&self) -> Option<&str> {
         (self.inspected && self.verdict != "works").then_some(self.verdict.as_str())
+    }
+
+    /// The advisory a caller shows when the block was not inspected. It is not a
+    /// refusal; the application proceeds.
+    pub fn advisory(&self) -> Option<&str> {
+        (!self.inspected).then_some(self.verdict.as_str())
     }
 
     /// The helper's own failure, so a daemon writes it to its log instead of
@@ -325,46 +337,29 @@ fn public_key_with(
     now: u64,
     timeout: Duration,
 ) -> Result<Checked, Error> {
-    let cert = inspect_single_cert(value)?;
-    Ok(
-        match run_keygen_check(program, &cert.material, now, timeout) {
-            Ok(KeygenVerdict::Parsed(findings)) if findings.is_empty() => Checked {
-                verdict: "works".to_string(),
-                inspected: true,
-                helper_error: None,
-            },
-            Ok(KeygenVerdict::Parsed(findings)) => Checked {
-                verdict: findings.join("; "),
-                inspected: true,
-                helper_error: None,
-            },
-            // The helper read the framing and could not read the key: a gap in the
-            // check, not a fault in this process, so there is nothing to log.
-            Ok(KeygenVerdict::Uninspected) => Checked {
-                verdict: UNINSPECTED.to_string(),
-                inspected: false,
-                helper_error: None,
-            },
-            // A helper that could not answer is the same advisory to the applicant
-            // and a line in the daemon's log for the operator.
-            Err(err) => Checked {
-                verdict: UNINSPECTED.to_string(),
-                inspected: false,
-                helper_error: Some(err),
-            },
-        },
-    )
-}
-
-/// The three-condition findings, for a caller that only shows them. The
-/// advisory a helper gap produces is one entry, which is what the caller
-/// prints; no refusal is built from this.
-pub fn findings(value: &str) -> Result<Vec<String>, Error> {
-    let checked = public_key(value)?;
-    Ok(if checked.verdict == "works" {
-        Vec::new()
-    } else {
-        vec![checked.verdict]
+    let Cert {
+        material,
+        fingerprint,
+    } = inspect_single_cert(value)?;
+    let (verdict, inspected, helper_error) =
+        match run_keygen_check(program, &material, now, timeout) {
+            Ok(KeygenVerdict::Parsed(findings)) if findings.is_empty() => {
+                ("works".to_string(), true, None)
+            }
+            Ok(KeygenVerdict::Parsed(findings)) => (findings.join("; "), true, None),
+            // The helper read the framing and could not read the key: a gap in
+            // the check, not a fault in this process, so there is nothing to log.
+            Ok(KeygenVerdict::Uninspected) => (UNINSPECTED.to_string(), false, None),
+            // A helper that could not answer is the same advisory to the
+            // applicant and a line in the daemon's log for the operator.
+            Err(err) => (UNINSPECTED.to_string(), false, Some(err)),
+        };
+    Ok(Checked {
+        material,
+        fingerprint,
+        verdict,
+        inspected,
+        helper_error,
     })
 }
 
@@ -1273,7 +1268,14 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&env_check, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(
-            run_keygen_check(env_check.display().to_string(), "", 0, Duration::from_secs(2)),
+            run_keygen_check(
+                env_check.display().to_string(),
+                "",
+                0,
+                // The service deadline: these scripts answer immediately, and a
+                // loaded machine must not turn that into a timeout.
+                KEYGEN_TIMEOUT
+            ),
             Ok(KeygenVerdict::Parsed(findings)) if findings.is_empty()
         ));
 
@@ -1285,7 +1287,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&flood, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(
-            run_keygen_check(flood.display().to_string(), "", 0, Duration::from_secs(2)),
+            run_keygen_check(flood.display().to_string(), "", 0, KEYGEN_TIMEOUT),
             Err(Error::KeygenCheckProtocol { .. })
         ));
     }
@@ -1380,8 +1382,15 @@ mod tests {
         let path = home.path().join("check");
         std::fs::write(&path, "#!/bin/sh\nexit 3\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let failed = public_key_with(path.display().to_string(), CLEAN, 0, Duration::from_secs(2))
-            .expect("a helper that exits non-zero is not a framing refusal");
+        let failed = public_key_with(
+            path.display().to_string(),
+            CLEAN,
+            0,
+            // The service deadline, so a loaded machine cannot turn a fast exit
+            // into the timeout this test is not about.
+            KEYGEN_TIMEOUT,
+        )
+        .expect("a helper that exits non-zero is not a framing refusal");
         assert!(!failed.inspected);
         assert!(failed.refusal().is_none());
         assert!(

@@ -72,30 +72,56 @@ pub fn openssh_public_key(value: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// The record for one mail key, with the fingerprint and the verdict computed
-/// over the material rather than taken from the client. A block that does not
-/// parse is still recorded: the form refuses an inspected finding, and the
-/// parser-gap advisory proceeds with the verdict saying what the check found.
-pub fn mail_key(mailbox: String, address: &str, material: &str) -> KeyRecord {
-    record(mailbox, address, material, Kind::Mail)
+/// One submitted key block and what the check made of it. Splitting and
+/// inspecting once is what lets a refused block, an advisory and a record share
+/// one helper spawn.
+#[derive(Debug)]
+pub enum Inspected {
+    /// An armoured public key block, inspected.
+    Checked(pgp::Checked),
+    /// Not an armoured public key block at all, which the form refuses.
+    NotArmoured(Error),
 }
 
-/// The record for one upload key. The mail check does not apply to it.
-pub fn upload_key(material: &str) -> KeyRecord {
-    record(String::new(), "", material, Kind::Upload)
+impl Inspected {
+    /// The refusal this block has earned, or `None` when it may deliver. The
+    /// parser-gap advisory is not a refusal.
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            Inspected::NotArmoured(source) => Some(source.to_string()),
+            Inspected::Checked(checked) => checked.refusal().map(str::to_string),
+        }
+    }
+
+    /// The inspection, when the block was a public key block at all.
+    pub fn checked(&self) -> Option<&pgp::Checked> {
+        match self {
+            Inspected::Checked(checked) => Some(checked),
+            Inspected::NotArmoured(_) => None,
+        }
+    }
 }
 
-enum Kind {
-    Mail,
-    Upload,
+/// Split a key answer into its blocks and inspect each once. One helper spawn
+/// per block, whatever the caller then does with the result.
+pub fn inspect(value: &str) -> Vec<Inspected> {
+    pgp::blocks(value)
+        .into_iter()
+        .map(|block| match pgp::public_key(&block) {
+            Ok(checked) => Inspected::Checked(checked),
+            Err(source) => Inspected::NotArmoured(source),
+        })
+        .collect()
 }
 
-fn record(mailbox: String, address: &str, material: &str, kind: Kind) -> KeyRecord {
-    let mut verdict = pgp::public_key(material)
-        .map(|c| c.verdict)
-        .unwrap_or_else(|_| "unchecked".to_string());
-    if matches!(kind, Kind::Mail) && !address.is_empty() {
-        for warning in pgp::uid_warnings(material, address) {
+/// The record for one inspected mail key, with the fingerprint and verdict the
+/// inspection carried rather than a second run of the check. The User ID
+/// warnings are parsed from the same material in memory, so this spawns
+/// nothing.
+pub fn mail_key_from_checked(mailbox: String, address: &str, checked: &pgp::Checked) -> KeyRecord {
+    let mut verdict = checked.verdict.clone();
+    if !address.is_empty() {
+        for warning in pgp::uid_warnings(&checked.material, address) {
             if verdict == "works" {
                 verdict = warning;
             } else {
@@ -104,16 +130,39 @@ fn record(mailbox: String, address: &str, material: &str, kind: Kind) -> KeyReco
             }
         }
     }
-    let fingerprint = match kind {
-        Kind::Mail => pgp::fingerprint(material),
-        Kind::Upload => openssh_fingerprint(material),
-    }
-    .unwrap_or_default();
     KeyRecord {
         mailbox,
-        fingerprint,
-        material: material.trim().to_string(),
+        fingerprint: checked.fingerprint.clone(),
+        material: checked.material.trim().to_string(),
         verdict,
+    }
+}
+
+/// The record for one mail key, inspecting the material once. A caller that
+/// already holds a [`pgp::Checked`] uses [`mail_key_from_checked`] instead.
+/// A block that does not parse is still recorded: the form refuses an inspected
+/// finding, and the parser-gap advisory proceeds with the verdict saying what
+/// the check found.
+pub fn mail_key(mailbox: String, address: &str, material: &str) -> KeyRecord {
+    match pgp::public_key(material) {
+        Ok(checked) => mail_key_from_checked(mailbox, address, &checked),
+        Err(_) => KeyRecord {
+            mailbox,
+            fingerprint: pgp::fingerprint(material).unwrap_or_default(),
+            material: material.trim().to_string(),
+            verdict: "unchecked".to_string(),
+        },
+    }
+}
+
+/// The record for one upload key. The mail check does not apply to it, so this
+/// runs no helper: only the OpenSSH fingerprint is computed.
+pub fn upload_key(material: &str) -> KeyRecord {
+    KeyRecord {
+        mailbox: String::new(),
+        fingerprint: openssh_fingerprint(material).unwrap_or_default(),
+        material: material.trim().to_string(),
+        verdict: "unchecked".to_string(),
     }
 }
 

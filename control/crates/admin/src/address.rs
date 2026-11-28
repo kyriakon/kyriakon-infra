@@ -152,7 +152,7 @@ pub(crate) async fn address(
                 });
             }
             let address = format!("{mailbox}@kyriakon.net");
-            let record = keycheck::mail_key(mailbox.to_string(), &address, &material);
+            let record = keycheck::mail_key_from_checked(mailbox.to_string(), &address, &checked);
             if record.fingerprint.is_empty() {
                 return Err(Error::MailKeyNoPacket { path: path.into() });
             }

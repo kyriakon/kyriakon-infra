@@ -186,6 +186,24 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
     // One lock around the read and every write: the drain files a mailed key
     // into this same record as root, and two unsynchronised read-modify-writes
     // would lose one of them.
+    // A key answer is inspected before the draft lock is taken: the helper runs
+    // for up to ten seconds, and every other applicant's draft write waits on
+    // this one. The peeked page is used only while the locked read still lands
+    // on it; a concurrent writer that moved the page falls back to inspecting
+    // inside the lock, which is rare and still correct.
+    let peek = match store::draft::load(&app.store, token).await {
+        Ok(Some(record)) => {
+            let path = flow_path(&app.questions, &record.answers);
+            let index = next_page(&path, &record);
+            let key_page = path.get(index).is_some_and(|page| page.mailbox.is_some());
+            Some((index, key_page))
+        }
+        _ => None,
+    };
+    let inspected = peek
+        .filter(|&(_, key_page)| key_page && !incoming.query.is_empty())
+        .map(|_| keycheck::inspect(&capsule_value(&incoming.query)));
+
     let step = match app
         .store
         .update_draft(token, |record| {
@@ -216,9 +234,25 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
                 Kind::YesNo | Kind::Acceptance => value.to_ascii_lowercase(),
                 _ => value,
             };
-            if let Some(why) =
-                flow_problem(page, &value, &app.reserved, q.required, &record.answers)
-            {
+            let inspected = match peek {
+                Some((peeked, _)) if peeked == index => inspected.as_deref(),
+                _ => None,
+            };
+            if page.mailbox.is_some() && inspected.is_none() {
+                // The draft moved between the peek and the lock, or the peek
+                // failed, so this answer was never inspected. Ask the page again
+                // rather than run the helper with the draft lock held.
+                let meta = capsule_meta(page, index, path.len(), token, None);
+                return Ok((Step::Ask(meta), false));
+            }
+            if let Some(why) = flow_problem(
+                page,
+                &value,
+                &app.reserved,
+                q.required,
+                &record.answers,
+                inspected,
+            ) {
                 let meta = capsule_meta(page, index, path.len(), token, Some(&why));
                 return Ok((Step::Ask(meta), false));
             }
@@ -230,10 +264,20 @@ pub(super) async fn capsule_apply(app: &App, incoming: &Incoming, rest: &str) ->
                         mailbox.address.clone()
                     };
                     record.mail_keys.retain(|k| k.mailbox != mailbox.name);
-                    record.mail_keys.push(keycheck::mail_key(
+                    let Some(checked) = inspected
+                        .and_then(|blocks| blocks.first())
+                        .and_then(keycheck::Inspected::checked)
+                    else {
+                        // `flow_problem` refused every block that is not one
+                        // inspected public key, so this is unreachable; re-ask
+                        // rather than store a record nothing inspected.
+                        let meta = capsule_meta(page, index, path.len(), token, None);
+                        return Ok((Step::Ask(meta), false));
+                    };
+                    record.mail_keys.push(keycheck::mail_key_from_checked(
                         mailbox.name.clone(),
                         &address,
-                        &value,
+                        checked,
                     ));
                 }
                 None => {
@@ -398,7 +442,14 @@ pub(super) async fn capsule_file(app: &App, token: &str) -> Reply {
         .complete_draft::<Reply, Error, _>(token, |record| async move {
             let body = record.answers.get("whose").map(String::as_str) == Some("body");
             let answers = flow_answers(&record, body);
-            let application = build_record(app, &answers, body, &record.token, "capsule")?;
+            let application = build_record(
+                app,
+                &answers,
+                body,
+                &record.token,
+                "capsule",
+                record.mail_keys.clone(),
+            );
             file_application(app, &application).await?;
             let link = format!("gemini://{HOST}/status/{}", record.token);
             Ok(Reply::gemini(20, "text/gemini", capsule::filed(&link)))

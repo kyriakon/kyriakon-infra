@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use super::Error;
 use crate::flow::questions::{self, Branch, Kind, Question, Rule};
 use crate::flow::validate;
-use crate::mail::pgp;
+use crate::mail::keycheck::{self, Inspected};
 use crate::store::draft;
 
 /// One page of the applicant's path. A mail key is one page per mailbox, with
@@ -103,22 +103,40 @@ pub fn flow_problem(
     reserved: &HashSet<String>,
     required: bool,
     answers: &BTreeMap<String, String>,
+    inspected: Option<&[Inspected]>,
 ) -> Option<String> {
     let q = page.q;
     if page.mailbox.is_some() {
         if value.trim().is_empty() {
             return Some("a public key is needed".to_string());
         }
-        let blocks = pgp::blocks(value);
+        // A caller that holds the draft lock inspects before taking it and
+        // passes the result, so no helper runs inside the lock.
+        let owned;
+        let blocks = match inspected {
+            Some(blocks) => blocks,
+            None => {
+                owned = keycheck::inspect(value);
+                &owned
+            }
+        };
         if blocks.len() != 1 {
             return Some("one key for one mailbox".to_string());
         }
-        return key_error(&blocks[0]);
+        return blocks[0].refusal();
     }
     // The key rules run before the generic shape rule so a body's list is
     // bounded before any per-key helper starts.
     if q.rule == Rule::MailKey && !value.trim().is_empty() {
-        return mail_key_errors(q, value, answers).into_iter().next();
+        let owned;
+        let blocks = match inspected {
+            Some(blocks) => blocks,
+            None => {
+                owned = keycheck::inspect(value);
+                &owned
+            }
+        };
+        return mail_key_errors_from(q, blocks, answers).into_iter().next();
     }
     if let Some(why) = validate::reason(q, value, reserved, required) {
         return Some(why.to_string());
@@ -226,10 +244,14 @@ pub fn body_cross_checks(form: &BTreeMap<String, String>, errors: &mut Vec<Strin
     }
 }
 
-/// The refusals for a mail-key answer. A person's key is one block; a body's is
-/// one block per mailbox, paired with the account names in the order given.
-pub fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String>) -> Vec<String> {
-    let blocks = pgp::blocks(value);
+/// The refusals for one key answer already split and inspected. A person's key
+/// is one block; a body's is one block per mailbox, paired with the account
+/// names in the order given. No helper runs here.
+pub fn mail_key_errors_from(
+    q: &Question,
+    blocks: &[Inspected],
+    form: &BTreeMap<String, String>,
+) -> Vec<String> {
     if blocks.is_empty() {
         return vec!["a public key is needed".to_string()];
     }
@@ -244,22 +266,11 @@ pub fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String
                 blocks.len()
             )];
         }
-        blocks.iter().filter_map(|b| key_error(b)).collect()
+        blocks.iter().filter_map(Inspected::refusal).collect()
     } else if blocks.len() > 1 {
         vec!["one key for one address".to_string()]
     } else {
-        key_error(&blocks[0]).into_iter().collect()
-    }
-}
-
-/// The refusal a submitted block has earned, or `None` when it can deliver.
-/// An inspected finding (AEAD, expiry, revocation, no encryption subkey) is a
-/// refusal at the form; the parser-gap advisory proceeds, because a key the
-/// platform cannot inspect is not a key it can prove bad.
-pub fn key_error(block: &str) -> Option<String> {
-    match pgp::public_key(block) {
-        Err(e) => Some(e.to_string()),
-        Ok(checked) => checked.refusal().map(str::to_string),
+        blocks[0].refusal().into_iter().collect()
     }
 }
 
@@ -284,11 +295,11 @@ mod tests {
     fn a_mail_key_that_cannot_deliver_is_refused() {
         let q = mail_key_question();
         let form = BTreeMap::new();
-        assert!(mail_key_errors(&q, CLEAN, &form).is_empty());
-        assert!(mail_key_errors(&q, AEAD, &form)
+        assert!(mail_key_errors_from(&q, &keycheck::inspect(CLEAN), &form).is_empty());
+        assert!(mail_key_errors_from(&q, &keycheck::inspect(AEAD), &form)
             .iter()
             .any(|why| why.contains("AEAD")));
-        assert!(!mail_key_errors(&q, EXPIRED_SUBKEY, &form).is_empty());
+        assert!(!mail_key_errors_from(&q, &keycheck::inspect(EXPIRED_SUBKEY), &form).is_empty());
     }
 
     /// A draft written when the address pages came after the key pages: its
