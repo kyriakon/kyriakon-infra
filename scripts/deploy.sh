@@ -162,6 +162,9 @@ classify() {
 		manual_lapsed_class=yes
 		;;
 	reserved-usernames.txt | scripts/control-store.sh) needs_control=yes ;;
+	# Verifiers run in CI or by hand from the checkout; nothing installs them,
+	# so a change reaches the next run through the pull and needs no deploy.
+	scripts/verify-*.sh) : ;;
 	# The installed set is the table's: a script's row names the deploy that
 	# installs it, so adding one is a row there and not an arm here.
 	scripts/*) classify_script "$1" || return 1 ;;
@@ -579,6 +582,10 @@ self_test() {
 	got=0
 	( classify 'scripts/no-such-helper.sh' ) || got=$?
 	check 'an uninstalled script with no rule is refused' "$got" 1
+
+	reset_plan
+	classify 'scripts/verify-drain-sandbox.sh'
+	check 'a verifier script plans nothing' "$(plan_order)" ''
 
 	# Retiring an installed script deletes the script and marks its manifest row
 	# retired in one commit. The deletion is an explicit uninstall step, and the
