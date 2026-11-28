@@ -20,26 +20,164 @@
 // The check is the half the control plane uses; the generator is the CLI's and
 // the page's. `generate` is the feature that separates them.
 
+use std::fmt;
+
 use pgp::composed::{Deserializable, SignedPublicKey};
 #[cfg(feature = "generate")]
 use pgp::composed::{
     EncryptionCaps, KeyType, SecretKeyParamsBuilder, SignedSecretKey, SubkeyParamsBuilder,
 };
+use pgp::crypto::aead::AeadAlgorithm;
 #[cfg(feature = "generate")]
 use pgp::crypto::ecc_curve::ECCCurve;
 #[cfg(feature = "generate")]
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::public_key::PublicKeyAlgorithm;
-#[cfg(feature = "generate")]
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::{Signature, SignatureType, SubpacketData};
 #[cfg(feature = "generate")]
 use pgp::types::{CompressionAlgorithm, KeyVersion};
-use pgp::types::{KeyDetails, Tag};
+use pgp::types::{Fingerprint, KeyDetails, Tag};
 #[cfg(feature = "generate")]
 use rand::thread_rng;
 #[cfg(feature = "generate")]
 use smallvec::smallvec;
+
+/// One condition the check reports. The check returns these rather than
+/// sentences, so a caller and a test read the condition; [`fmt::Display`] is the
+/// one place the user-facing sentence is written.
+///
+/// The wire format `keygen-check` prints and the page's JSON both format through
+/// `Display`, so the copy the control plane and the browser show is this impl's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Finding {
+    /// No current, verified self-signature for the primary key.
+    NoSelfSignature,
+    /// The key carries a revocation signature.
+    Revoked,
+    /// The key advertises an AEAD preference that some mail clients cannot read.
+    Aead(Vec<Aead>),
+    /// The primary key's creation time is in the future.
+    FutureDated,
+    /// The primary key's expiry has passed.
+    Expired { at: u64 },
+    /// The primary key expires in the future.
+    Expires { at: u64 },
+    /// An encryption subkey's expiry has passed.
+    SubkeyExpired { at: u64 },
+    /// An encryption subkey expires in the future.
+    SubkeyExpires { at: u64 },
+    /// No usable encryption subkey at all.
+    NoEncryptionSubkey,
+    /// An encryption subkey is revoked, and no replacement was found.
+    SubkeyRevoked { fingerprint: Fingerprint },
+}
+
+impl fmt::Display for Finding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Finding::NoSelfSignature => {
+                f.write_str("The key has no current, verified self-signature for its primary key.")
+            }
+            Finding::Revoked => f.write_str(
+                "The key has been revoked. Make a new key in Thunderbird or with gpg; a revoked key \
+                 cannot receive mail.",
+            ),
+            Finding::Aead(items) => {
+                f.write_str("The key asks for AEAD ciphers (")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                f.write_str(
+                    "), so mail encrypted to it may not open in the member's mail program. Remove \
+                     AEAD from the key's preferences, or make a new key in Thunderbird or with gpg.",
+                )
+            }
+            Finding::FutureDated => f.write_str(
+                "The key is dated in the future; check the clock on the machine that made it, \
+                 or make a new key.",
+            ),
+            Finding::Expired { at } => write!(
+                f,
+                "The key expired at {at} seconds since the epoch and cannot be \
+                 used. Make a new key in Thunderbird or with gpg, or extend the expiry in your \
+                 mail client before it lapses."
+            ),
+            Finding::Expires { at } => write!(
+                f,
+                "The key expires at {at} seconds since the epoch, and a mail key \
+                 must not expire: delivery stops at that date without a word. Choose \
+                 \"Key does not expire\" when you make the key, or set its expiry to never \
+                 in your mail client."
+            ),
+            Finding::SubkeyExpired { at } => write!(
+                f,
+                "The encryption subkey expired at {at} seconds since the epoch, \
+                 so mail encrypted to this key may not open. Extend the subkey's expiry \
+                 in your mail client, or make a new key in Thunderbird or with gpg."
+            ),
+            Finding::SubkeyExpires { at } => write!(
+                f,
+                "The encryption subkey expires at {at} seconds since the epoch, \
+                 and a mail key must not expire: delivery stops at that date without a \
+                 word. Choose \"Key does not expire\" when you make the key, or set the \
+                 subkey's expiry to never in your mail client."
+            ),
+            Finding::NoEncryptionSubkey => f.write_str(
+                "There is no encryption-capable subkey, so mail to this member would be \
+                 refused rather than delivered. Make a new key in Thunderbird or with gpg, which makes \
+                 an encryption subkey beside the signing one.",
+            ),
+            Finding::SubkeyRevoked { fingerprint } => write!(
+                f,
+                "The encryption subkey {fingerprint:?} has been revoked, so mail cannot be encrypted to \
+                 it. Make a new key in Thunderbird or with gpg; a revoked subkey cannot receive mail."
+            ),
+        }
+    }
+}
+
+/// One advertised AEAD preference, as it appears inside [`Finding::Aead`].
+/// rPGP exposes SEIPDv2 directly but LibrePGP OCB only through the wire flags,
+/// so the last four name the subpacket rather than a value it decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Aead {
+    /// A preferred AEAD cipher and mode.
+    Algorithm {
+        cipher: SymmetricKeyAlgorithm,
+        mode: AeadAlgorithm,
+    },
+    /// A preferred encryption mode.
+    Mode(AeadAlgorithm),
+    /// The LibrePGP OCB feature bit.
+    Ocb,
+    /// The SEIPD v2 feature bit.
+    SeipdV2,
+    /// A type 34 ciphersuite subpacket this build does not parse.
+    Ciphersuite,
+    /// A type 22 algorithms subpacket this build does not parse.
+    Algorithms,
+}
+
+impl fmt::Display for Aead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Aead::Algorithm { cipher, mode } => write!(f, "{cipher:?} in {mode:?}"),
+            Aead::Mode(mode) => write!(f, "{mode:?} as an AEAD mode"),
+            Aead::Ocb => f.write_str("the OCB feature bit in the key's features"),
+            Aead::SeipdV2 => f.write_str("the SEIPD v2 feature bit in the key's features"),
+            Aead::Ciphersuite => {
+                f.write_str("an AEAD ciphersuite subpacket (type 34) this build does not parse")
+            }
+            Aead::Algorithms => {
+                f.write_str("an AEAD algorithms subpacket (type 22) this build does not parse")
+            }
+        }
+    }
+}
 
 #[cfg(feature = "generate")]
 pub const DEFAULT_USER_ID: &str = "Keygen Member <keygen@example.invalid>";
@@ -147,7 +285,7 @@ fn encryption_algorithm_usable(key: &pgp::packet::PublicSubkey) -> bool {
     }
 }
 
-fn signature_aead_findings(sig: &Signature) -> Vec<String> {
+fn signature_aead_findings(sig: &Signature) -> Vec<Aead> {
     let mut found = Vec::new();
     let Some(config) = sig.config() else {
         return found;
@@ -156,7 +294,10 @@ fn signature_aead_findings(sig: &Signature) -> Vec<String> {
         match &subpacket.data {
             SubpacketData::PreferredAeadAlgorithms(list) => {
                 for (cipher, mode) in list.iter() {
-                    found.push(format!("{cipher:?} in {mode:?}"));
+                    found.push(Aead::Algorithm {
+                        cipher: *cipher,
+                        mode: *mode,
+                    });
                 }
             }
             // The subpacket gpg actually writes is type 34, and rpgp 0.20 parses it
@@ -165,28 +306,20 @@ fn signature_aead_findings(sig: &Signature) -> Vec<String> {
             // gpg key, which is the dangerous direction for this warning.
             SubpacketData::PreferredEncryptionModes(modes) => {
                 for mode in modes.iter() {
-                    found.push(format!("{mode:?} as an AEAD mode"));
+                    found.push(Aead::Mode(*mode));
                 }
             }
             // rPGP exposes SEIPDv2, but LibrePGP OCB (0x02) only via the wire flags.
             SubpacketData::Features(features) => {
                 if Vec::from(features).first().is_some_and(|b| b & 0x02 != 0) {
-                    found.push("the OCB feature bit in the key's features".into());
+                    found.push(Aead::Ocb);
                 }
                 if features.seipd_v2() {
-                    found.push("the SEIPD v2 feature bit in the key's features".into());
+                    found.push(Aead::SeipdV2);
                 }
             }
-            SubpacketData::Other(34, _) => {
-                found.push(
-                    "an AEAD ciphersuite subpacket (type 34) this build does not parse".into(),
-                );
-            }
-            SubpacketData::Other(22, _) => {
-                found.push(
-                    "an AEAD algorithms subpacket (type 22) this build does not parse".into(),
-                );
-            }
+            SubpacketData::Other(34, _) => found.push(Aead::Ciphersuite),
+            SubpacketData::Other(22, _) => found.push(Aead::Algorithms),
             _ => {}
         }
     }
@@ -228,7 +361,7 @@ fn current_signature(
 
 /// The three conditions, as the check page would state them. `now_secs` is the caller's
 /// clock, so the same code runs in a binary and in a browser.
-pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, String> {
+pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<Finding>, String> {
     let (key, _) =
         SignedPublicKey::from_armor_single(armor.as_bytes()).map_err(|e| e.to_string())?;
     let mut findings = Vec::new();
@@ -252,7 +385,7 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
 
     let mut uid_expiry = None;
     let mut has_self_signature = false;
-    let mut aead: Vec<String> = Vec::new();
+    let mut aead: Vec<Aead> = Vec::new();
     for sig in users
         .chain(attributes)
         .filter(|sig| sig.typ() != Some(SignatureType::CertRevocation))
@@ -272,34 +405,20 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
 
     if !has_self_signature || (primary.version() == pgp::types::KeyVersion::V6 && direct.is_none())
     {
-        findings
-            .push("The key has no current, verified self-signature for its primary key.".into());
+        findings.push(Finding::NoSelfSignature);
     }
 
     if !key.details.revocation_signatures.is_empty() {
-        findings.push(
-            "The key has been revoked. Make a new key in Thunderbird or with gpg; a revoked key \
-             cannot receive mail."
-                .into(),
-        );
+        findings.push(Finding::Revoked);
     }
 
     if !aead.is_empty() {
-        findings.push(format!(
-            "The key asks for AEAD ciphers ({}), so mail encrypted to it may not open in \
-             the member's mail program. Remove AEAD from the key's preferences, or make a \
-             new key in Thunderbird or with gpg.",
-            aead.join(", ")
-        ));
+        findings.push(Finding::Aead(aead));
     }
 
     let created = key.primary_key.created_at().as_secs();
     if u64::from(created) > now_secs {
-        findings.push(
-            "The key is dated in the future; check the clock on the machine that made it, \
-             or make a new key."
-                .into(),
-        );
+        findings.push(Finding::FutureDated);
     }
     // Any expiry is a finding, not only one already past: approval's
     // key_problems refuses an expiring key and delivery stops at the date. The
@@ -313,18 +432,9 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
     if let Some(lifetime) = expires_after {
         let expires_at = u64::from(created) + u64::from(lifetime);
         findings.push(if expires_at <= now_secs {
-            format!(
-                "The key expired at {expires_at} seconds since the epoch and cannot be \
-                 used. Make a new key in Thunderbird or with gpg, or extend the expiry in your \
-                 mail client before it lapses."
-            )
+            Finding::Expired { at: expires_at }
         } else {
-            format!(
-                "The key expires at {expires_at} seconds since the epoch, and a mail key \
-                 must not expire: delivery stops at that date without a word. Choose \
-                 \"Key does not expire\" when you make the key, or set its expiry to never \
-                 in your mail client."
-            )
+            Finding::Expires { at: expires_at }
         });
     }
 
@@ -364,36 +474,19 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
         {
             let expires_at = u64::from(sub_created) + u64::from(lifetime);
             findings.push(if expires_at <= now_secs {
-                format!(
-                    "The encryption subkey expired at {expires_at} seconds since the epoch, \
-                     so mail encrypted to this key may not open. Extend the subkey's expiry \
-                     in your mail client, or make a new key in Thunderbird or with gpg."
-                )
+                Finding::SubkeyExpired { at: expires_at }
             } else {
-                format!(
-                    "The encryption subkey expires at {expires_at} seconds since the epoch, \
-                     and a mail key must not expire: delivery stops at that date without a \
-                     word. Choose \"Key does not expire\" when you make the key, or set the \
-                     subkey's expiry to never in your mail client."
-                )
+                Finding::SubkeyExpires { at: expires_at }
             });
         }
     }
 
     if !has_live_encryption_subkey {
         if revoked_subkeys.is_empty() {
-            findings.push(
-                "There is no encryption-capable subkey, so mail to this member would be \
-                 refused rather than delivered. Make a new key in Thunderbird or with gpg, which makes \
-                 an encryption subkey beside the signing one."
-                    .into(),
-            );
+            findings.push(Finding::NoEncryptionSubkey);
         } else {
             for fingerprint in revoked_subkeys {
-                findings.push(format!(
-                    "The encryption subkey {fingerprint:?} has been revoked, so mail cannot be encrypted to \
-                     it. Make a new key in Thunderbird or with gpg; a revoked subkey cannot receive mail."
-                ));
+                findings.push(Finding::SubkeyRevoked { fingerprint });
             }
         }
     }
@@ -420,8 +513,11 @@ fn esc(s: &str) -> String {
 }
 
 #[cfg(feature = "generate")]
-fn findings_json(findings: &[String]) -> String {
-    let items: Vec<String> = findings.iter().map(|f| format!("\"{}\"", esc(f))).collect();
+fn findings_json(findings: &[Finding]) -> String {
+    let items: Vec<String> = findings
+        .iter()
+        .map(|f| format!("\"{}\"", esc(&f.to_string())))
+        .collect();
     format!(
         "{{\"ok\":{},\"findings\":[{}]}}",
         findings.is_empty(),
@@ -484,10 +580,16 @@ pub fn self_check() -> Result<(), String> {
     if check_public_key(not_a_key, 1_700_000_000).is_ok() {
         return Err("a malformed key was accepted".into());
     }
-    if findings_json(&["a \"quoted\" \\ line\nsecond".to_string()])
-        != "{\"ok\":false,\"findings\":[\"a \\\"quoted\\\" \\\\ line\\nsecond\"]}"
-    {
+    if esc("a \"quoted\" \\ line\nsecond") != "a \\\"quoted\\\" \\\\ line\\nsecond" {
         return Err("json escaping is wrong".into());
+    }
+    if findings_json(&[Finding::Expires { at: 1_900_000_000 }])
+        != "{\"ok\":false,\"findings\":[\"The key expires at 1900000000 seconds since the epoch, \
+            and a mail key must not expire: delivery stops at that date without a word. Choose \\\"Key \
+            does not expire\\\" when you make the key, or set its expiry to never in your mail \
+            client.\"]}"
+    {
+        return Err("the findings JSON is wrong".into());
     }
     Ok(())
 }

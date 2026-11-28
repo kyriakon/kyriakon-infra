@@ -21,7 +21,7 @@
 //                                primary never expires and only the encryption subkey does (2040-01-01).
 // The long-paste fixture is gpg rsa4096 with an encryption subkey, 3216 bytes.
 
-use keygen::check_public_key;
+use keygen::{Aead, Finding, check_public_key};
 
 const NOW: u64 = 1_800_000_000;
 
@@ -42,29 +42,23 @@ fn the_generators_own_key_is_clean() {
 fn each_gpg_fixture_carries_its_own_verdict() {
     let aead = check_public_key(AEAD, NOW).expect("the AEAD fixture parses");
     assert_eq!(aead.len(), 1, "{aead:?}");
-    assert!(aead[0].contains("AEAD"), "{aead:?}");
-    assert!(aead[0].contains("Remove AEAD"), "{aead:?}");
+    assert!(
+        matches!(&aead[0], Finding::Aead(items) if !items.is_empty()),
+        "{aead:?}"
+    );
 
     let no_encryption =
         check_public_key(NO_ENCRYPTION, NOW).expect("the no-encryption fixture parses");
     assert_eq!(no_encryption.len(), 1, "{no_encryption:?}");
     assert!(
-        no_encryption[0].contains("no encryption-capable subkey"),
-        "{no_encryption:?}"
-    );
-    assert!(
-        no_encryption[0].contains("Make a new key"),
+        matches!(&no_encryption[0], Finding::NoEncryptionSubkey),
         "{no_encryption:?}"
     );
 
     let expired = check_public_key(EXPIRED_SUBKEY, NOW).expect("the expired fixture parses");
     assert_eq!(expired.len(), 1, "{expired:?}");
     assert!(
-        expired[0].contains("encryption subkey expired"),
-        "{expired:?}"
-    );
-    assert!(
-        expired[0].contains("Extend the subkey's expiry"),
+        matches!(&expired[0], Finding::SubkeyExpired { .. }),
         "{expired:?}"
     );
 }
@@ -76,14 +70,11 @@ fn each_gpg_fixture_carries_its_own_verdict() {
 fn an_expiry_in_the_future_is_a_finding_and_a_past_one_says_expired() {
     let future = check_public_key(FUTURE_EXPIRY, NOW).expect("the future-expiry fixture parses");
     assert_eq!(future.len(), 1, "{future:?}");
-    assert!(future[0].contains("expires at"), "{future:?}");
-    assert!(future[0].contains("Key does not expire"), "{future:?}");
-    assert!(!future[0].contains("expired at"), "{future:?}");
+    assert!(matches!(&future[0], Finding::Expires { .. }), "{future:?}");
 
     let past = check_public_key(FUTURE_EXPIRY, 2_300_000_000).expect("it still parses");
     assert_eq!(past.len(), 1, "{past:?}");
-    assert!(past[0].contains("expired at"), "{past:?}");
-    assert!(!past[0].contains("Key does not expire"), "{past:?}");
+    assert!(matches!(&past[0], Finding::Expired { .. }), "{past:?}");
 }
 
 /// The subkey branch is its own reading: a primary that never expires with an
@@ -95,14 +86,16 @@ fn a_future_expiry_on_the_encryption_subkey_alone_is_a_finding() {
         check_public_key(FUTURE_EXPIRY_SUBKEY, NOW).expect("the subkey-expiry fixture parses");
     assert_eq!(future.len(), 1, "{future:?}");
     assert!(
-        future[0].contains("encryption subkey expires at"),
+        matches!(&future[0], Finding::SubkeyExpires { .. }),
         "{future:?}"
     );
-    assert!(future[0].contains("Key does not expire"), "{future:?}");
 
     let past = check_public_key(FUTURE_EXPIRY_SUBKEY, 2_300_000_000).expect("it still parses");
     assert_eq!(past.len(), 1, "{past:?}");
-    assert!(past[0].contains("encryption subkey expired at"), "{past:?}");
+    assert!(
+        matches!(&past[0], Finding::SubkeyExpired { .. }),
+        "{past:?}"
+    );
 }
 
 // GnuPG: ed25519 cert primary, --quick-add-key <fpr> rsa2048 sign never.
@@ -111,7 +104,10 @@ fn a_signing_only_rsa_subkey_cannot_receive_mail() {
     let findings = check_public_key(include_str!("../fixtures/gpg-rsa-signing-subkey.asc"), NOW)
         .expect("ordinary signed RSA subkey");
     assert_eq!(findings.len(), 1, "{findings:?}");
-    assert!(findings[0].contains("no encryption-capable subkey"));
+    assert!(
+        matches!(&findings[0], Finding::NoEncryptionSubkey),
+        "{findings:?}"
+    );
 }
 
 #[cfg(feature = "generate")]
@@ -175,17 +171,37 @@ fn the_newest_signed_declaration_wins_in_either_packet_order() {
             match offset {
                 0 => {
                     assert_eq!(findings.len(), 3, "{findings:?}");
-                    assert!(findings.iter().any(|f| f.contains("OCB feature bit")));
-                    assert!(findings.iter().any(|f| f.contains("The key expires at")));
-                    assert!(findings.iter().any(|f| f.contains("subkey expires at")));
+                    assert!(
+                        findings.iter().any(
+                            |f| matches!(f, Finding::Aead(items) if items.contains(&Aead::Ocb))
+                        )
+                    );
+                    assert!(
+                        findings
+                            .iter()
+                            .any(|f| matches!(f, Finding::Expires { .. })),
+                        "{findings:?}"
+                    );
+                    assert!(
+                        findings
+                            .iter()
+                            .any(|f| matches!(f, Finding::SubkeyExpires { .. })),
+                        "{findings:?}"
+                    );
                 }
                 1 => {
                     assert_eq!(findings.len(), 1, "{findings:?}");
-                    assert!(findings[0].contains("SEIPD v2 feature bit"));
+                    assert!(
+                        matches!(&findings[0], Finding::Aead(items) if items.contains(&Aead::SeipdV2)),
+                        "{findings:?}"
+                    );
                 }
                 2 => {
                     assert_eq!(findings.len(), 1, "{findings:?}");
-                    assert!(findings[0].contains("no encryption-capable subkey"));
+                    assert!(
+                        matches!(&findings[0], Finding::NoEncryptionSubkey),
+                        "{findings:?}"
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -238,7 +254,9 @@ fn same_second_aead_and_direct_zero_expiry_and_rotated_subkey_match_gpg() {
         let armor = cert.to_armored_string(Default::default()).unwrap();
         let findings = check_public_key(&armor, now).unwrap();
         assert!(
-            findings.iter().any(|f| f.contains("OCB feature bit")),
+            findings
+                .iter()
+                .any(|f| matches!(f, Finding::Aead(items) if items.contains(&Aead::Ocb))),
             "{findings:?}"
         );
         cert.details.users[0].signatures.reverse();
@@ -318,7 +336,10 @@ fn same_second_aead_and_direct_zero_expiry_and_rotated_subkey_match_gpg() {
     let revoked_only = cert.to_armored_string(Default::default()).unwrap();
     let findings = check_public_key(&revoked_only, now).unwrap();
     assert_eq!(findings.len(), 1, "{findings:?}");
-    assert!(findings[0].contains("has been revoked"), "{findings:?}");
+    assert!(
+        matches!(&findings[0], Finding::SubkeyRevoked { .. }),
+        "{findings:?}"
+    );
 
     cert.public_subkeys.push(replacement);
     let rotated = cert.to_armored_string(Default::default()).unwrap();
