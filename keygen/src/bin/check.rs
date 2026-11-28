@@ -37,6 +37,12 @@ fn system_now() -> u64 {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "openbsd")]
+    // SAFETY: the promise list is NUL-terminated; there are no exec promises.
+    if unsafe { libc::pledge(c"stdio".as_ptr(), std::ptr::null()) } == -1 {
+        eprintln!("keygen-check: pledge: {}", std::io::Error::last_os_error());
+        return ExitCode::from(2);
+    }
     let mut now = system_now();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {

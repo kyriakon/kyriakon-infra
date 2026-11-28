@@ -31,10 +31,10 @@ use pgp::crypto::ecc_curve::ECCCurve;
 use pgp::crypto::hash::HashAlgorithm;
 #[cfg(feature = "generate")]
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
-use pgp::packet::SubpacketData;
-use pgp::types::KeyDetails;
+use pgp::packet::{Signature, SignatureType, SubpacketData};
 #[cfg(feature = "generate")]
 use pgp::types::{CompressionAlgorithm, KeyVersion};
+use pgp::types::{KeyDetails, Tag};
 #[cfg(feature = "generate")]
 use rand::thread_rng;
 #[cfg(feature = "generate")]
@@ -117,6 +117,53 @@ pub fn generate_key(
     })
 }
 
+fn binding_allows_encryption(sig: &Signature) -> bool {
+    // GnuPG falls back to the algorithm only when the binding omits Key Flags.
+    sig.config().is_some_and(|config| {
+        config
+            .hashed_subpackets()
+            .find_map(|p| match &p.data {
+                SubpacketData::KeyFlags(f) => Some(f.encrypt_comms() || f.encrypt_storage()),
+                _ => None,
+            })
+            .unwrap_or(true)
+    })
+}
+
+fn current_signature(
+    signatures: &[Signature],
+    now: u64,
+    verified: impl Fn(&Signature) -> bool,
+) -> Option<&Signature> {
+    signatures
+        .iter()
+        .filter(|sig| {
+            let Some(created) = sig.created().map(|t| u64::from(t.as_secs())) else {
+                return false;
+            };
+            let lifetime = sig.signature_expiration_time().map_or(0, |d| d.as_secs());
+            created <= now
+                && (lifetime == 0 || created + u64::from(lifetime) > now)
+                && verified(sig)
+        })
+        .max_by(|a, b| {
+            a.created().cmp(&b.created()).then_with(|| {
+                // Simultaneous declarations must not clear a restriction by packet order.
+                let restrictions = |s: &Signature| {
+                    let expiry = s.key_expiration_time().map_or(0, |d| d.as_secs());
+                    (
+                        s.typ() == Some(SignatureType::CertRevocation),
+                        s.typ() == Some(SignatureType::SubkeyBinding)
+                            && !binding_allows_encryption(s),
+                        expiry != 0,
+                        std::cmp::Reverse(expiry),
+                    )
+                };
+                restrictions(a).cmp(&restrictions(b))
+            })
+        })
+}
+
 /// The three conditions, as the check page would state them. `now_secs` is the caller's
 /// clock, so the same code runs in a binary and in a browser.
 pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, String> {
@@ -124,28 +171,43 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
         SignedPublicKey::from_armor_single(armor.as_bytes()).map_err(|e| e.to_string())?;
     let mut findings = Vec::new();
 
-    // Expiry and revocation come from the certificate's own signatures. The preferences
-    // can sit on a direct key signature rather than on the user id binding, which is what
-    // gpg 2.4 and later write, so both places are read. A checker that reads only the user
-    // id passes a key that advertises AEAD, which is the whole condition it exists for.
-    let mut all_signatures: Vec<&pgp::packet::Signature> =
-        key.details.direct_signatures.iter().collect();
-    for user in &key.details.users {
-        all_signatures.extend(user.signatures.iter());
-    }
-    for attribute in &key.details.user_attributes {
-        all_signatures.extend(attribute.signatures.iter());
-    }
+    let primary = &key.primary_key;
+    let direct = current_signature(&key.details.direct_signatures, now_secs, |sig| {
+        sig.typ() == Some(SignatureType::Key) && sig.verify_key(primary).is_ok()
+    });
+    let users = key.details.users.iter().filter_map(|user| {
+        current_signature(&user.signatures, now_secs, |sig| {
+            sig.verify_certification(primary, Tag::UserId, &user.id)
+                .is_ok()
+        })
+    });
+    let attributes = key.details.user_attributes.iter().filter_map(|attr| {
+        current_signature(&attr.signatures, now_secs, |sig| {
+            sig.verify_certification(primary, Tag::UserAttribute, &attr.attr)
+                .is_ok()
+        })
+    });
 
-    let mut expires_after: Option<u32> = None;
+    let mut uid_expiry = None;
+    let mut has_self_signature = false;
     let mut aead: Vec<String> = Vec::new();
-    for sig in all_signatures {
+    for sig in users
+        .chain(attributes)
+        .filter(|sig| sig.typ() != Some(SignatureType::CertRevocation))
+        .chain(direct)
+    {
+        has_self_signature = true;
+        if sig.typ() != Some(SignatureType::Key)
+            && let Some(expiry) = sig
+                .key_expiration_time()
+                .map(|d| d.as_secs())
+                .filter(|&d| d != 0)
+        {
+            uid_expiry = uid_expiry.max(Some((sig.created(), std::cmp::Reverse(expiry))));
+        }
         if let Some(config) = sig.config() {
             for subpacket in config.hashed_subpackets() {
                 match &subpacket.data {
-                    SubpacketData::KeyExpirationTime(duration) => {
-                        expires_after = Some(duration.as_secs());
-                    }
                     SubpacketData::PreferredAeadAlgorithms(list) => {
                         for (cipher, mode) in list.iter() {
                             aead.push(format!("{cipher:?} in {mode:?}"));
@@ -160,12 +222,11 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
                             aead.push(format!("{mode:?} as an AEAD mode"));
                         }
                     }
-                    // The AEAD feature bit is the other half of the same advertisement.
-                    // rpgp exposes seipd_v2() and keeps the bit gpg actually sets (the one
-                    // it inherited from LibrePGP, visible in the debug output as
-                    // _libre_ocb) behind a private field, so a check written on rpgp's
-                    // public API can read half of the feature byte and not the other half.
+                    // rPGP exposes SEIPDv2, but LibrePGP OCB (0x02) only via the wire flags.
                     SubpacketData::Features(features) => {
+                        if Vec::from(features).first().is_some_and(|b| b & 0x02 != 0) {
+                            aead.push("the OCB feature bit in the key's features".into());
+                        }
                         if features.seipd_v2() {
                             aead.push("the SEIPD v2 feature bit in the key's features".into());
                         }
@@ -186,6 +247,12 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
                 }
             }
         }
+    }
+
+    if !has_self_signature || (primary.version() == pgp::types::KeyVersion::V6 && direct.is_none())
+    {
+        findings
+            .push("The key has no current, verified self-signature for its primary key.".into());
     }
 
     if !key.details.revocation_signatures.is_empty() {
@@ -209,11 +276,15 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
     // Any expiry is a finding, not only one already past: approval's
     // key_problems refuses an expiring key and delivery stops at the date. The
     // clock only chooses the wording. A zero lifetime is OpenPGP's "never".
-    if let Some(lifetime) = expires_after
-        && lifetime > 0
-    {
-        let expires_at = created.saturating_add(lifetime);
-        findings.push(if u64::from(expires_at) <= now_secs {
+    // GnuPG uses a direct-key expiry first, then the newest current identity with an expiry.
+    let expires_after = direct
+        .and_then(Signature::key_expiration_time)
+        .map(|d| d.as_secs())
+        .filter(|&d| d != 0)
+        .or_else(|| uid_expiry.map(|(_, expiry)| expiry.0));
+    if let Some(lifetime) = expires_after {
+        let expires_at = u64::from(created) + u64::from(lifetime);
+        findings.push(if expires_at <= now_secs {
             format!(
                 "The key expired at {expires_at} seconds since the epoch and cannot be \
                  used. Make a new key in Thunderbird or with gpg, or extend the expiry in your \
@@ -232,35 +303,36 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
     // A subkey carries its own expiry and its own revocation, in its binding signature.
     // Reading only the primary key's signatures reports a clean key whose encryption
     // subkey died years ago, which is a false clean in the direction that loses mail.
+    let mut has_encryption_subkey = false;
     for sub in &key.public_subkeys {
-        let sub_created = sub.key.created_at().as_secs();
-        let mut sub_expires: Option<u32> = None;
-        let mut sub_revoked = false;
-        for sig in &sub.signatures {
-            if sig.typ() == Some(pgp::packet::SignatureType::SubkeyRevocation) {
-                sub_revoked = true;
-            }
-            if let Some(config) = sig.config() {
-                for subpacket in config.hashed_subpackets() {
-                    if let SubpacketData::KeyExpirationTime(duration) = &subpacket.data {
-                        sub_expires = Some(duration.as_secs());
-                    }
-                }
-            }
+        if !sub.key.algorithm().can_encrypt() {
+            continue;
         }
-        let encrypts = sub.key.algorithm().can_encrypt();
-        if sub_revoked && encrypts {
+        let Some(binding) = current_signature(&sub.signatures, now_secs, |sig| {
+            sig.typ() == Some(SignatureType::SubkeyBinding)
+                && sig.verify_subkey_binding(primary, &sub.key).is_ok()
+        }) else {
+            continue;
+        };
+        if !binding_allows_encryption(binding) {
+            continue;
+        }
+        has_encryption_subkey = true;
+        if sub.signatures.iter().any(|sig| {
+            sig.typ() == Some(SignatureType::SubkeyRevocation)
+                && sig.verify_subkey_binding(primary, &sub.key).is_ok()
+        }) {
             findings.push(format!(
                 "The encryption subkey {:?} has been revoked, so mail cannot be encrypted to \
                  it. Make a new key in Thunderbird or with gpg; a revoked subkey cannot receive mail.",
                 sub.key.fingerprint()
             ));
         }
-        if let (true, Some(lifetime)) = (encrypts, sub_expires)
-            && lifetime > 0
+        if let Some(lifetime) = binding.key_expiration_time().map(|d| d.as_secs())
+            && lifetime != 0
         {
-            let expires_at = sub_created.saturating_add(lifetime);
-            findings.push(if u64::from(expires_at) <= now_secs {
+            let expires_at = u64::from(sub.key.created_at().as_secs()) + u64::from(lifetime);
+            findings.push(if expires_at <= now_secs {
                 format!(
                     "The encryption subkey expired at {expires_at} seconds since the epoch, \
                      so mail encrypted to this key may not open. Extend the subkey's expiry \
@@ -277,13 +349,7 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<String>, Strin
         }
     }
 
-    let encrypting: Vec<String> = key
-        .public_subkeys
-        .iter()
-        .filter(|sub| sub.key.algorithm().can_encrypt())
-        .map(|sub| format!("{:?}", sub.key.algorithm()))
-        .collect();
-    if encrypting.is_empty() {
+    if !has_encryption_subkey {
         findings.push(
             "There is no encryption-capable subkey, so mail to this member would be \
              refused rather than delivered. Make a new key in Thunderbird or with gpg, which makes \
@@ -369,7 +435,7 @@ pub fn self_check() -> Result<(), String> {
     if !g.public_armor.contains("BEGIN PGP PUBLIC KEY BLOCK") {
         return Err("no public armor".into());
     }
-    let findings = check_public_key(&g.public_armor, 1_700_000_000)?;
+    let findings = check_public_key(&g.public_armor, u64::MAX)?;
     if !findings.is_empty() {
         return Err(format!("a generated key did not check clean: {findings:?}"));
     }

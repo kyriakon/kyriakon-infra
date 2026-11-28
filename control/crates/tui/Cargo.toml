@@ -11,3 +11,7 @@ path = "src/main.rs"
 [dependencies]
 kyriakon-control-core = { path = "../core" }
 libc.workspace = true
+
+[dev-dependencies]
+# The flow tests run the key check helper; a service build must not.
+kyriakon-control-core = { path = "../core", features = ["test-fixtures"] }

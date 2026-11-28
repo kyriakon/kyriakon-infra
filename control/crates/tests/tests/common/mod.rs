@@ -106,9 +106,6 @@ pub struct Fix {
 
 impl Fix {
     pub fn new(name: &str) -> Fix {
-        // The handler runs the key check as a process, so the fixture builds it
-        // once and exports the path to every child it starts.
-        kyriakon_control_core::mail::pgp::keygen_check_test_binary();
         let dir = std::env::temp_dir().join(format!("control-it-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for sub in [
@@ -1321,6 +1318,10 @@ impl Fix {
     /// its printed alerts, its exit status and its pass lock.
     pub fn drain_binary(&self) -> Output {
         std::process::Command::new(drain_binary())
+            .env(
+                "KYRIAKON_KEYGEN_CHECK",
+                kyriakon_control_core::mail::pgp::keygen_check_program(),
+            )
             .arg("--config")
             .arg(self.config())
             .output()
@@ -1339,6 +1340,10 @@ impl Fix {
 
     pub fn ctl(&self, args: &[&str]) -> Output {
         std::process::Command::new(ctl_binary())
+            .env(
+                "KYRIAKON_KEYGEN_CHECK",
+                kyriakon_control_core::mail::pgp::keygen_check_program(),
+            )
             .arg("--config")
             .arg(self.config())
             .args(args)

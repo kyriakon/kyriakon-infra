@@ -63,6 +63,10 @@ is a usage or I/O failure. `control/crates/core/src/mail/pgp.rs` runs the helper
 with a ten-second deadline and treats every spawn, timeout, exit or protocol
 failure as the existing uninspected advisory, never as a refusal.
 
+On OpenBSD the handler, drain and terminal portal unveil the helper for
+execution. The helper pledges `stdio` before reading the key. A production
+release uses `/usr/local/libexec/keygen-check` regardless of its environment.
+
 ## Tests and fuzzing
 
 ```sh

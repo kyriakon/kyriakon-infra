@@ -104,3 +104,87 @@ fn a_future_expiry_on_the_encryption_subkey_alone_is_a_finding() {
     assert_eq!(past.len(), 1, "{past:?}");
     assert!(past[0].contains("encryption subkey expired at"), "{past:?}");
 }
+
+// GnuPG: ed25519 cert primary, --quick-add-key <fpr> rsa2048 sign never.
+#[test]
+fn a_signing_only_rsa_subkey_cannot_receive_mail() {
+    let findings = check_public_key(include_str!("../fixtures/gpg-rsa-signing-subkey.asc"), NOW)
+        .expect("ordinary signed RSA subkey");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].contains("no encryption-capable subkey"));
+}
+
+#[cfg(feature = "generate")]
+#[test]
+fn signed_renewals_take_effect_at_their_creation_time_in_either_packet_order() {
+    use pgp::composed::{Deserializable, SignedSecretKey};
+    use pgp::crypto::hash::HashAlgorithm;
+    use pgp::packet::{
+        Features, KeyFlags, SignatureConfig, SignatureType, Subpacket, SubpacketData,
+    };
+    use pgp::types::{Duration, KeyDetails, Password, Tag, Timestamp};
+
+    let generated = keygen::generate_key("ed25519", keygen::DEFAULT_USER_ID, None).unwrap();
+    let (secret, _) =
+        SignedSecretKey::from_armor_single(generated.secret_armor.as_bytes()).unwrap();
+    let signer = &secret.primary_key;
+    let mut cert = secret.to_public_key();
+    let start = Timestamp::now().as_secs() + 1;
+    let password = Password::empty();
+    for (offset, lifetime, feature) in [(0, 86_400, 0x02), (1, 0, 0x08), (2, 0, 0x01)] {
+        let config = |typ| {
+            let mut config = SignatureConfig::v4(typ, signer.algorithm(), HashAlgorithm::Sha256);
+            for data in [
+                SubpacketData::SignatureCreationTime(Timestamp::from_secs(start + offset)),
+                SubpacketData::KeyExpirationTime(Duration::from_secs(lifetime)),
+            ] {
+                config
+                    .hashed_subpackets
+                    .push(Subpacket::regular(data).unwrap());
+            }
+            config
+        };
+        let mut uid = config(SignatureType::CertPositive);
+        uid.hashed_subpackets.push(
+            Subpacket::regular(SubpacketData::Features(Features::from(&[feature][..]))).unwrap(),
+        );
+        let user = &mut cert.details.users[0];
+        user.signatures.push(
+            uid.sign_certification(signer, &cert.primary_key, &password, Tag::UserId, &user.id)
+                .unwrap(),
+        );
+
+        let mut binding = config(SignatureType::SubkeyBinding);
+        // Absent flags retain the legacy algorithm fallback. Explicit zero flags don't.
+        if offset == 2 {
+            binding
+                .hashed_subpackets
+                .push(Subpacket::regular(SubpacketData::KeyFlags(KeyFlags::default())).unwrap());
+        }
+        let sub = &mut cert.public_subkeys[0];
+        sub.signatures.push(
+            binding
+                .sign_subkey_binding(signer, &cert.primary_key, &password, &sub.key)
+                .unwrap(),
+        );
+    }
+    for _ in 0..2 {
+        let armor = cert.to_armored_string(Default::default()).unwrap();
+        let check = |offset: u32| check_public_key(&armor, u64::from(start + offset)).unwrap();
+        let expiring = check(0);
+        assert_eq!(expiring.len(), 3, "{expiring:?}");
+        assert!(expiring.iter().any(|f| f.contains("OCB feature bit")));
+        assert!(expiring.iter().any(|f| f.contains("The key expires at")));
+        assert!(expiring.iter().any(|f| f.contains("subkey expires at")));
+
+        let renewed = check(1);
+        assert_eq!(renewed.len(), 1, "{renewed:?}");
+        assert!(renewed[0].contains("SEIPD v2 feature bit"));
+        let disabled = check(2);
+        assert_eq!(disabled.len(), 1, "{disabled:?}");
+        assert!(disabled[0].contains("no encryption-capable subkey"));
+
+        cert.details.users[0].signatures.reverse();
+        cert.public_subkeys[0].signatures.reverse();
+    }
+}

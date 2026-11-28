@@ -44,6 +44,8 @@ pub enum Error {
     Question { id: String, source: Box<Error> },
     /// A body names one account twice.
     DuplicateAccountName { name: String },
+    /// A body requests more than the allowed number of mailboxes.
+    TooManyAccountNames,
 }
 
 impl fmt::Display for Error {
@@ -82,6 +84,13 @@ impl fmt::Display for Error {
             Error::Question { id, source } => write!(f, "the question {id:?}: {source}"),
             Error::DuplicateAccountName { name } => {
                 write!(f, "the account name {name:?} is given twice")
+            }
+            Error::TooManyAccountNames => {
+                write!(
+                    f,
+                    "up to {} account names",
+                    super::questions::BODY_MAILBOX_LIMIT
+                )
             }
         }
     }
@@ -143,6 +152,8 @@ pub enum Reason {
     UsernameLast,
     /// A list names one username twice.
     UsernameTwice { name: String },
+    /// A list has more names than a body can request.
+    TooManyAccountNames,
     /// A list's line is refused, and the sentence names the line.
     UsernameNamed { name: String, source: Box<Reason> },
 
@@ -224,6 +235,7 @@ impl fmt::Display for Reason {
                 f.write_str("a username ends with a lowercase letter or a digit")
             }
             Reason::UsernameTwice { name } => write!(f, "the name {name:?} is given twice"),
+            Reason::TooManyAccountNames => Error::TooManyAccountNames.fmt(f),
             Reason::UsernameNamed { name, source } => write!(f, "the name {name:?}: {source}"),
             Reason::DomainTooLong { limit } => {
                 write!(f, "a domain is at most {limit} characters")

@@ -60,16 +60,14 @@ repo=$(cd "$script_dir/.." && pwd)
 drain_bin=${KYRIAKON_DRAIN_BIN:-$repo/control/target/release/kyriakon-control-drain}
 admin_bin=${KYRIAKON_ADMIN_BIN:-$repo/control/target/release/kyriakon-admin}
 config_src=$repo/openbsd/etc/onboard/drain.toml
-# The member key the fixture's application carries: the throwaway public key
-# the export tests use. It carries an encryption subkey, which is what the
-# approval insists on, and it has no private half anywhere. It is extracted from
-# the Rust source so the suite holds one copy of it.
-key_src=$repo/control/crates/tests/tests/areas/export.rs
+key_src=$repo/keygen/fixtures/generated-clean.asc
+refused_key=$repo/keygen/fixtures/gpg-no-encryption-subkey.asc
 # The application's status token: 26 Crockford characters, the shape
 # Store::is_status_token accepts.
 status_token=01arz3ndektsv4rrffq69g5fav
 # The body's application token, the same shape and a different value.
 body_token=01arz3ndektsv4rrffq69g5fax
+refused_token=01arz3ndektsv4rrffq69g5fay
 
 usage() {
 	cat >&2 <<'USAGE'
@@ -209,32 +207,15 @@ config_for() {
 		"$config_src"
 }
 
-# extract_member_key <out>: the public key block the export tests carry, with
-# the Rust string quoting and continuations removed. The approval re-inspects
-# the material, so a real frame with a subkey is what lets that check run.
-extract_member_key() {
-	awk '
-		/BEGIN PGP PUBLIC KEY BLOCK/ { started = 1 }
-		started {
-			line = $0
-			sub(/^.*BEGIN PGP PUBLIC KEY BLOCK-----/, "-----BEGIN PGP PUBLIC KEY BLOCK-----", line)
-			gsub(/\\n/, "\n", line)
-			gsub(/\\/, "", line)
-			print line
-			if (line ~ /END PGP PUBLIC KEY BLOCK-----/) exit
-		}
-	' "$key_src" | sed '/^[[:space:]]*$/d' > "$1"
-}
-
-# file_approval <tree> <key>: the handler-shaped application the console's
+# file_approval <tree> <key> <username> <token>: the handler-shaped application the console's
 # decision needs, filed in applications/ under its own token. Every field the
 # approval reads is here, and there is no outside address, so the confirmation
 # letter has nowhere to go and the pass does not depend on it.
 file_approval() {
-	typeset tree=$1 key=$2
+	typeset tree=$1 key=$2 username=$3 token=$4
 	mkdir -p "$tree/store/applications"
-	jq -n --arg token "$status_token" --arg key "$(cat "$key")" '{
-		username: "alice",
+	jq -n --arg token "$token" --arg username "$username" --rawfile key "$key" '{
+		username: $username,
 		status_token: $token,
 		filed_at: "2026-11-01T09:00:00Z",
 		front_end: "web",
@@ -249,7 +230,7 @@ file_approval() {
 		# keyring empty until its sweep, which is not what this pass checks.
 		acceptances: [{"document": "immediate supply and the digital-content acknowledgement", "version": "fixture"}],
 		question_list: "fixture"
-	}' > "$tree/store/applications/$status_token.json"
+	}' > "$tree/store/applications/$token.json"
 }
 
 # file_body_approval <tree> <key>: a community body's application, so the
@@ -317,6 +298,7 @@ assert_fixture() {
 full_run() {
 	[ "$(uname -s)" = OpenBSD ] || missing "the full run needs OpenBSD's unveil(2) and pledge(2); use --self-test"
 	[ -x "$drain_bin" ] || missing "no drain binary at $drain_bin; set KYRIAKON_DRAIN_BIN"
+	[ -x "${KYRIAKON_KEYGEN_CHECK:-/usr/local/libexec/keygen-check}" ] || missing "no key checker"
 	[ -f "$config_src" ] || missing "no drain.toml at $config_src"
 
 	# Outside the process's temp directory on purpose: restrict unveils /tmp
@@ -334,13 +316,10 @@ full_run() {
 		missing "no console at $admin_bin; set KYRIAKON_ADMIN_BIN"
 	[ -f "$key_src" ] || missing "no test key source at $key_src"
 	command -v jq >/dev/null 2>&1 || missing "jq is needed to write the fixture's application"
-	extract_member_key "$work/member-key.asc"
-	grep -q '^-----BEGIN PGP PUBLIC KEY BLOCK-----$' "$work/member-key.asc" ||
-		die "could not extract the test key"
 
 	# The console signs an approval of the fixture's application with the same
 	# key the drain verifies, so the pass below carries a real root verb.
-	file_approval "$tree" "$work/member-key.asc"
+	file_approval "$tree" "$key_src" alice "$status_token"
 	if ! "$admin_bin" --config "$work/drain.toml" approve-free alice "$status_token" \
 		> "$work/admin-out" 2>&1; then
 		sed -n 1,20p "$work/admin-out" >&2
@@ -349,12 +328,16 @@ full_run() {
 	# The body's free approval takes the group path, and the drain's own
 	# provision-group transition writes mail_domains. That is the table write
 	# the stale lock below is reaped by.
-	file_body_approval "$tree" "$work/member-key.asc"
+	file_body_approval "$tree" "$key_src"
 	if ! "$admin_bin" --config "$work/drain.toml" approve-free warden "$body_token" \
 		> "$work/admin-body-out" 2>&1; then
 		sed -n 1,20p "$work/admin-body-out" >&2
 		die "the console could not sign the fixture's body decision"
 	fi
+
+	file_approval "$tree" "$refused_key" basil "$refused_token"
+	"$admin_bin" --config "$work/drain.toml" approve-free basil "$refused_token" ||
+		die "the console could not sign the signing-only key fixture's decision"
 
 	# The pass must finish. Its stderr carries the malformed intent's report,
 	# which is expected; the exit status is what says unveil and pledge held.
@@ -362,6 +345,11 @@ full_run() {
 		sed -n 1,40p "$work/out" >&2
 		fail "the drain failed under unveil and pledge"
 	fi
+
+	grep -q 'no encryption-capable subkey' "$tree/store/journal.jsonl" ||
+		fail "the drain did not inspect the signing-only key"
+	[ ! -e "$tree/store/accounts/basil/account.json" ] ||
+		fail "the drain provisioned the refused application"
 
 	# The approval reached the store, the keyring and the privileged scripts:
 	# account_on_box read /etc/passwd, name_allowed read the reserved names, and
@@ -417,6 +405,16 @@ full_run() {
 	# grep exiting early would make the pipeline a SIGPIPE under pipefail.
 	find "$tree/home/www/alice.kyriakon.net/export" -type f > "$work/export-files" 2>/dev/null
 	[ -s "$work/export-files" ] || fail "the export wrote no bundle under public_root"
+
+	# A box whose card rail is not configured has no webhook secret, and
+	# `transitions::stripe` reports that instead of failing the pass. The
+	# sandbox has to agree: unveil remembers a non-directory by name, so a
+	# missing secret passes unveil and would fail the probe.
+	rm "$tree/stripe-secret"
+	if ! "$drain_bin" --config "$work/drain.toml" > "$work/no-secret-out" 2>&1; then
+		sed -n 1,40p "$work/no-secret-out" >&2
+		fail "the drain failed with no Stripe webhook secret"
+	fi
 
 	# A path whose parent does not exist fails at unveil, and the message names
 	# the path and the errno text: the operator can fix the config from cron mail.

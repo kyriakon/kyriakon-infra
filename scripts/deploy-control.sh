@@ -618,6 +618,14 @@ install -d -m 0755 -o root -g wheel /etc/onboard
 # The responder's host-to-tree map. Empty on a box with no group site; the group
 # lanes write one file per domain into it.
 install -d -m 0755 -o root -g wheel /etc/onboard/static-hosts
+install -d -m 0755 -o root -g wheel /usr/local/libexec
+# The key check helper core runs for a submitted key. Its name is the manifest
+# row's, so the path core compiles in and the deploy installs cannot drift.
+keygen_check_name=$(manifest_installed_name "$install_set" keygen-check /usr/local/libexec) \
+	|| die "cannot read $install_set"
+[ -n "$keygen_check_name" ] || die "$install_set names no keygen-check for /usr/local/libexec"
+install -m 0755 "$repo_dir/keygen/target/release/keygen-check" \
+	"/usr/local/libexec/$keygen_check_name"
 install -m 0755 "$repo_dir/control/target/release/kyriakon-control" /usr/local/sbin/kyriakon-control
 # The member content responder, which serves /home/www for both front-ends. Its
 # config names the two sockets and the tree, and is installed verbatim: nothing
@@ -676,7 +684,6 @@ fi
 # doas.conf cannot name the check's arguments (they are the username), so it
 # names this program, and the program is what keeps the subcommand fixed and
 # mints the login proof.
-install -d -m 0755 -o root -g wheel /usr/local/libexec
 # lib.sh sits beside it because the checker sources valid_localpart from there.
 # It is a 0644 source file, not a program, so it adds nothing the doas rule can
 # run: the rule still names only /usr/local/libexec/kyriakon-authcheck.
@@ -700,13 +707,6 @@ fromcheck_name=$(manifest_installed_name "$install_set" kyriakon-fromcheck /usr/
 [ -n "$fromcheck_name" ] || die "$install_set names no kyriakon-fromcheck for /usr/local/libexec"
 install -m 0755 "$repo_dir/control/target/release/kyriakon-fromcheck" \
 	"/usr/local/libexec/$fromcheck_name"
-# The key check helper core runs for a submitted key. Its name is the manifest
-# row's, so the path core compiles in and the deploy installs cannot drift.
-keygen_check_name=$(manifest_installed_name "$install_set" keygen-check /usr/local/libexec) \
-	|| die "cannot read $install_set"
-[ -n "$keygen_check_name" ] || die "$install_set names no keygen-check for /usr/local/libexec"
-install -m 0755 "$repo_dir/keygen/target/release/keygen-check" \
-	"/usr/local/libexec/$keygen_check_name"
 
 # The login proofs: one file per admitted login, named by a random token, written
 # by the checker as root and read back by the drain. Root-owned 0700 is the whole

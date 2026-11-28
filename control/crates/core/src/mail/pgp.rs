@@ -16,15 +16,13 @@
 //! large export cannot fill a pipe while gpg fills the other (#929), and it
 //! kills the child at a hard deadline.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
@@ -42,8 +40,8 @@ const SIGNED_END: &str = "-----END PGP SIGNATURE-----";
 /// must not hold the single-flight drain open forever.
 const GPG_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The installed check helper. A test build overrides this with the debug
-/// binary; nothing else may point it at a different program.
+/// Production releases do not consult the environment for an executable.
+#[cfg(not(any(test, feature = "test-fixtures")))]
 const KEYGEN_CHECK: &str = "/usr/local/libexec/keygen-check";
 
 /// The helper parses one key and exits. A parser that hangs on one key must not
@@ -335,82 +333,105 @@ enum KeygenVerdict {
 /// control plane does not link `pgp`; every failure here is the uninspected
 /// advisory at the caller, never a refusal on a key the platform did not read.
 fn keygen_check(material: &str, now: u64) -> Result<KeygenVerdict, Error> {
-    let program = keygen_check_program();
+    run_keygen_check(keygen_check_program(), material, now, KEYGEN_TIMEOUT)
+}
+
+fn run_keygen_check(
+    program: String,
+    material: &str,
+    now: u64,
+    timeout: Duration,
+) -> Result<KeygenVerdict, Error> {
+    let deadline = Instant::now() + timeout;
     let mut child = std::process::Command::new(&program)
         .arg("--now-secs")
         .arg(now.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .spawn()
         .map_err(|source| Error::RunKeygenCheck {
             program: program.clone(),
             source,
         })?;
 
-    // The helper is ours, but a parser that hangs must not hold the request.
-    // The child is not reaped until `wait_with_output`, so the pid cannot have
-    // been reused when the watchdog kills it.
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let (done, waiting) = mpsc::channel::<()>();
-    let pid = child.id();
-    let flag = Arc::clone(&timed_out);
-    let watchdog = thread::spawn(move || {
-        if waiting.recv_timeout(KEYGEN_TIMEOUT).is_err() {
-            flag.store(true, Ordering::SeqCst);
-            // SAFETY: pid is the live, unreaped child we spawned above.
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-        }
-    });
-
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = done.send(());
-        let _ = watchdog.join();
-        return Err(Error::KeygenCheckProtocol {
-            program: program.clone(),
-        });
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let expired = || Error::KeygenCheckTimedOut {
+        program: program.clone(),
+        seconds: timeout.as_secs(),
     };
-    let material = material.to_string();
-    let writer = thread::spawn(move || {
-        stdin.write_all(material.as_bytes())?;
-        stdin.flush()
-    });
-
-    let output = child.wait_with_output();
-    let _ = done.send(());
-    let _ = watchdog.join();
-    let written = writer.join().map_err(|_| Error::KeygenCheckProtocol {
-        program: program.clone(),
-    })?;
-    let output = output.map_err(|source| Error::WaitKeygenCheck {
-        program: program.clone(),
-        source,
-    })?;
-    if timed_out.load(Ordering::SeqCst) {
-        return Err(Error::KeygenCheckTimedOut {
-            program,
-            seconds: KEYGEN_TIMEOUT.as_secs(),
+    thread::scope(|scope| {
+        let (send, receive) = mpsc::channel();
+        scope.spawn(move || {
+            // The helper reads to EOF before it writes a verdict.
+            let written = stdin.write_all(material.as_bytes());
+            drop(stdin);
+            let mut output = Vec::new();
+            let read = stdout.read_to_end(&mut output).map(|_| output);
+            let _ = send.send((written, read));
         });
-    }
-    if !output.status.success() {
-        return Err(Error::KeygenCheckExited {
-            program,
-            status: output.status,
-        });
-    }
-    written.map_err(|source| Error::WriteKeygenCheck {
-        program: program.clone(),
-        source,
-    })?;
-    parse_keygen_output(&program, &output.stdout)
+        let result = (|| {
+            let (written, read) = receive
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => expired(),
+                    mpsc::RecvTimeoutError::Disconnected => Error::KeygenCheckProtocol {
+                        program: program.clone(),
+                    },
+                })?;
+            // EOF can precede exit. Only this thread may signal or reap the child.
+            loop {
+                if let Some(status) = child.try_wait().map_err(|source| Error::WaitKeygenCheck {
+                    program: program.clone(),
+                    source,
+                })? {
+                    if !status.success() {
+                        return Err(Error::KeygenCheckExited {
+                            program: program.clone(),
+                            status,
+                        });
+                    }
+                    break;
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(expired());
+                }
+                thread::sleep(left.min(Duration::from_millis(1)));
+            }
+            written.map_err(|source| Error::WriteKeygenCheck {
+                program: program.clone(),
+                source,
+            })?;
+            let output = read.map_err(|source| Error::ReadKeygenCheck {
+                program: program.clone(),
+                source,
+            })?;
+            parse_keygen_output(&program, &output)
+        })();
+        if result.is_err() {
+            // Child::kill is a no-op once try_wait has reaped this child.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        result
+    })
 }
 
-fn keygen_check_program() -> String {
+/// The executable the sandbox unveils and the key check starts.
+pub fn keygen_check_program() -> String {
     #[cfg(any(test, feature = "test-fixtures"))]
-    let _ = keygen_check_test_binary();
-    std::env::var("KYRIAKON_KEYGEN_CHECK").unwrap_or_else(|_| KEYGEN_CHECK.to_string())
+    {
+        keygen_check_test_binary().to_string_lossy().into_owned()
+    }
+    #[cfg(not(any(test, feature = "test-fixtures")))]
+    {
+        #[cfg(debug_assertions)]
+        if let Ok(program) = std::env::var("KYRIAKON_KEYGEN_CHECK") {
+            return program;
+        }
+        KEYGEN_CHECK.to_owned()
+    }
 }
 
 /// The check protocol: `ok` and one finding per line, or `uninspected`.
@@ -433,10 +454,9 @@ fn parse_keygen_output(program: &str, stdout: &[u8]) -> Result<KeygenVerdict, Er
     }
 }
 
-/// Build the helper from its own build root and point the process at it. Test
-/// builds and the acceptance suite call this; a service build never compiles it.
+/// Resolve the fixture helper once per test process, before the sandbox locks.
 #[cfg(any(test, feature = "test-fixtures"))]
-pub fn keygen_check_test_binary() -> PathBuf {
+fn keygen_check_test_binary() -> &'static Path {
     use std::sync::LazyLock;
 
     static PATH: LazyLock<PathBuf> = LazyLock::new(|| {
@@ -445,13 +465,7 @@ pub fn keygen_check_test_binary() -> PathBuf {
         }
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let manifest = root.join("keygen/Cargo.toml");
-        let binary = root.join("keygen/target/debug/keygen-check");
-        // A test run must not shell out to cargo once the helper exists: the
-        // outer `cargo test` is the one that builds it, and a nested build on a
-        // fresh clone is the slow path, not the loop.
-        if binary.is_file() {
-            return binary;
-        }
+        let target = root.join("keygen/target");
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let status = std::process::Command::new(cargo)
             .args([
@@ -463,14 +477,14 @@ pub fn keygen_check_test_binary() -> PathBuf {
                 "--manifest-path",
             ])
             .arg(&manifest)
+            .arg("--target-dir")
+            .arg(target.as_path())
             .status()
             .expect("cargo builds keygen-check");
         assert!(status.success(), "cargo build keygen-check failed");
-        binary
+        target.join("debug/keygen-check")
     });
-    let path = PATH.clone();
-    std::env::set_var("KYRIAKON_KEYGEN_CHECK", &path);
-    path
+    &PATH
 }
 
 /// The advisory a well-framed block gets when the crate cannot parse it. It is
@@ -1148,6 +1162,18 @@ mod tests {
 
     fn armoured(b64: &str) -> String {
         format!("{BEGIN}\n\n{b64}\n{END}\n")
+    }
+
+    #[test]
+    fn helper_eof_does_not_cancel_its_deadline() {
+        let home = ScratchHome::new().unwrap();
+        let path = home.path().join("check");
+        std::fs::write(&path, "#!/bin/sh\nexec 1>&-\nexec sleep 5\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            run_keygen_check(path.display().to_string(), "", 0, Duration::from_millis(50)),
+            Err(Error::KeygenCheckTimedOut { .. })
+        ));
     }
 
     #[test]
