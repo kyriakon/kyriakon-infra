@@ -1,0 +1,33 @@
+# The key check under libFuzzer. Not part of any service build: `cargo-fuzz`
+# builds this on nightly, which is why it is a crate of its own.
+#
+#   cargo +nightly fuzz run key
+#
+# Seeds are committed in `corpus/key/`; a crash lands in `artifacts/key/` and is
+# turned into a test in `../src/`. See docs/runbook.md, "Fuzz the parsers".
+[package]
+name = "kyriakon-keygen-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# The check half only: no generator, no rand, no smallvec.
+[dependencies.keygen]
+path = ".."
+default-features = false
+
+[[bin]]
+name = "key"
+path = "fuzz_targets/key.rs"
+test = false
+doc = false
+bench = false
+
+# Detached from any parent workspace: this crate needs nightly.
+[workspace]

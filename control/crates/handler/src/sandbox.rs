@@ -34,6 +34,7 @@ pub fn restrict(cfg: &Config) -> Result<(), sandbox::Error> {
     sandbox::unveil("/dev/null", "rw")?;
     sandbox::unveil(session::DOAS, "x")?;
     sandbox::unveil(session::AUTHCHECK, "x")?;
+    sandbox::unveil_keygen_check()?;
     sandbox::lock()?;
     sandbox::probe(&cfg.store_root)?;
     sandbox::probe("/dev/urandom")?;

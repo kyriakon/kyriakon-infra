@@ -900,6 +900,9 @@ fn address_key(intent: &GroupAddressIntent) -> Result<KeyRecord, Transitions> {
     // The form and the rotation path refuse a key whose verdict is not "works";
     // the console is the same boundary, so an AEAD advert or an expiring subkey
     // cannot reach the keyring by this route.
+    if let Some(err) = checked.helper_error() {
+        kyriakon_control_core::util::report(err, "keygen-check");
+    }
     if let Some(verdict) = checked.refusal() {
         return Err(Transitions::Groups(Error::MailKeyUnusable {
             mailbox: intent.mailbox.clone(),

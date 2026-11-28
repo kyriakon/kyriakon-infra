@@ -121,7 +121,7 @@ async fn a_titan_upload_of_an_undeliverable_key_is_refused() {
         .unwrap();
 
     let body = std::fs::read_to_string(format!(
-        "{}/../../../docs/planning/prototypes/keygen-spike/fixtures/gpg-aead.asc",
+        "{}/../../../keygen/fixtures/gpg-aead.asc",
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap();

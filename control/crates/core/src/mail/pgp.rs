@@ -16,10 +16,13 @@
 //! large export cannot fill a pipe while gpg fills the other (#929), and it
 //! kills the child at a hard deadline.
 
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
@@ -37,6 +40,20 @@ const SIGNED_END: &str = "-----END PGP SIGNATURE-----";
 /// must not hold the single-flight drain open forever.
 const GPG_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Production releases do not consult the environment for an executable.
+#[cfg(not(any(test, feature = "test-fixtures")))]
+const KEYGEN_CHECK: &str = "/usr/local/libexec/keygen-check";
+
+/// The helper parses one key and exits. A parser that hangs on one key must not
+/// hold the request open.
+const KEYGEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Matches `keygen-check`'s stdin cap so oversized material fails without a spawn.
+const MAX_KEYGEN_INPUT: usize = 1 << 20;
+
+/// Real verdicts are a few hundred bytes; bound stdout against a runaway helper.
+const MAX_KEYGEN_OUTPUT: usize = 64 * 1024;
+
 #[derive(Debug)]
 pub struct Checked {
     /// "works" when the shared check finds nothing, or its findings joined with
@@ -47,6 +64,11 @@ pub struct Checked {
     /// advisory that proceeds; a key is refused only when `inspected` and the
     /// verdict is not "works".
     pub inspected: bool,
+    /// Why the helper could not answer, when it could not: a missing binary, a
+    /// timeout, a non-zero exit or a broken protocol. `None` for a clean run and
+    /// for the helper's own `uninspected`, which is a gap in its parse rather
+    /// than a fault of this process; the advisory covers both alike.
+    helper_error: Option<Error>,
 }
 
 impl Checked {
@@ -54,6 +76,13 @@ impl Checked {
     /// inspected or the check found nothing. The parser-gap advisory proceeds.
     pub fn refusal(&self) -> Option<&str> {
         (self.inspected && self.verdict != "works").then_some(self.verdict.as_str())
+    }
+
+    /// The helper's own failure, so a daemon writes it to its log instead of
+    /// losing it. The portal does not report this: its stderr is a member's
+    /// terminal.
+    pub fn helper_error(&self) -> Option<&Error> {
+        self.helper_error.as_ref()
     }
 }
 
@@ -281,37 +310,243 @@ pub fn inspect_single_cert(armour: &str) -> Result<Cert, Error> {
 /// Inspect an armoured PGP public key block. `Err` is the refusal reason; the
 /// verdict is the shared crate's reading of the three conditions, joined when
 /// more than one trips. `inspected` separates a finding from the advisory that
-/// the parser could not read the block.
+/// the parser could not read the block, and a helper that could not answer keeps
+/// its error for the caller's log.
 pub fn public_key(value: &str) -> Result<Checked, Error> {
-    let (findings, inspected) = inspected_findings(value)?;
-    Ok(Checked {
-        verdict: if findings.is_empty() {
-            "works".to_string()
-        } else {
-            findings.join("; ")
+    public_key_with(keygen_check_program(), value, now_secs(), KEYGEN_TIMEOUT)
+}
+
+/// The one inspection, with the helper named. [`public_key`] names the deployed
+/// one; a test drives a helper that cannot answer, which is the path this keeps
+/// observable.
+fn public_key_with(
+    program: String,
+    value: &str,
+    now: u64,
+    timeout: Duration,
+) -> Result<Checked, Error> {
+    let cert = inspect_single_cert(value)?;
+    Ok(
+        match run_keygen_check(program, &cert.material, now, timeout) {
+            Ok(KeygenVerdict::Parsed(findings)) if findings.is_empty() => Checked {
+                verdict: "works".to_string(),
+                inspected: true,
+                helper_error: None,
+            },
+            Ok(KeygenVerdict::Parsed(findings)) => Checked {
+                verdict: findings.join("; "),
+                inspected: true,
+                helper_error: None,
+            },
+            // The helper read the framing and could not read the key: a gap in the
+            // check, not a fault in this process, so there is nothing to log.
+            Ok(KeygenVerdict::Uninspected) => Checked {
+                verdict: UNINSPECTED.to_string(),
+                inspected: false,
+                helper_error: None,
+            },
+            // A helper that could not answer is the same advisory to the applicant
+            // and a line in the daemon's log for the operator.
+            Err(err) => Checked {
+                verdict: UNINSPECTED.to_string(),
+                inspected: false,
+                helper_error: Some(err),
+            },
         },
-        inspected,
+    )
+}
+
+/// The three-condition findings, for a caller that only shows them. The
+/// advisory a helper gap produces is one entry, which is what the caller
+/// prints; no refusal is built from this.
+pub fn findings(value: &str) -> Result<Vec<String>, Error> {
+    let checked = public_key(value)?;
+    Ok(if checked.verdict == "works" {
+        Vec::new()
+    } else {
+        vec![checked.verdict]
     })
 }
 
-/// The three-condition inspection, from the crate the page builds to WASM, with
-/// the framing check that decides whether the material is a public key block at
-/// all. The conditions themselves are not repeated here.
-pub fn findings(value: &str) -> Result<Vec<String>, Error> {
-    inspected_findings(value).map(|(findings, _)| findings)
+/// The helper's answer, with the parser gap kept distinct from a clean key.
+enum KeygenVerdict {
+    Parsed(Vec<String>),
+    Uninspected,
 }
 
-/// The crate's findings, and whether it read the block at all. A parser that
-/// cannot read a well-framed block is a gap in this check, not a verdict on the
-/// key: the advisory proceeds and names a reader.
-fn inspected_findings(value: &str) -> Result<(Vec<String>, bool), Error> {
-    let cert = inspect_single_cert(value)?;
-    Ok(
-        match keygen_spike::check_public_key(&cert.material, now_secs()) {
-            Ok(findings) => (findings, true),
-            Err(_) => (vec![UNINSPECTED.to_string()], false),
-        },
-    )
+/// Run `keygen-check` for one key. The helper is a separate build root so the
+/// control plane does not link `pgp`; every failure here is the uninspected
+/// advisory at the caller, never a refusal on a key the platform did not read.
+fn run_keygen_check(
+    program: String,
+    material: &str,
+    now: u64,
+    timeout: Duration,
+) -> Result<KeygenVerdict, Error> {
+    if material.len() > MAX_KEYGEN_INPUT {
+        return Err(Error::KeygenCheckProtocol { program });
+    }
+    let deadline = Instant::now() + timeout;
+    let mut child = std::process::Command::new(&program)
+        .env_clear()
+        .arg("--now-secs")
+        .arg(now.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| Error::RunKeygenCheck {
+            program: program.clone(),
+            source,
+        })?;
+
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let expired = || Error::KeygenCheckTimedOut {
+        program: program.clone(),
+        seconds: timeout.as_secs(),
+    };
+    thread::scope(|scope| {
+        let (send, receive) = mpsc::channel();
+        scope.spawn(move || {
+            // The helper reads to EOF before it writes a verdict.
+            let written = stdin.write_all(material.as_bytes());
+            drop(stdin);
+            let mut output = Vec::new();
+            let read = stdout
+                .take(MAX_KEYGEN_OUTPUT as u64 + 1)
+                .read_to_end(&mut output)
+                .map(|_| output);
+            let _ = send.send((written, read));
+        });
+        let result = (|| {
+            let (written, read) = receive
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => expired(),
+                    mpsc::RecvTimeoutError::Disconnected => Error::KeygenCheckProtocol {
+                        program: program.clone(),
+                    },
+                })?;
+            if matches!(&read, Ok(output) if output.len() > MAX_KEYGEN_OUTPUT) {
+                return Err(Error::KeygenCheckProtocol {
+                    program: program.clone(),
+                });
+            }
+            // EOF can precede exit. Only this thread may signal or reap the child.
+            loop {
+                if let Some(status) = child.try_wait().map_err(|source| Error::WaitKeygenCheck {
+                    program: program.clone(),
+                    source,
+                })? {
+                    if !status.success() {
+                        return Err(Error::KeygenCheckExited {
+                            program: program.clone(),
+                            status,
+                        });
+                    }
+                    break;
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(expired());
+                }
+                thread::sleep(left.min(Duration::from_millis(1)));
+            }
+            written.map_err(|source| Error::WriteKeygenCheck {
+                program: program.clone(),
+                source,
+            })?;
+            let output = read.map_err(|source| Error::ReadKeygenCheck {
+                program: program.clone(),
+                source,
+            })?;
+            parse_keygen_output(&program, &output)
+        })();
+        if result.is_err() {
+            // Child::kill is a no-op once try_wait has reaped this child.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        result
+    })
+}
+
+/// The executable the sandbox unveils and the key check starts.
+pub fn keygen_check_program() -> String {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    {
+        keygen_check_test_binary().to_string_lossy().into_owned()
+    }
+    #[cfg(not(any(test, feature = "test-fixtures")))]
+    {
+        #[cfg(debug_assertions)]
+        if let Ok(program) = std::env::var("KYRIAKON_KEYGEN_CHECK") {
+            if !program.is_empty() {
+                return program;
+            }
+        }
+        KEYGEN_CHECK.to_owned()
+    }
+}
+
+/// The check protocol: `ok` and one finding per line, or `uninspected`.
+fn parse_keygen_output(program: &str, stdout: &[u8]) -> Result<KeygenVerdict, Error> {
+    let protocol = || Error::KeygenCheckProtocol {
+        program: program.to_string(),
+    };
+    let text = std::str::from_utf8(stdout).map_err(|_| protocol())?;
+    let Some(body) = text.strip_suffix('\n') else {
+        return Err(protocol());
+    };
+    let mut lines = body.split('\n');
+    match lines.next() {
+        Some("ok") => {
+            let mut findings = Vec::new();
+            for line in lines {
+                if line.is_empty() {
+                    return Err(protocol());
+                }
+                findings.push(line.to_string());
+            }
+            Ok(KeygenVerdict::Parsed(findings))
+        }
+        Some("uninspected") if lines.next().is_none() => Ok(KeygenVerdict::Uninspected),
+        _ => Err(protocol()),
+    }
+}
+
+/// Resolve the fixture helper once per test process, before the sandbox locks.
+#[cfg(any(test, feature = "test-fixtures"))]
+fn keygen_check_test_binary() -> &'static Path {
+    use std::sync::LazyLock;
+
+    static PATH: LazyLock<PathBuf> = LazyLock::new(|| {
+        if let Some(program) = std::env::var_os("KYRIAKON_KEYGEN_CHECK").filter(|v| !v.is_empty()) {
+            return PathBuf::from(program);
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let manifest = root.join("keygen/Cargo.toml");
+        let target = root.join("keygen/target");
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let status = std::process::Command::new(cargo)
+            .args([
+                "build",
+                "--quiet",
+                "--no-default-features",
+                "--bin",
+                "keygen-check",
+                "--manifest-path",
+            ])
+            .arg(&manifest)
+            .arg("--target-dir")
+            .arg(target.as_path())
+            .status()
+            .expect("cargo builds keygen-check");
+        assert!(status.success(), "cargo build keygen-check failed");
+        target.join("debug/keygen-check")
+    });
+    &PATH
 }
 
 /// The advisory a well-framed block gets when the crate cannot parse it. It is
@@ -992,6 +1227,70 @@ mod tests {
     }
 
     #[test]
+    fn helper_eof_does_not_cancel_its_deadline() {
+        let home = ScratchHome::new().unwrap();
+        let path = home.path().join("check");
+        std::fs::write(&path, "#!/bin/sh\nexec 1>&-\nexec sleep 5\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            run_keygen_check(path.display().to_string(), "", 0, Duration::from_millis(50)),
+            Err(Error::KeygenCheckTimedOut { .. })
+        ));
+    }
+
+    #[test]
+    fn keygen_protocol_rejects_truncated_blank_and_trailing_output() {
+        assert!(matches!(
+            parse_keygen_output("check", b"ok"),
+            Err(Error::KeygenCheckProtocol { .. })
+        ));
+        assert!(matches!(
+            parse_keygen_output("check", b"ok\n\n"),
+            Err(Error::KeygenCheckProtocol { .. })
+        ));
+        assert!(matches!(
+            parse_keygen_output("check", b"uninspected\nextra\n"),
+            Err(Error::KeygenCheckProtocol { .. })
+        ));
+        assert!(matches!(
+            parse_keygen_output("check", b"ok\n"),
+            Ok(KeygenVerdict::Parsed(findings)) if findings.is_empty()
+        ));
+        assert!(matches!(
+            parse_keygen_output("check", b"uninspected\n"),
+            Ok(KeygenVerdict::Uninspected)
+        ));
+    }
+
+    #[test]
+    fn keygen_helper_gets_clean_env_and_bounded_stdout() {
+        let home = ScratchHome::new().unwrap();
+        let env_check = home.path().join("env-check");
+        std::fs::write(
+            &env_check,
+            "#!/bin/sh\ncat >/dev/null\nif [ -n \"${HOME:-}\" ]; then echo leak; else echo ok; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&env_check, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            run_keygen_check(env_check.display().to_string(), "", 0, Duration::from_secs(2)),
+            Ok(KeygenVerdict::Parsed(findings)) if findings.is_empty()
+        ));
+
+        let flood = home.path().join("flood");
+        std::fs::write(
+            &flood,
+            "#!/bin/sh\ncat >/dev/null\necho ok\nhead -c 70000 /dev/zero | tr '\\0' x\necho\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&flood, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            run_keygen_check(flood.display().to_string(), "", 0, Duration::from_secs(2)),
+            Err(Error::KeygenCheckProtocol { .. })
+        ));
+    }
+
+    #[test]
     fn the_generators_own_key_checks_clean() {
         let c = public_key(CLEAN).unwrap();
         assert_eq!(c.verdict, "works");
@@ -1055,6 +1354,41 @@ mod tests {
 
         let clean = public_key(CLEAN).unwrap();
         assert!(clean.inspected);
+    }
+
+    #[test]
+    fn a_helper_that_cannot_run_is_the_advisory_with_its_error_kept() {
+        // ADR 0008: a key this platform could not inspect must still proceed.
+        // The operator learns why from the error the advisory carries, which is
+        // the one thing the old catch-all dropped.
+        let missing = public_key_with(
+            "/nonexistent/keygen-check".to_string(),
+            CLEAN,
+            0,
+            Duration::from_millis(50),
+        )
+        .expect("a helper that cannot run is not a framing refusal");
+        assert!(!missing.inspected, "{}", missing.verdict);
+        assert!(missing.refusal().is_none(), "{}", missing.verdict);
+        assert!(
+            matches!(missing.helper_error(), Some(Error::RunKeygenCheck { .. })),
+            "{:?}",
+            missing.helper_error()
+        );
+
+        let home = ScratchHome::new().unwrap();
+        let path = home.path().join("check");
+        std::fs::write(&path, "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let failed = public_key_with(path.display().to_string(), CLEAN, 0, Duration::from_secs(2))
+            .expect("a helper that exits non-zero is not a framing refusal");
+        assert!(!failed.inspected);
+        assert!(failed.refusal().is_none());
+        assert!(
+            matches!(failed.helper_error(), Some(Error::KeygenCheckExited { .. })),
+            "{:?}",
+            failed.helper_error()
+        );
     }
 
     #[test]

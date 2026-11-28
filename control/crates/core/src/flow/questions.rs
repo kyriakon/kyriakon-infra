@@ -291,6 +291,8 @@ pub fn is_monastic(orders: Option<&str>) -> bool {
     matches!(orders.map(str::trim), Some("monk") | Some("nun"))
 }
 
+pub(super) const BODY_MAILBOX_LIMIT: usize = 10;
+
 /// The body's account names, one per mailbox, in the order the answers gave.
 /// The form, the capsule and the mail route all pair a key with one of these
 /// names, so the parsing lives here rather than in three places. A name given
@@ -311,6 +313,9 @@ pub fn account_names(answers: &BTreeMap<String, String>) -> Result<Vec<String>, 
             return Err(Error::DuplicateAccountName {
                 name: line.to_string(),
             });
+        }
+        if names.len() == BODY_MAILBOX_LIMIT {
+            return Err(Error::TooManyAccountNames);
         }
         names.push(line.to_string());
     }
@@ -454,6 +459,23 @@ required = true
         assert!(matches!(
             account_names(&answers),
             Err(Error::DuplicateAccountName { name }) if name == "secretary"
+        ));
+    }
+
+    #[test]
+    fn account_names_stop_at_ten_mailboxes() {
+        let mut answers = BTreeMap::from([(
+            "body_account_names".into(),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten".to_string(),
+        )]);
+        assert_eq!(account_names(&answers).unwrap().len(), 10);
+        answers
+            .get_mut("body_account_names")
+            .unwrap()
+            .push_str("\neleven");
+        assert!(matches!(
+            account_names(&answers),
+            Err(Error::TooManyAccountNames)
         ));
     }
 

@@ -1,0 +1,9 @@
+target
+artifacts
+coverage
+# libFuzzer writes a hash-named entry for every input that finds new coverage.
+# The hand-written seeds under corpus/key/ are text and tracked instead.
+corpus/*
+!corpus/key/
+corpus/key/*
+!corpus/key/*.asc

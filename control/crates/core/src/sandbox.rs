@@ -107,6 +107,17 @@ pub fn unveil(_path: &str, _permissions: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// The helper is optional. A missing basename can be unveiled by name, but
+/// a missing parent returns ENOENT; neither should prevent startup.
+pub fn unveil_keygen_check() -> Result<(), Error> {
+    match unveil(&crate::mail::pgp::keygen_check_program(), "x") {
+        Err(Error::Unveil { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 /// Lock the list: after this no later unveil can widen the view and a path not
 /// named is invisible. Strongly recommended by `unveil(2)`.
 #[cfg(target_os = "openbsd")]

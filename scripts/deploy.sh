@@ -123,6 +123,9 @@ classify() {
 	# deploy: a new binary is not running until smtpd restarts the filter.
 	control/crates/fromcheck/*) needs_control=yes; needs_mail=yes ;;
 	control/*) needs_control=yes ;;
+	# The key check helper is built by the control deploy and installed beside
+	# the handler; a change to it is a control deploy, not its own service.
+	keygen/*) needs_control=yes ;;
 	# The filter reads mailparse too, so a parser change rebuilds and restarts
 	# it as well as the encryptor.
 	mailparse/*) needs_mail=yes; needs_control=yes ;;
@@ -749,6 +752,9 @@ self_test() {
 	classify 'control/crates/fromcheck/src/lib.rs'
 	check 'a filter change rebuilds it and restarts smtpd' \
 		"$needs_control $needs_mail" 'yes yes'
+	reset_plan
+	classify 'keygen/src/lib.rs'
+	check 'a key check change plans deploy-control' "$needs_control" yes
 	reset_plan
 	classify 'scripts/kyriakon-authcheck.sh'
 	check 'the libexec install plans deploy-control' "$needs_control" yes

@@ -4,8 +4,9 @@
 # The release's front door, installed from this repository: the store under
 # /var/db/onboard, the six programs built from control/. Five go to
 # /usr/local/sbin (the handler, the member content responder, the root drain,
-# kyriakon-admin and the portal) and the From-header filter to
-# /usr/local/libexec/filter-fromcheck, the handler's config at /etc/onboard/onboard.toml,
+# kyriakon-admin and the portal), the From-header filter to
+# /usr/local/libexec/filter-fromcheck, and the key check helper built from
+# keygen/ to /usr/local/libexec/keygen-check, the handler's config at /etc/onboard/onboard.toml,
 # the responder's at /etc/onboard/static.toml, and the drain's own root-only config
 # at /etc/kyriakon/onboard/drain.toml, the first and last with the deployed release
 # substituted, and the two rc.d units. Every step is idempotent, so a rebuild, or a
@@ -550,7 +551,7 @@ onboard_user='_onboard'
 
 # Every source this installs, checked before anything on the box is changed, so a
 # half-copied checkout fails here rather than after the store has been written.
-for f in control/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/drain.toml \
+for f in control/Cargo.toml keygen/Cargo.toml openbsd/etc/onboard/onboard.toml openbsd/etc/onboard/drain.toml \
 	openbsd/etc/onboard/static.toml control/questions.toml \
 	openbsd/etc/rc.d/kyriakon_control openbsd/etc/rc.d/kyriakon_control_static \
 	scripts/control-store.sh scripts/render-docs.sh \
@@ -595,6 +596,10 @@ say "build"
 # jq for the publish path, and gmid for the capsule socket directory.
 need_packages "$repo_dir/openbsd/packages.tsv" deploy-control.sh
 cargo build --release --manifest-path "$repo_dir/control/Cargo.toml"
+# The helper is its own build root so the control programs do not link pgp. It
+# is built without the generator feature, so no rand or smallvec reaches it.
+cargo build --release --manifest-path "$repo_dir/keygen/Cargo.toml" \
+	--no-default-features --bin keygen-check
 # The handler, the member content responder, the root drain, kyriakon-admin, the
 # portal and the From-header filter are one workspace and six programs: a build
 # that produced some of them but not the others is half a service. The portal is
@@ -605,12 +610,25 @@ for b in kyriakon-control kyriakon-control-static kyriakon-control-drain kyriako
 	[ -x "$repo_dir/control/target/release/$b" ] \
 		|| die "the build produced no binary at control/target/release/$b"
 done
+[ -x "$repo_dir/keygen/target/release/keygen-check" ] \
+	|| die "the build produced no binary at keygen/target/release/keygen-check"
 
 say "install"
 install -d -m 0755 -o root -g wheel /etc/onboard
 # The responder's host-to-tree map. Empty on a box with no group site; the group
 # lanes write one file per domain into it.
 install -d -m 0755 -o root -g wheel /etc/onboard/static-hosts
+install -d -m 0755 -o root -g wheel /usr/local/libexec
+# The key check helper core runs for a submitted key. Its name is the manifest
+# row's, so the path core compiles in and the deploy installs cannot drift.
+keygen_check_name=$(manifest_installed_name "$install_set" keygen-check /usr/local/libexec) \
+	|| die "cannot read $install_set"
+[ -n "$keygen_check_name" ] || die "$install_set names no keygen-check for /usr/local/libexec"
+# core compiles in this basename; a manifest rename would install a helper the
+# handler never runs.
+[ "$keygen_check_name" = keygen-check ] || die "$install_set installs keygen-check as $keygen_check_name"
+install -m 0755 "$repo_dir/keygen/target/release/keygen-check" \
+	"/usr/local/libexec/$keygen_check_name"
 install -m 0755 "$repo_dir/control/target/release/kyriakon-control" /usr/local/sbin/kyriakon-control
 # The member content responder, which serves /home/www for both front-ends. Its
 # config names the two sockets and the tree, and is installed verbatim: nothing
@@ -669,7 +687,6 @@ fi
 # doas.conf cannot name the check's arguments (they are the username), so it
 # names this program, and the program is what keeps the subcommand fixed and
 # mints the login proof.
-install -d -m 0755 -o root -g wheel /usr/local/libexec
 # lib.sh sits beside it because the checker sources valid_localpart from there.
 # It is a 0644 source file, not a program, so it adds nothing the doas rule can
 # run: the rule still names only /usr/local/libexec/kyriakon-authcheck.

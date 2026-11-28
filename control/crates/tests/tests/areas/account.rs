@@ -21,19 +21,13 @@ fn logging_script(fix: &Fix, name: &str) -> String {
 /// the generator's own clean key, since a replacement must pass the same check
 /// approval does.
 fn replacement_key() -> String {
-    let path =
-        repo_root().join("docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc");
+    let path = repo_root().join("keygen/fixtures/generated-clean.asc");
     std::fs::read_to_string(path).unwrap()
 }
 
 /// A fixture by file name, for a key whose verdict is the point of the test.
 fn fixture(name: &str) -> String {
-    std::fs::read_to_string(
-        repo_root()
-            .join("docs/planning/prototypes/keygen-spike/fixtures")
-            .join(name),
-    )
-    .unwrap()
+    std::fs::read_to_string(repo_root().join("keygen/fixtures").join(name)).unwrap()
 }
 
 /// A throwaway signing keypair in a temporary GNUPGHOME, with its home, public

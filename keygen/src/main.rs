@@ -1,10 +1,8 @@
-// Throwaway CLI for kyriakon-infra#185. The logic lives in src/lib.rs, which the browser
-// page loads as WebAssembly, so this exists only to drive the same code from a shell and to
-// write keys out for the client tests.
-//
-// Not the deliverable. No error handling worth the name, no CLI worth the name.
+// The generator CLI. The logic lives in src/lib.rs, which the browser page loads
+// as WebAssembly, so this drives the same code from a shell and writes keys out
+// for the client tests. The control plane uses `keygen-check` instead.
 
-use keygen_spike::{DEFAULT_USER_ID, check_public_key, generate_key, self_check};
+use keygen::{DEFAULT_USER_ID, check_public_key, generate_key, self_check};
 use pgp::composed::{Deserializable, SignedPublicKey, SignedSecretKey};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};

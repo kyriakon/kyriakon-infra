@@ -54,12 +54,13 @@ and `terraform apply`/`destroy` remain human-only.
 
 ## Fuzz the parsers
 
-Seven `cargo-fuzz` targets cover the parsers that read input the box does not
+Eight `cargo-fuzz` targets cover the parsers that read input the box does not
 control: the encryptor's message and envelope parsers, the handler's FastCGI
 reader and form decoder, the member path resolver, which asserts that a served
 file is always one inside the member's own root, the From-header filter's
-protocol and policy, and the shared header, address and MIME parsers in
-`mailparse/fuzz`. The `fuzz` workflow in
+protocol and policy, the shared header, address and MIME parsers in
+`mailparse/fuzz`, and the armour, packet and subkey walk `keygen-check` runs on
+a submitted key in `keygen/fuzz`. The `fuzz` workflow in
 `.github/workflows/fuzz.yml` runs each for two minutes every Monday and on
 demand. That is coverage over time, not a merge gate: a crash is filed as a bug
 with a regression test, not treated as a blocked PR.
@@ -67,7 +68,7 @@ with a regression test, not treated as a blocked PR.
 Run one for as long as you want, by hand. The paths below are relative to the
 `fuzz` directory the first command enters:
 
-	cd kyriakon-encrypt/fuzz     # or control/fuzz, or mailparse/fuzz
+	cd kyriakon-encrypt/fuzz     # or control/fuzz, mailparse/fuzz, or keygen/fuzz
 	cargo +nightly fuzz list     # the targets in this crate
 	cargo +nightly fuzz run message -- -max_total_time=300
 

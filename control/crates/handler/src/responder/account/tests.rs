@@ -1132,7 +1132,7 @@ async fn the_mail_key_form_starts_and_cancels_a_replacement() {
     let (app, dir) = handler("account-mail-key").await;
     file_account(&dir);
     let key = std::fs::read_to_string(format!(
-        "{}/../../../docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc",
+        "{}/../../../keygen/fixtures/generated-clean.asc",
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap();
@@ -1235,7 +1235,7 @@ async fn the_mail_key_form_refuses_a_key_delivery_cannot_use() {
         ),
     ] {
         let key = std::fs::read_to_string(format!(
-            "{}/../../../docs/planning/prototypes/keygen-spike/fixtures/{fixture}",
+            "{}/../../../keygen/fixtures/{fixture}",
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();

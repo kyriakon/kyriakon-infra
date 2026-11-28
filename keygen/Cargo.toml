@@ -1,0 +1,39 @@
+[package]
+name = "keygen"
+version = "0.1.0"
+edition = "2024"
+# A separate build root, like mailparse and kyriakon-encrypt: the control plane
+# runs keygen-check as a process and does not link the OpenPGP crate.
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The generator. `generate` is the CLI's and the page's half; `keygen-check`
+# and the control plane get only the check, so no rand or smallvec build.
+[[bin]]
+name = "keygen"
+path = "src/main.rs"
+required-features = ["generate"]
+
+# The check-only helper core invokes over stdin/stdout. It is built with
+# `--no-default-features`, so the feature list above stays out of it.
+[[bin]]
+name = "keygen-check"
+path = "src/bin/check.rs"
+
+[features]
+default = ["generate"]
+generate = ["dep:rand", "dep:smallvec"]
+wasm = ["generate", "dep:wasm-bindgen"]
+
+[dependencies]
+# `wasm` enables getrandom/js and web-time, not wasm-bindgen; the page needs it
+# and the native check is unaffected.
+pgp = { version = "0.20.0", features = ["wasm"] }
+rand = { version = "0.8", optional = true }
+smallvec = { version = "1", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+
+[target.'cfg(target_os = "openbsd")'.dependencies]
+libc = "0.2"

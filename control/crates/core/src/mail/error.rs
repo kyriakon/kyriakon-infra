@@ -74,6 +74,22 @@ pub enum Error {
     /// A signature file could not be written before gpg read it.
     WriteSignature { path: PathBuf, source: io::Error },
 
+    // ---- the key check helper ----
+    /// keygen-check could not be started.
+    RunKeygenCheck { program: String, source: io::Error },
+    /// keygen-check's stdin could not be written.
+    WriteKeygenCheck { program: String, source: io::Error },
+    /// keygen-check's stdout could not be drained.
+    ReadKeygenCheck { program: String, source: io::Error },
+    /// Waiting for keygen-check failed.
+    WaitKeygenCheck { program: String, source: io::Error },
+    /// keygen-check ran past the deadline and was stopped.
+    KeygenCheckTimedOut { program: String, seconds: u64 },
+    /// keygen-check ran and did not exit successfully.
+    KeygenCheckExited { program: String, status: ExitStatus },
+    /// keygen-check printed something that is not the check protocol.
+    KeygenCheckProtocol { program: String },
+
     // ---- armour framing ----
     /// The material is not framed as an armoured public key block.
     NotArmoured,
@@ -249,6 +265,28 @@ impl fmt::Display for Error {
             Error::WriteSignature { path, source } => {
                 write!(f, "cannot write {}: {source}", path.display())
             }
+            Error::RunKeygenCheck { program, source } => {
+                write!(f, "cannot run {program}: {source}")
+            }
+            Error::WriteKeygenCheck { program, source } => {
+                write!(f, "cannot write to {program}: {source}")
+            }
+            Error::ReadKeygenCheck { program, source } => {
+                write!(f, "cannot read {program}'s output: {source}")
+            }
+            Error::WaitKeygenCheck { program, source } => {
+                write!(f, "cannot wait for {program}: {source}")
+            }
+            Error::KeygenCheckTimedOut { program, seconds } => write!(
+                f,
+                "{program} did not finish within {seconds} seconds and was stopped"
+            ),
+            Error::KeygenCheckExited { program, status } => {
+                write!(f, "{program} exited {status}")
+            }
+            Error::KeygenCheckProtocol { program } => {
+                write!(f, "{program} did not print a check verdict")
+            }
             Error::NotArmoured => f.write_str("this is not an armoured PGP public key block"),
             Error::MultipleArmourBlocks => {
                 f.write_str("the material is more than one armoured key block; submit one key")
@@ -404,6 +442,10 @@ impl std::error::Error for Error {
             | Error::ReadGpgError { source, .. }
             | Error::WriteGpg { source }
             | Error::WriteSignature { source, .. }
+            | Error::RunKeygenCheck { source, .. }
+            | Error::WriteKeygenCheck { source, .. }
+            | Error::ReadKeygenCheck { source, .. }
+            | Error::WaitKeygenCheck { source, .. }
             | Error::ReadPasswd { source, .. }
             | Error::ReadVirtuals { source, .. }
             | Error::ReadTable { source, .. }

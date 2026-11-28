@@ -142,7 +142,7 @@ pub(crate) mod fixtures {
         ($name:literal) => {
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../../docs/planning/prototypes/keygen-spike/fixtures/",
+                "/../../../keygen/fixtures/",
                 $name
             ))
         };

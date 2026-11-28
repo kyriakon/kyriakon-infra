@@ -115,16 +115,13 @@ pub fn flow_problem(
         }
         return key_error(&blocks[0]);
     }
+    // The key rules run before the generic shape rule so a body's list is
+    // bounded before any per-key helper starts.
+    if q.rule == Rule::MailKey && !value.trim().is_empty() {
+        return mail_key_errors(q, value, answers).into_iter().next();
+    }
     if let Some(why) = validate::reason(q, value, reserved, required) {
         return Some(why.to_string());
-    }
-    // The shared key check is the web form's, because `validate::reason` only
-    // proves the first block parses; it does not count blocks or compare them
-    // with the body's account names.
-    if q.rule == Rule::MailKey && !value.is_empty() {
-        if let Some(why) = mail_key_errors(q, value, answers).into_iter().next() {
-            return Some(why);
-        }
     }
     if q.kind == Kind::Addresses {
         return validate::address_lines(value).map(|why| why.to_string());
@@ -237,9 +234,10 @@ pub fn mail_key_errors(q: &Question, value: &str, form: &BTreeMap<String, String
         return vec!["a public key is needed".to_string()];
     }
     if q.id == "body_mail_key" {
-        let mailboxes = questions::account_names(form)
-            .map(|names| names.len())
-            .unwrap_or_default();
+        let mailboxes = match questions::account_names(form) {
+            Ok(names) => names.len(),
+            Err(why) => return vec![why.to_string()],
+        };
         if blocks.len() != mailboxes {
             return vec![format!(
                 "one key per mailbox: {mailboxes} mailboxes and {} keys",

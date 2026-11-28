@@ -142,6 +142,7 @@ pub fn restrict(cfg: &DrainConfig) -> Result<(), Transitions> {
     unveil(&cfg.sendmail, "x")?;
     // The OpenPGP binary `mail::pgp` runs for a key check or a signature.
     unveil(&cfg.gpg, "x")?;
+    sandbox::unveil_keygen_check().map_err(|source| Error::Unveil { source })?;
     // The resolver `check_group_dns` runs, which needs no entry of its own for
     // `/etc/resolv.conf`: it is a different process after `execve`.
     unveil(&cfg.resolver, "x")?;

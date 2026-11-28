@@ -186,6 +186,9 @@ pub fn usernames(value: &str, reserved: &HashSet<String>) -> Option<Reason> {
                 source: Box::new(source),
             });
         }
+        if seen.len() > questions::BODY_MAILBOX_LIMIT {
+            return Some(Reason::TooManyAccountNames);
+        }
     }
     None
 }
@@ -272,7 +275,7 @@ pub fn address_lines(value: &str) -> Option<Reason> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    if lines.len() > 10 {
+    if lines.len() > questions::BODY_MAILBOX_LIMIT {
         return Some(Reason::AddressLinesTooMany { count: lines.len() });
     }
     for line in lines {

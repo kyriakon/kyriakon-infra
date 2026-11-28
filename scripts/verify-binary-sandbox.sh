@@ -56,10 +56,16 @@ tui_bin=${KYRIAKON_TUI_BIN:-$control_target/release/kyriakon-control-tui}
 fromcheck_bin=${KYRIAKON_FROMCHECK_BIN:-$control_target/release/kyriakon-fromcheck}
 encrypt_bin=${KYRIAKON_ENCRYPT_BIN:-$repo/kyriakon-encrypt/target/release/kyriakon-encrypt}
 probe_bin=${KYRIAKON_SANDBOX_PROBE:-$control_target/release/examples/sandbox-probe}
+keygen_check=${KYRIAKON_KEYGEN_CHECK:-/usr/local/libexec/keygen-check}
+case $keygen_check in /*) ;; *) keygen_check=$PWD/$keygen_check ;; esac
+# The handler and terminal resolve the helper at startup; give them the path
+# this script validated rather than letting a fixture build run inside the veil.
+export KYRIAKON_KEYGEN_CHECK=$keygen_check
 
 # The nested test key: a public key with an encryption subkey, from the
-# keygen-spike fixtures the other Rust tests share. Its private half is nowhere.
-fixture_key=$repo/docs/planning/prototypes/keygen-spike/fixtures/generated-clean.asc
+# keygen fixtures the other Rust tests share. Its private half is nowhere.
+fixture_key=$repo/keygen/fixtures/generated-clean.asc
+refused_key=$repo/keygen/fixtures/gpg-no-encryption-subkey.asc
 catalogue_src=$repo/openbsd/etc/onboard/catalogue.toml
 reserved_src=$repo/reserved-usernames.txt
 config_src=$repo/openbsd/etc/onboard/onboard.toml
@@ -158,7 +164,10 @@ make_fixture() {
 	for page in terms.gmi aup.gmi privacy.gmi key-walkthrough.gmi; do
 		printf '# %s\n\nA mirrored page.\n' "$page" > "$tree/store/pages/$page"
 	done
-	printf 'alice\n' > "$tree/store/accounts/alice/account.json"
+	cat > "$tree/store/accounts/alice/account.json" <<'ACCOUNT'
+{"version":1,"username":"alice","state":"active","decision":"approve","decided_at":"2026-09-30T09:00:00Z",
+"rail":"no_charge","no_charge":true,"created_at":"2026-09-30T09:00:00Z","certificates":[],"mail_key":"AAAA"}
+ACCOUNT
 	printf 'kyriakon.net\n' > "$tree/mail/mail_from"
 	cp "$fixture_key" "$tree/keyring/alice.asc"
 	chmod 700 "$tree/gpg"
@@ -221,10 +230,10 @@ full_run() {
 		die "the full run needs OpenBSD's unveil(2) and pledge(2); use --self-test"
 	typeset bin
 	for bin in "$static_bin" "$handler_bin" "$tui_bin" "$fromcheck_bin" \
-		"$encrypt_bin" "$probe_bin"; do
+		"$encrypt_bin" "$probe_bin" "$keygen_check"; do
 		[ -x "$bin" ] || die "no binary at $bin; set its KYRIAKON_*_BIN"
 	done
-	for file in "$fixture_key" "$catalogue_src" "$reserved_src" "$config_src"; do
+	for file in "$fixture_key" "$refused_key" "$catalogue_src" "$reserved_src" "$config_src"; do
 		[ -f "$file" ] || die "no $file"
 	done
 	command -v gpg >/dev/null 2>&1 || die "gpg is needed for the encryptor smoke run"
@@ -425,6 +434,22 @@ PERL
 	ls "$tree/store/sessions"/*.json >/dev/null 2>&1 ||
 		fail "the successful login wrote no session record"
 
+	# An unavailable checker only warns. Its specific refusal proves the handler
+	# executed the real checker after locking the veil.
+	cookie=$(perl -ne 'print $1 if /Set-Cookie:\s*(__Host-kyriakon_session=[^;]+)/i' \
+		"$tree/logs/login-ok-reply")
+	[ -n "$cookie" ] || fail "the login returned no session cookie"
+	key_body=$(perl -0777 -pe 's/([^A-Za-z0-9])/sprintf("%%%02X",ord($1))/ge' "$refused_key")
+	perl "$work/fcgi-request.pl" "$tree/run/httpd.sock" "action=replace&key=$key_body" \
+		REQUEST_METHOD=POST REQUEST_URI=/account/mail-key REMOTE_ADDR=127.0.0.1 \
+		SERVER_NAME=signup.kyriakon.net CONTENT_TYPE=application/x-www-form-urlencoded \
+		HTTP_ORIGIN=https://signup.kyriakon.net "HTTP_COOKIE=$cookie" \
+		> "$tree/logs/key-reply" || fail "the key replacement request failed"
+	alive "$hpid" ||
+		fail "the handler died on the mail-key replacement request"
+	grep -aq 'no encryption-capable subkey' "$tree/logs/key-reply" ||
+		fail "the handler did not inspect the signing-only key"
+
 	# 4. tui: a plain session reads its catalogue, takes its session lock, asks
 	# the handler for a status so the unix connect is exercised, and leaves. The
 	# start screen's word is "quit"; the menu's is "q", which this session never
@@ -438,6 +463,16 @@ PERL
 	if grep -q 'status service is not answering' "$tree/logs/tui"; then
 		fail "the terminal could not connect to the portal socket"
 	fi
+
+	apply_row=$(awk '/^\[\[service\]\]/ { ++row } /^action = "apply"/ { print row; exit }' "$catalogue_src")
+	{
+		printf '\n%s\ntheophilus\nperson\n\n\n' "$apply_row"
+		cat "$refused_key"
+		printf '\nquit\n'
+	} | "$tui_bin" --plain --config "$tree/handler.toml" --state "$tree/state" \
+		> "$tree/logs/tui-key" 2>&1 || fail "the terminal key session failed"
+	grep -q 'no encryption-capable subkey' "$tree/logs/tui-key" ||
+		fail "the terminal did not inspect the signing-only key"
 
 	kill "$hpid" 2>/dev/null || true
 	status=0

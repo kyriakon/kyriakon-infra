@@ -3163,6 +3163,9 @@ pub async fn mail_key(
                     return Ok(Settlement::refused(format!("the mail key: {why}")));
                 }
             };
+            if let Some(err) = checked.helper_error() {
+                kyriakon_control_core::util::report(err, "keygen-check");
+            }
             // Signup warns and proceeds because a heuristic refusal turns a
             // guarantee into a support queue. A replacement refuses, because
             // the account already receives mail and a key that stops delivery

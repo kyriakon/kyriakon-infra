@@ -140,6 +140,9 @@ pub(crate) async fn address(
                 path: path.clone().into(),
                 source,
             })?;
+            if let Some(err) = checked.helper_error() {
+                kyriakon_control_core::util::report(err, "keygen-check");
+            }
             if let Some(verdict) = checked.refusal() {
                 return Err(Error::MailKeyRefused {
                     mailbox: mailbox.to_string(),
