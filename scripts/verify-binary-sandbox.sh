@@ -332,35 +332,87 @@ EOF
 	# rather than through a daemon: a helper that is missing, or a promise that
 	# kills it, fails here by name instead of every key silently becoming the
 	# uninspected advisory. The clock is an argument so the fixtures' age cannot
-	# decide a verdict.
+	# decide a verdict. The helper's stdout is the check protocol, not a log:
+	# stdout alone is compared byte for byte, and stderr must stay empty, or a
+	# finding that leaked onto stdout would pass a grep.
+	printf 'ok\n' > "$tree/logs/keygen-clean.expected"
 	if ! "$keygen_check" --now-secs 1800000000 < "$fixture_key" \
-		> "$tree/logs/keygen-clean" 2>&1; then
+		> "$tree/logs/keygen-clean.out" 2> "$tree/logs/keygen-clean.err"; then
 		fail "keygen-check refused the clean fixture"
 	fi
-	grep -qx 'ok' "$tree/logs/keygen-clean" ||
-		fail "keygen-check printed no clean verdict"
+	cmp -s "$tree/logs/keygen-clean.expected" "$tree/logs/keygen-clean.out" ||
+		fail "keygen-check did not print exactly the clean verdict on stdout"
+	[ ! -s "$tree/logs/keygen-clean.err" ] ||
+		fail "keygen-check wrote to stderr on the clean fixture"
+	cat > "$tree/logs/keygen-refused.expected" <<'EXPECTED'
+ok
+There is no encryption-capable subkey, so mail to this member would be refused rather than delivered. Make a new key in Thunderbird or with gpg, which makes an encryption subkey beside the signing one.
+EXPECTED
 	if ! "$keygen_check" --now-secs 1800000000 < "$refused_key" \
-		> "$tree/logs/keygen-refused" 2>&1; then
+		> "$tree/logs/keygen-refused.out" 2> "$tree/logs/keygen-refused.err"; then
 		fail "keygen-check refused the signing-only fixture"
 	fi
-	grep -qx 'ok' "$tree/logs/keygen-refused" ||
-		fail "keygen-check did not parse the signing-only fixture"
-	grep -q 'no encryption-capable subkey' "$tree/logs/keygen-refused" ||
-		fail "keygen-check reported no finding for the signing-only fixture"
+	cmp -s "$tree/logs/keygen-refused.expected" "$tree/logs/keygen-refused.out" ||
+		fail "keygen-check did not print the ok line and exactly the expected finding"
+	[ ! -s "$tree/logs/keygen-refused.err" ] ||
+		fail "keygen-check wrote to stderr on the signing-only fixture"
 	printf 'not a key\n' |
-		"$keygen_check" --now-secs 1800000000 > "$tree/logs/keygen-malformed" 2>&1 ||
+		"$keygen_check" --now-secs 1800000000 \
+		> "$tree/logs/keygen-malformed.out" 2> "$tree/logs/keygen-malformed.err" ||
 		fail "keygen-check did not exit 0 on a malformed block"
-	grep -qx 'uninspected' "$tree/logs/keygen-malformed" ||
-		fail "keygen-check did not answer uninspected"
+	printf 'uninspected\n' > "$tree/logs/keygen-malformed.expected"
+	cmp -s "$tree/logs/keygen-malformed.expected" "$tree/logs/keygen-malformed.out" ||
+		fail "keygen-check did not answer exactly uninspected on stdout"
+	[ ! -s "$tree/logs/keygen-malformed.err" ] ||
+		fail "keygen-check wrote to stderr on a malformed block"
 	# dd rather than `head -c`: OpenBSD's head has no -c.
 	if dd if=/dev/zero bs=1024 count=1025 2>/dev/null | "$keygen_check" \
-		> "$tree/logs/keygen-large" 2>&1; then
+		> "$tree/logs/keygen-large.out" 2> "$tree/logs/keygen-large.err"; then
 		fail "keygen-check accepted an input over 1 MiB"
 	else
 		code=$?
 	fi
 	[ "$code" -eq 2 ] ||
 		fail "an over-1 MiB input exited $code, not 2"
+
+	# The rollout contract in #1049: a missing final basename must be admitted
+	# (merge to deploy, when the helper is not installed yet), and a missing
+	# parent must fail at startup naming the configured path. Both are read by
+	# the handler's own sandbox setup, so they run before the main handler.
+	mkdir -p "$tree/libexec"
+	handler_config "$tree" |
+		sed -e "s|^keygen_check = .*|keygen_check = \"$tree/libexec/keygen-check\"|" \
+		> "$tree/handler-absent.toml"
+	"$handler_bin" serve --config "$tree/handler-absent.toml" \
+		> "$tree/logs/handler-absent" 2>&1 &
+	apid=$!
+	if ! wait_for "$tree/run/portal.sock"; then
+		kill "$apid" 2>/dev/null || true
+		wait "$apid" 2>/dev/null || true
+		fail "the handler did not bind with a missing final helper basename"
+	fi
+	if ! alive "$apid"; then
+		wait "$apid" 2>/dev/null || true
+		fail "the handler exited with a missing final helper basename"
+	fi
+	kill "$apid" 2>/dev/null || true
+	status=0
+	wait "$apid" 2>/dev/null || status=$?
+	assert_signal_only "$status" "the handler with a missing helper basename"
+	rm -f "$tree/run/portal.sock" "$tree/run/httpd.sock" "$tree/run/gemini.sock"
+
+	handler_config "$tree" |
+		sed -e "s|^keygen_check = .*|keygen_check = \"$tree/no-such-dir/keygen-check\"|" \
+		> "$tree/handler-missing-dir.toml"
+	if "$handler_bin" serve --config "$tree/handler-missing-dir.toml" \
+		> "$tree/logs/handler-missing-dir" 2>&1; then
+		fail "the handler started with a key checker in a missing directory"
+	fi
+	grep -qF "$tree/no-such-dir/keygen-check" "$tree/logs/handler-missing-dir" ||
+		fail "the startup failure did not name the configured key checker path"
+	grep -qF 'No such file or directory' "$tree/logs/handler-missing-dir" ||
+		fail "the startup failure did not name the missing directory"
+	rm -f "$tree/run/portal.sock" "$tree/run/httpd.sock" "$tree/run/gemini.sock"
 
 	# 3. handler: bind four listeners, keep its view, and answer a portal read
 	# and three FastCGI requests. The capsule's `/apply` is unauthenticated and

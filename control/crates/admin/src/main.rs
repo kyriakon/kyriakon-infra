@@ -139,7 +139,7 @@ async fn run(cfg_path: &std::path::Path, rest: &[String]) -> Result<(), Error> {
     let cfg = DrainConfig::load(cfg_path)?;
     // The console runs no sandbox, but it runs the same key check and must name
     // the same helper the drain's config does.
-    kyriakon_control_core::mail::pgp::configure_keygen_check(&cfg.keygen_check);
+    kyriakon_control_core::mail::pgp::configure_keygen_check(&cfg.keygen_check)?;
     let store = Store::new(&cfg.store_root);
     let Some(verb) = rest.first().map(String::as_str) else {
         return Err(Error::Usage);

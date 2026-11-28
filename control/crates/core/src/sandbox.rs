@@ -38,6 +38,8 @@ pub enum Error {
     },
     /// `pledge(2)` refused the promise set.
     Pledge { source: std::io::Error },
+    /// The key checker's path is unusable or conflicts with the one already set.
+    KeyCheck(crate::mail::Error),
 }
 
 impl fmt::Display for Error {
@@ -57,6 +59,7 @@ impl fmt::Display for Error {
             ),
             Error::Probe { path, source } => write!(f, "unveil {path} (probe): {source}"),
             Error::Pledge { source } => write!(f, "pledge: {source}"),
+            Error::KeyCheck(source) => source.fmt(f),
         }
     }
 }
@@ -68,6 +71,7 @@ impl std::error::Error for Error {
             | Error::Lock { source }
             | Error::Probe { source, .. }
             | Error::Pledge { source } => Some(source),
+            Error::KeyCheck(source) => Some(source),
             Error::PathNotUtf8 { .. } | Error::NullPath { .. } | Error::ProbeUncovered { .. } => {
                 None
             }
@@ -113,7 +117,7 @@ pub fn unveil(_path: &str, _permissions: &str) -> Result<(), Error> {
 /// merge-to-deploy window working; a missing parent is a broken install and
 /// fails here rather than every check becoming the uninspected advisory.
 pub fn unveil_keygen_check(path: &str) -> Result<(), Error> {
-    crate::mail::pgp::configure_keygen_check(path);
+    crate::mail::pgp::configure_keygen_check(path).map_err(Error::KeyCheck)?;
     unveil(path, "x")
 }
 
