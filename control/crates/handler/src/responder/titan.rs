@@ -228,6 +228,13 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
     // two uploads that both read a keyless draft cannot both file a key. The
     // lock is held across the read-modify-write and not across the body read.
     let blocks = pgp::blocks(&String::from_utf8_lossy(&body));
+    // The key is inspected before the draft lock is taken: the helper may run
+    // for ten seconds, and every other applicant's draft write waits on this
+    // one. The locked read still decides which mailbox the upload fills.
+    let inspected = match blocks.as_slice() {
+        [block] => Some(pgp::public_key(block)),
+        _ => None,
+    };
     let outcome = match app
         .store
         .update_draft(token, |record| {
@@ -237,8 +244,25 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
             if blocks.len() != 1 {
                 return Ok((Upload::NotOneBlock, false));
             }
-            if let Some(why) = kyriakon_control_core::flow::applicant::key_error(&blocks[0]) {
-                return Ok((Upload::Unusable { reason: why }, false));
+            let checked = match inspected {
+                Some(Ok(checked)) => checked,
+                Some(Err(source)) => {
+                    return Ok((
+                        Upload::Unusable {
+                            reason: source.to_string(),
+                        },
+                        false,
+                    ))
+                }
+                None => return Ok((Upload::NotOneBlock, false)),
+            };
+            if let Some(why) = checked.refusal() {
+                return Ok((
+                    Upload::Unusable {
+                        reason: why.to_string(),
+                    },
+                    false,
+                ));
             }
             // The same retain-then-push the capsule's key page uses, so a retry
             // for one mailbox replaces its key rather than adding a second.
@@ -257,9 +281,11 @@ pub(super) async fn titan_answer<R: tokio::io::AsyncRead + Unpin>(
             } else {
                 format!("{mailbox}@kyriakon.net")
             };
-            record
-                .mail_keys
-                .push(keycheck::mail_key(mailbox.clone(), &identity, &blocks[0]));
+            record.mail_keys.push(keycheck::mail_key_from_checked(
+                mailbox.clone(),
+                &identity,
+                &checked,
+            ));
             Ok::<_, Error>((Upload::Filled(mailbox), true))
         })
         .await

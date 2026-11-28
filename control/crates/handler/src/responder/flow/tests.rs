@@ -1,6 +1,6 @@
 //! Tests for the flow module.
 
-use super::{application_problems, build_record};
+use super::{application_problems, build_record, mail_keys_from_form};
 use crate::fastcgi::fixture;
 use crate::responder::test_support::*;
 use kyriakon_control_core::flow::applicant::{body_cross_checks, label};
@@ -204,7 +204,7 @@ async fn the_second_checkbox_is_recorded_beside_the_documents() {
         .collect();
 
     form.insert("accept_supply".to_string(), "yes".to_string());
-    let record = build_record(&app, &form, true, TOKEN, "web").unwrap();
+    let record = build_record(&app, &form, true, TOKEN, "web", Vec::new());
     let documents: Vec<&str> = record
         .acceptances
         .iter()
@@ -222,7 +222,7 @@ async fn the_second_checkbox_is_recorded_beside_the_documents() {
     );
 
     form.remove("accept_supply");
-    let record = build_record(&app, &form, true, TOKEN, "web").unwrap();
+    let record = build_record(&app, &form, true, TOKEN, "web", Vec::new());
     assert_eq!(
         record.acceptances.len(),
         3,
@@ -337,7 +337,7 @@ async fn a_padded_monastic_answer_still_requires_the_blessing() {
         .collect();
     form.insert("orders".to_string(), "monk ".to_string());
     form.insert("blessing".to_string(), String::new());
-    let errors = application_problems(&app, &form);
+    let (errors, _) = application_problems(&app, &form);
     assert!(
         errors.iter().any(|e| e.contains("blessing")),
         "the monastic blessing is still required: {errors:?}"
@@ -384,7 +384,9 @@ async fn a_persons_key_is_checked_against_the_username() {
     form.insert("username".to_string(), "alice".to_string());
     form.insert("whose".to_string(), "person".to_string());
     form.insert("mail_key".to_string(), key);
-    let record = build_record(&app, &form, false, TOKEN, "web").unwrap();
+    let (_, inspected) = application_problems(&app, &form);
+    let mail_keys = mail_keys_from_form(&form, false, &inspected).unwrap();
+    let record = build_record(&app, &form, false, TOKEN, "web", mail_keys);
     assert_eq!(record.mail_keys.len(), 1);
     assert!(
         record.mail_keys[0].verdict.contains("User ID"),

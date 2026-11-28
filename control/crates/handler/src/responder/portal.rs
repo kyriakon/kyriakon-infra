@@ -3,7 +3,7 @@
 use super::*;
 
 use super::connection::say;
-use super::flow::{application_problems, build_record, file_application};
+use super::flow::{application_problems, build_record, file_application, mail_keys_from_form};
 use super::status::{record_for, status_page};
 
 use std::collections::BTreeMap;
@@ -112,7 +112,7 @@ pub(super) async fn portal_file(app: &App, address: &str, body: &str) -> String 
         Ok(form) => form,
         Err(e) => return ipc::file_answer(None, &format!("the application: {e}")),
     };
-    let errors = application_problems(app, &form);
+    let (errors, inspected) = application_problems(app, &form);
     if !errors.is_empty() {
         return ipc::file_answer(None, &errors.join(" "));
     }
@@ -136,13 +136,14 @@ pub(super) async fn portal_file(app: &App, address: &str, body: &str) -> String 
         }
     };
     let body_branch = form.get("whose").map(|v| v.trim()) == Some("body");
-    let record = match build_record(app, &form, body_branch, &token, "tui") {
-        Ok(record) => record,
+    let mail_keys = match mail_keys_from_form(&form, body_branch, &inspected) {
+        Ok(keys) => keys,
         Err(e) => {
             e.report("the portal");
             return ipc::file_answer(None, "Temporary failure. Try again in a moment.");
         }
     };
+    let record = build_record(app, &form, body_branch, &token, "tui", mail_keys);
     if let Err(e) = file_application(app, &record).await {
         e.report("the portal");
         return ipc::file_answer(None, "Temporary failure. Try again in a moment.");

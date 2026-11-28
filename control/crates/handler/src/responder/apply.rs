@@ -3,7 +3,9 @@
 use super::*;
 
 use super::connection::fields;
-use super::flow::{application_problems, build_record, file_application, render_applicant};
+use super::flow::{
+    application_problems, build_record, file_application, mail_keys_from_form, render_applicant,
+};
 use super::gemini::capsule_new;
 use super::reply::{capability, page_html, refused, respond, too_many, unavailable, Which};
 use super::route::Call;
@@ -90,7 +92,7 @@ pub(super) async fn apply_web(app: &App, request: &Request, incoming: &Incoming)
     if !shown {
         return render_applicant(app, body, &form, &[]);
     }
-    let errors = application_problems(app, &form);
+    let (errors, inspected) = application_problems(app, &form);
     if !errors.is_empty() {
         let mut page = page::applicant(
             &app.questions,
@@ -118,10 +120,11 @@ pub(super) async fn apply_web(app: &App, request: &Request, incoming: &Incoming)
         Ok(t) => t,
         Err(e) => return respond(&Error::from(e), FrontEnd::Httpd),
     };
-    let record = match build_record(app, &form, body, &token, label) {
-        Ok(r) => r,
+    let mail_keys = match mail_keys_from_form(&form, body, &inspected) {
+        Ok(keys) => keys,
         Err(e) => return respond(&e, FrontEnd::Httpd),
     };
+    let record = build_record(app, &form, body, &token, label, mail_keys);
     if let Err(e) = file_application(app, &record).await {
         return respond(&e, FrontEnd::Httpd);
     }

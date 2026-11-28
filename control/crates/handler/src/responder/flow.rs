@@ -10,10 +10,10 @@ use std::collections::BTreeMap;
 
 use crate::fastcgi::{Reply, Request};
 use crate::{capsule, page};
-use kyriakon_control_core::flow::applicant::{body_cross_checks, mail_key_errors};
+use kyriakon_control_core::flow::applicant::{body_cross_checks, mail_key_errors_from};
 use kyriakon_control_core::flow::questions::{Branch, Rule};
-use kyriakon_control_core::store::{Acceptance, Record};
-use kyriakon_control_core::{flow::questions, flow::validate, mail::keycheck, mail::pgp, util};
+use kyriakon_control_core::store::{Acceptance, KeyRecord, Record};
+use kyriakon_control_core::{flow::questions, flow::validate, mail::keycheck, util};
 
 /// Draw the intent id and write the application then the intent. The application
 /// goes first, so the drain never sees an intent whose application is not on
@@ -127,10 +127,14 @@ pub(super) fn own_origin(request: &Request, reaches: Reaches) -> bool {
 /// posts it, and the terminal's completed application is checked with it before
 /// the handler files anything, so the two cannot disagree about what is
 /// acceptable.
-pub(super) fn application_problems(app: &App, form: &BTreeMap<String, String>) -> Vec<String> {
+pub(super) fn application_problems(
+    app: &App,
+    form: &BTreeMap<String, String>,
+) -> (Vec<String>, BTreeMap<String, Vec<keycheck::Inspected>>) {
     let body = form.get("whose").map(|v| v.trim()) == Some("body");
     let monastic = questions::is_monastic(form.get("orders").map(String::as_str));
     let mut errors = Vec::new();
+    let mut inspected = BTreeMap::new();
     for q in questions::shown(&app.questions, !body) {
         let value = form.get(&q.id).cloned().unwrap_or_default();
         // A monastic-branch question belongs to the monastic path, so its
@@ -141,9 +145,13 @@ pub(super) fn application_problems(app: &App, form: &BTreeMap<String, String>) -
             _ => q.required,
         };
         if q.rule == Rule::MailKey {
-            for why in mail_key_errors(q, &value, form) {
+            // One inspection serves both the refusal and, when the submission
+            // files, the record: the key is not read twice.
+            let blocks = keycheck::inspect(&value);
+            for why in mail_key_errors_from(q, &blocks, form) {
                 errors.push(format!("{}: {why}", q.prompt));
             }
+            inspected.insert(q.id.clone(), blocks);
         } else if let Some(why) = validate::reason(q, &value, &app.reserved, required) {
             errors.push(format!("{}: {why}", q.prompt));
         }
@@ -151,7 +159,51 @@ pub(super) fn application_problems(app: &App, form: &BTreeMap<String, String>) -
     if body {
         body_cross_checks(form, &mut errors);
     }
-    errors
+    (errors, inspected)
+}
+
+/// The mail-key records for a submission's blocks, paired one block to one
+/// mailbox in account order. A refused or unreadable block has already put an
+/// error in the submission, so it contributes no record; no helper runs here.
+pub(super) fn mail_keys_from_form(
+    form: &BTreeMap<String, String>,
+    body: bool,
+    inspected: &BTreeMap<String, Vec<keycheck::Inspected>>,
+) -> Result<Vec<KeyRecord>, Error> {
+    let mail_key_id = if body { "body_mail_key" } else { "mail_key" };
+    let blocks = inspected.get(mail_key_id).map(Vec::as_slice).unwrap_or(&[]);
+    let mailboxes: Vec<String> = if body {
+        questions::account_names(form)?
+    } else {
+        vec![String::new()]
+    };
+    let domain = form
+        .get("body_domain")
+        .map(|v| v.trim())
+        .unwrap_or_default();
+    let username = form.get("username").map(|v| v.trim()).unwrap_or_default();
+    let mut mail_keys = Vec::new();
+    for (i, block) in blocks.iter().enumerate() {
+        let Some(checked) = block.checked() else {
+            continue;
+        };
+        let mailbox = mailboxes.get(i).cloned().unwrap_or_default();
+        // A person's key is filed under no mailbox, but its identity is the
+        // username answer; a body mailbox's identity is its own address.
+        let address = if body {
+            if domain.is_empty() {
+                mailbox.clone()
+            } else {
+                format!("{mailbox}@{domain}")
+            }
+        } else if username.is_empty() {
+            String::new()
+        } else {
+            format!("{username}@kyriakon.net")
+        };
+        mail_keys.push(keycheck::mail_key_from_checked(mailbox, &address, checked));
+    }
+    Ok(mail_keys)
 }
 
 pub(super) fn build_record(
@@ -160,7 +212,8 @@ pub(super) fn build_record(
     body: bool,
     token: &str,
     front_end: &str,
-) -> Result<Record, Error> {
+    mail_keys: Vec<KeyRecord>,
+) -> Record {
     let answers: BTreeMap<String, String> = questions::shown(&app.questions, !body)
         .iter()
         .map(|q| {
@@ -178,39 +231,6 @@ pub(super) fn build_record(
         .map(|v| v.trim())
         .unwrap_or_default()
         .to_string();
-
-    let mail_key_id = if body { "body_mail_key" } else { "mail_key" };
-    let blocks = pgp::blocks(form.get(mail_key_id).map(String::as_str).unwrap_or(""));
-    let mailboxes: Vec<String> = if body {
-        questions::account_names(form)?
-    } else {
-        vec![String::new()]
-    };
-    let mut mail_keys = Vec::new();
-    for (i, block) in blocks.iter().enumerate() {
-        let mailbox = mailboxes.get(i).cloned().unwrap_or_default();
-        // A person's key is filed under no mailbox, but its identity is the
-        // username answer; a body mailbox's identity is its own address.
-        let address = if body {
-            let domain = form
-                .get("body_domain")
-                .map(|v| v.trim())
-                .unwrap_or_default();
-            if domain.is_empty() {
-                mailbox.clone()
-            } else {
-                format!("{mailbox}@{domain}")
-            }
-        } else {
-            let name = answers.get("username").cloned().unwrap_or_default();
-            if name.is_empty() {
-                String::new()
-            } else {
-                format!("{name}@kyriakon.net")
-            }
-        };
-        mail_keys.push(keycheck::mail_key(mailbox, &address, block));
-    }
 
     let upload_key_id = if body {
         "body_upload_key"
@@ -242,7 +262,7 @@ pub(super) fn build_record(
         });
     }
 
-    Ok(Record {
+    Record {
         username: form
             .get("username")
             .map(|v| v.trim())
@@ -283,7 +303,7 @@ pub(super) fn build_record(
         confirmation_at: None,
         acceptances,
         question_list: app.cfg.release.clone(),
-    })
+    }
 }
 
 pub(super) fn render_applicant(
