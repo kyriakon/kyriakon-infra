@@ -56,6 +56,11 @@ tui_bin=${KYRIAKON_TUI_BIN:-$control_target/release/kyriakon-control-tui}
 fromcheck_bin=${KYRIAKON_FROMCHECK_BIN:-$control_target/release/kyriakon-fromcheck}
 encrypt_bin=${KYRIAKON_ENCRYPT_BIN:-$repo/kyriakon-encrypt/target/release/kyriakon-encrypt}
 probe_bin=${KYRIAKON_SANDBOX_PROBE:-$control_target/release/examples/sandbox-probe}
+keygen_check=${KYRIAKON_KEYGEN_CHECK:-/usr/local/libexec/keygen-check}
+case $keygen_check in /*) ;; *) keygen_check=$PWD/$keygen_check ;; esac
+# The handler and terminal resolve the helper at startup; give them the path
+# this script validated rather than letting a fixture build run inside the veil.
+export KYRIAKON_KEYGEN_CHECK=$keygen_check
 
 # The nested test key: a public key with an encryption subkey, from the
 # keygen fixtures the other Rust tests share. Its private half is nowhere.
@@ -225,7 +230,7 @@ full_run() {
 		die "the full run needs OpenBSD's unveil(2) and pledge(2); use --self-test"
 	typeset bin
 	for bin in "$static_bin" "$handler_bin" "$tui_bin" "$fromcheck_bin" \
-		"$encrypt_bin" "$probe_bin" "${KYRIAKON_KEYGEN_CHECK:-/usr/local/libexec/keygen-check}"; do
+		"$encrypt_bin" "$probe_bin" "$keygen_check"; do
 		[ -x "$bin" ] || die "no binary at $bin; set its KYRIAKON_*_BIN"
 	done
 	for file in "$fixture_key" "$refused_key" "$catalogue_src" "$reserved_src" "$config_src"; do

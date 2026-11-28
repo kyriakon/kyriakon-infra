@@ -624,6 +624,9 @@ install -d -m 0755 -o root -g wheel /usr/local/libexec
 keygen_check_name=$(manifest_installed_name "$install_set" keygen-check /usr/local/libexec) \
 	|| die "cannot read $install_set"
 [ -n "$keygen_check_name" ] || die "$install_set names no keygen-check for /usr/local/libexec"
+# core compiles in this basename; a manifest rename would install a helper the
+# handler never runs.
+[ "$keygen_check_name" = keygen-check ] || die "$install_set installs keygen-check as $keygen_check_name"
 install -m 0755 "$repo_dir/keygen/target/release/keygen-check" \
 	"/usr/local/libexec/$keygen_check_name"
 install -m 0755 "$repo_dir/control/target/release/kyriakon-control" /usr/local/sbin/kyriakon-control

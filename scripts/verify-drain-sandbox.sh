@@ -59,6 +59,10 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$script_dir/.." && pwd)
 drain_bin=${KYRIAKON_DRAIN_BIN:-$repo/control/target/release/kyriakon-control-drain}
 admin_bin=${KYRIAKON_ADMIN_BIN:-$repo/control/target/release/kyriakon-admin}
+keygen_check=${KYRIAKON_KEYGEN_CHECK:-/usr/local/libexec/keygen-check}
+case $keygen_check in /*) ;; *) keygen_check=$PWD/$keygen_check ;; esac
+# The drain resolves the helper at startup; give it the path this script checked.
+export KYRIAKON_KEYGEN_CHECK=$keygen_check
 config_src=$repo/openbsd/etc/onboard/drain.toml
 key_src=$repo/keygen/fixtures/generated-clean.asc
 refused_key=$repo/keygen/fixtures/gpg-no-encryption-subkey.asc
@@ -298,7 +302,7 @@ assert_fixture() {
 full_run() {
 	[ "$(uname -s)" = OpenBSD ] || missing "the full run needs OpenBSD's unveil(2) and pledge(2); use --self-test"
 	[ -x "$drain_bin" ] || missing "no drain binary at $drain_bin; set KYRIAKON_DRAIN_BIN"
-	[ -x "${KYRIAKON_KEYGEN_CHECK:-/usr/local/libexec/keygen-check}" ] || missing "no key checker"
+	[ -x "$keygen_check" ] || missing "no key checker"
 	[ -f "$config_src" ] || missing "no drain.toml at $config_src"
 
 	# Outside the process's temp directory on purpose: restrict unveils /tmp
