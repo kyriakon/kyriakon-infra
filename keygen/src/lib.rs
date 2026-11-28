@@ -27,17 +27,17 @@ use pgp::composed::{Deserializable, SignedPublicKey};
 use pgp::composed::{
     EncryptionCaps, KeyType, SecretKeyParamsBuilder, SignedSecretKey, SubkeyParamsBuilder,
 };
+use pgp::crypto::aead::AeadAlgorithm;
 #[cfg(feature = "generate")]
 use pgp::crypto::ecc_curve::ECCCurve;
 #[cfg(feature = "generate")]
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::public_key::PublicKeyAlgorithm;
-#[cfg(feature = "generate")]
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::{Signature, SignatureType, SubpacketData};
 #[cfg(feature = "generate")]
 use pgp::types::{CompressionAlgorithm, KeyVersion};
-use pgp::types::{KeyDetails, Tag};
+use pgp::types::{Fingerprint, KeyDetails, Tag};
 #[cfg(feature = "generate")]
 use rand::thread_rng;
 #[cfg(feature = "generate")]
@@ -70,7 +70,7 @@ pub enum Finding {
     /// No usable encryption subkey at all.
     NoEncryptionSubkey,
     /// An encryption subkey is revoked, and no replacement was found.
-    SubkeyRevoked { fingerprint: String },
+    SubkeyRevoked { fingerprint: Fingerprint },
 }
 
 impl fmt::Display for Finding {
@@ -84,13 +84,16 @@ impl fmt::Display for Finding {
                  cannot receive mail.",
             ),
             Finding::Aead(items) => {
-                let items: Vec<String> = items.iter().map(ToString::to_string).collect();
-                write!(
-                    f,
-                    "The key asks for AEAD ciphers ({}), so mail encrypted to it may not open in \
-                     the member's mail program. Remove AEAD from the key's preferences, or make a \
-                     new key in Thunderbird or with gpg.",
-                    items.join(", ")
+                f.write_str("The key asks for AEAD ciphers (")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                f.write_str(
+                    "), so mail encrypted to it may not open in the member's mail program. Remove \
+                     AEAD from the key's preferences, or make a new key in Thunderbird or with gpg.",
                 )
             }
             Finding::FutureDated => f.write_str(
@@ -130,7 +133,7 @@ impl fmt::Display for Finding {
             ),
             Finding::SubkeyRevoked { fingerprint } => write!(
                 f,
-                "The encryption subkey {fingerprint} has been revoked, so mail cannot be encrypted to \
+                "The encryption subkey {fingerprint:?} has been revoked, so mail cannot be encrypted to \
                  it. Make a new key in Thunderbird or with gpg; a revoked subkey cannot receive mail."
             ),
         }
@@ -143,9 +146,12 @@ impl fmt::Display for Finding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Aead {
     /// A preferred AEAD cipher and mode.
-    Algorithm { cipher: String, mode: String },
+    Algorithm {
+        cipher: SymmetricKeyAlgorithm,
+        mode: AeadAlgorithm,
+    },
     /// A preferred encryption mode.
-    Mode(String),
+    Mode(AeadAlgorithm),
     /// The LibrePGP OCB feature bit.
     Ocb,
     /// The SEIPD v2 feature bit.
@@ -159,8 +165,8 @@ pub enum Aead {
 impl fmt::Display for Aead {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Aead::Algorithm { cipher, mode } => write!(f, "{cipher} in {mode}"),
-            Aead::Mode(mode) => write!(f, "{mode} as an AEAD mode"),
+            Aead::Algorithm { cipher, mode } => write!(f, "{cipher:?} in {mode:?}"),
+            Aead::Mode(mode) => write!(f, "{mode:?} as an AEAD mode"),
             Aead::Ocb => f.write_str("the OCB feature bit in the key's features"),
             Aead::SeipdV2 => f.write_str("the SEIPD v2 feature bit in the key's features"),
             Aead::Ciphersuite => {
@@ -289,8 +295,8 @@ fn signature_aead_findings(sig: &Signature) -> Vec<Aead> {
             SubpacketData::PreferredAeadAlgorithms(list) => {
                 for (cipher, mode) in list.iter() {
                     found.push(Aead::Algorithm {
-                        cipher: format!("{cipher:?}"),
-                        mode: format!("{mode:?}"),
+                        cipher: *cipher,
+                        mode: *mode,
                     });
                 }
             }
@@ -300,7 +306,7 @@ fn signature_aead_findings(sig: &Signature) -> Vec<Aead> {
             // gpg key, which is the dangerous direction for this warning.
             SubpacketData::PreferredEncryptionModes(modes) => {
                 for mode in modes.iter() {
-                    found.push(Aead::Mode(format!("{mode:?}")));
+                    found.push(Aead::Mode(*mode));
                 }
             }
             // rPGP exposes SEIPDv2, but LibrePGP OCB (0x02) only via the wire flags.
@@ -480,9 +486,7 @@ pub fn check_public_key(armor: &str, now_secs: u64) -> Result<Vec<Finding>, Stri
             findings.push(Finding::NoEncryptionSubkey);
         } else {
             for fingerprint in revoked_subkeys {
-                findings.push(Finding::SubkeyRevoked {
-                    fingerprint: format!("{fingerprint:?}"),
-                });
+                findings.push(Finding::SubkeyRevoked { fingerprint });
             }
         }
     }
@@ -579,8 +583,11 @@ pub fn self_check() -> Result<(), String> {
     if esc("a \"quoted\" \\ line\nsecond") != "a \\\"quoted\\\" \\\\ line\\nsecond" {
         return Err("json escaping is wrong".into());
     }
-    if findings_json(&[Finding::NoSelfSignature])
-        != "{\"ok\":false,\"findings\":[\"The key has no current, verified self-signature for its primary key.\"]}"
+    if findings_json(&[Finding::Expires { at: 1_900_000_000 }])
+        != "{\"ok\":false,\"findings\":[\"The key expires at 1900000000 seconds since the epoch, \
+            and a mail key must not expire: delivery stops at that date without a word. Choose \\\"Key \
+            does not expire\\\" when you make the key, or set its expiry to never in your mail \
+            client.\"]}"
     {
         return Err("the findings JSON is wrong".into());
     }
