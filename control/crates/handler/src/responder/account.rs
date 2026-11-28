@@ -720,6 +720,11 @@ pub(super) async fn account_mail_key(app: &App, request: &Request) -> Reply {
                 Ok(checked) => checked,
                 Err(why) => return refused(&why.to_string()),
             };
+            // A helper that could not answer is the advisory the applicant
+            // sees below; the operator sees why here, in the daemon's log.
+            if let Some(err) = checked.helper_error() {
+                kyriakon_control_core::util::report(err, "keygen-check");
+            }
             // The drain refuses a key that cannot serve mail, and a refusal
             // settles before any notice, so the page must say it here or the
             // member is never told. A block the parser could not inspect is an

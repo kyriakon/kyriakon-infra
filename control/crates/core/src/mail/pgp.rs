@@ -64,6 +64,11 @@ pub struct Checked {
     /// advisory that proceeds; a key is refused only when `inspected` and the
     /// verdict is not "works".
     pub inspected: bool,
+    /// Why the helper could not answer, when it could not: a missing binary, a
+    /// timeout, a non-zero exit or a broken protocol. `None` for a clean run and
+    /// for the helper's own `uninspected`, which is a gap in its parse rather
+    /// than a fault of this process; the advisory covers both alike.
+    helper_error: Option<Error>,
 }
 
 impl Checked {
@@ -71,6 +76,13 @@ impl Checked {
     /// inspected or the check found nothing. The parser-gap advisory proceeds.
     pub fn refusal(&self) -> Option<&str> {
         (self.inspected && self.verdict != "works").then_some(self.verdict.as_str())
+    }
+
+    /// The helper's own failure, so a daemon writes it to its log instead of
+    /// losing it. The portal does not report this: its stderr is a member's
+    /// terminal.
+    pub fn helper_error(&self) -> Option<&Error> {
+        self.helper_error.as_ref()
     }
 }
 
@@ -298,34 +310,61 @@ pub fn inspect_single_cert(armour: &str) -> Result<Cert, Error> {
 /// Inspect an armoured PGP public key block. `Err` is the refusal reason; the
 /// verdict is the shared crate's reading of the three conditions, joined when
 /// more than one trips. `inspected` separates a finding from the advisory that
-/// the parser could not read the block.
+/// the parser could not read the block, and a helper that could not answer keeps
+/// its error for the caller's log.
 pub fn public_key(value: &str) -> Result<Checked, Error> {
-    let (findings, inspected) = inspected_findings(value)?;
-    Ok(Checked {
-        verdict: if findings.is_empty() {
-            "works".to_string()
-        } else {
-            findings.join("; ")
-        },
-        inspected,
-    })
+    public_key_with(keygen_check_program(), value, now_secs(), KEYGEN_TIMEOUT)
 }
 
-/// The three-condition inspection, from the crate the page builds to WASM, with
-/// the framing check that decides whether the material is a public key block at
-/// all. The conditions themselves are not repeated here.
-pub fn findings(value: &str) -> Result<Vec<String>, Error> {
-    inspected_findings(value).map(|(findings, _)| findings)
-}
-
-/// The keygen crate's findings, and whether it read the block at all. A parser
-/// that cannot read a well-framed block is a gap in this check, not a verdict on
-/// the key: the advisory proceeds and names a reader.
-fn inspected_findings(value: &str) -> Result<(Vec<String>, bool), Error> {
+/// The one inspection, with the helper named. [`public_key`] names the deployed
+/// one; a test drives a helper that cannot answer, which is the path this keeps
+/// observable.
+fn public_key_with(
+    program: String,
+    value: &str,
+    now: u64,
+    timeout: Duration,
+) -> Result<Checked, Error> {
     let cert = inspect_single_cert(value)?;
-    Ok(match keygen_check(&cert.material, now_secs()) {
-        Ok(KeygenVerdict::Parsed(findings)) => (findings, true),
-        Ok(KeygenVerdict::Uninspected) | Err(_) => (vec![UNINSPECTED.to_string()], false),
+    Ok(
+        match run_keygen_check(program, &cert.material, now, timeout) {
+            Ok(KeygenVerdict::Parsed(findings)) if findings.is_empty() => Checked {
+                verdict: "works".to_string(),
+                inspected: true,
+                helper_error: None,
+            },
+            Ok(KeygenVerdict::Parsed(findings)) => Checked {
+                verdict: findings.join("; "),
+                inspected: true,
+                helper_error: None,
+            },
+            // The helper read the framing and could not read the key: a gap in the
+            // check, not a fault in this process, so there is nothing to log.
+            Ok(KeygenVerdict::Uninspected) => Checked {
+                verdict: UNINSPECTED.to_string(),
+                inspected: false,
+                helper_error: None,
+            },
+            // A helper that could not answer is the same advisory to the applicant
+            // and a line in the daemon's log for the operator.
+            Err(err) => Checked {
+                verdict: UNINSPECTED.to_string(),
+                inspected: false,
+                helper_error: Some(err),
+            },
+        },
+    )
+}
+
+/// The three-condition findings, for a caller that only shows them. The
+/// advisory a helper gap produces is one entry, which is what the caller
+/// prints; no refusal is built from this.
+pub fn findings(value: &str) -> Result<Vec<String>, Error> {
+    let checked = public_key(value)?;
+    Ok(if checked.verdict == "works" {
+        Vec::new()
+    } else {
+        vec![checked.verdict]
     })
 }
 
@@ -338,10 +377,6 @@ enum KeygenVerdict {
 /// Run `keygen-check` for one key. The helper is a separate build root so the
 /// control plane does not link `pgp`; every failure here is the uninspected
 /// advisory at the caller, never a refusal on a key the platform did not read.
-fn keygen_check(material: &str, now: u64) -> Result<KeygenVerdict, Error> {
-    run_keygen_check(keygen_check_program(), material, now, KEYGEN_TIMEOUT)
-}
-
 fn run_keygen_check(
     program: String,
     material: &str,
@@ -1319,6 +1354,41 @@ mod tests {
 
         let clean = public_key(CLEAN).unwrap();
         assert!(clean.inspected);
+    }
+
+    #[test]
+    fn a_helper_that_cannot_run_is_the_advisory_with_its_error_kept() {
+        // ADR 0008: a key this platform could not inspect must still proceed.
+        // The operator learns why from the error the advisory carries, which is
+        // the one thing the old catch-all dropped.
+        let missing = public_key_with(
+            "/nonexistent/keygen-check".to_string(),
+            CLEAN,
+            0,
+            Duration::from_millis(50),
+        )
+        .expect("a helper that cannot run is not a framing refusal");
+        assert!(!missing.inspected, "{}", missing.verdict);
+        assert!(missing.refusal().is_none(), "{}", missing.verdict);
+        assert!(
+            matches!(missing.helper_error(), Some(Error::RunKeygenCheck { .. })),
+            "{:?}",
+            missing.helper_error()
+        );
+
+        let home = ScratchHome::new().unwrap();
+        let path = home.path().join("check");
+        std::fs::write(&path, "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let failed = public_key_with(path.display().to_string(), CLEAN, 0, Duration::from_secs(2))
+            .expect("a helper that exits non-zero is not a framing refusal");
+        assert!(!failed.inspected);
+        assert!(failed.refusal().is_none());
+        assert!(
+            matches!(failed.helper_error(), Some(Error::KeygenCheckExited { .. })),
+            "{:?}",
+            failed.helper_error()
+        );
     }
 
     #[test]

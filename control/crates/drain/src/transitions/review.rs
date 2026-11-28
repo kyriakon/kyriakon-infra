@@ -540,6 +540,9 @@ async fn approve(
         }
         let checked = kyriakon_control_core::mail::pgp::public_key(&key.material)
             .map_err(|e| Transitions::context("the application's mail key", e))?;
+        if let Some(err) = checked.helper_error() {
+            kyriakon_control_core::util::report(err, "keygen-check");
+        }
         if let Some(verdict) = checked.refusal() {
             return Err(Transitions::Review(Error::MailKeyUnusable {
                 source: Reason::KeyRefused {
